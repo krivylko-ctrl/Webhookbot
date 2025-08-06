@@ -1,0 +1,247 @@
+<!DOCTYPE html>
+<html lang="ru" data-bs-theme="dark">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Торговый Бот - MEXC API</title>
+    <link href="https://cdn.replit.com/agent/bootstrap-agent-dark-theme.min.css" rel="stylesheet">
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css" rel="stylesheet">
+    <link href="{{ url_for('static', filename='style.css') }}" rel="stylesheet">
+</head>
+<body>
+    <div class="container-fluid py-4">
+        <div class="row">
+            <div class="col-12">
+                <div class="d-flex justify-content-between align-items-center mb-4">
+                    <h1 class="h2 mb-0">
+                        <i class="fas fa-robot text-primary me-2"></i>
+                        Торговый Бот MEXC
+                    </h1>
+                    <div class="d-flex gap-2">
+                        <button class="btn btn-outline-info" onclick="refreshStats()">
+                            <i class="fas fa-sync-alt"></i> Обновить
+                        </button>
+                        <button class="btn btn-outline-warning" onclick="testConnection()">
+                            <i class="fas fa-plug"></i> Тест API
+                        </button>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Статистика -->
+        <div class="row mb-4">
+            <div class="col-md-3 mb-3">
+                <div class="card bg-primary">
+                    <div class="card-body text-center">
+                        <i class="fas fa-signal fa-2x mb-2"></i>
+                        <h5 class="card-title">Всего сигналов</h5>
+                        <h3 id="total-signals">{{ stats.total_signals }}</h3>
+                    </div>
+                </div>
+            </div>
+            <div class="col-md-3 mb-3">
+                <div class="card bg-success">
+                    <div class="card-body text-center">
+                        <i class="fas fa-check-circle fa-2x mb-2"></i>
+                        <h5 class="card-title">Успешные</h5>
+                        <h3 id="successful-trades">{{ stats.successful_trades }}</h3>
+                    </div>
+                </div>
+            </div>
+            <div class="col-md-3 mb-3">
+                <div class="card bg-danger">
+                    <div class="card-body text-center">
+                        <i class="fas fa-times-circle fa-2x mb-2"></i>
+                        <h5 class="card-title">Ошибки</h5>
+                        <h3 id="failed-trades">{{ stats.failed_trades }}</h3>
+                    </div>
+                </div>
+            </div>
+            <div class="col-md-3 mb-3">
+                <div class="card bg-info">
+                    <div class="card-body text-center">
+                        <i class="fas fa-chart-line fa-2x mb-2"></i>
+                        <h5 class="card-title">Активные позиции</h5>
+                        <h3 id="active-positions">{{ stats.active_positions }}</h3>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Последний сигнал -->
+        <div class="row mb-4">
+            <div class="col-12">
+                <div class="card">
+                    <div class="card-header">
+                        <h5 class="mb-0">
+                            <i class="fas fa-clock me-2"></i>
+                            Последний сигнал
+                        </h5>
+                    </div>
+                    <div class="card-body">
+                        <div class="row">
+                            <div class="col-md-6">
+                                <strong>Время:</strong> 
+                                <span id="last-signal-time">
+                                    {{ stats.last_signal_time or 'Нет данных' }}
+                                </span>
+                            </div>
+                            <div class="col-md-6">
+                                <strong>Тип:</strong> 
+                                <span id="last-signal-type" class="badge bg-secondary">
+                                    {{ stats.last_signal_type or 'Нет данных' }}
+                                </span>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Последние логи -->
+        <div class="row mb-4">
+            <div class="col-12">
+                <div class="card">
+                    <div class="card-header d-flex justify-content-between align-items-center">
+                        <h5 class="mb-0">
+                            <i class="fas fa-list me-2"></i>
+                            Последние события
+                        </h5>
+                        <a href="{{ url_for('logs') }}" class="btn btn-sm btn-outline-primary">
+                            Все логи
+                        </a>
+                    </div>
+                    <div class="card-body">
+                        <div id="recent-logs">
+                            {% if recent_logs %}
+                                {% for log in recent_logs %}
+                                <div class="log-entry mb-2 p-2 rounded {{ 'bg-success-subtle' if log.level == 'SUCCESS' else ('bg-danger-subtle' if log.level == 'ERROR' or log.level == 'CRITICAL' else ('bg-warning-subtle' if log.level == 'WARNING' else '')) }}">
+                                    <div class="d-flex justify-content-between align-items-start">
+                                        <div class="flex-grow-1">
+                                            <span class="badge {{ 'bg-success' if log.level == 'SUCCESS' else ('bg-danger' if log.level == 'ERROR' or log.level == 'CRITICAL' else ('bg-warning' if log.level == 'WARNING' else 'bg-info')) }} me-2">
+                                                {{ log.level }}
+                                            </span>
+                                            {{ log.message }}
+                                        </div>
+                                        <small class="text-muted">{{ log.timestamp }}</small>
+                                    </div>
+                                </div>
+                                {% endfor %}
+                            {% else %}
+                                <p class="text-muted text-center">Нет событий</p>
+                            {% endif %}
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Webhook URL -->
+        <div class="row">
+            <div class="col-12">
+                <div class="card">
+                    <div class="card-header">
+                        <h5 class="mb-0">
+                            <i class="fas fa-link me-2"></i>
+                            Webhook URL для TradingView
+                        </h5>
+                    </div>
+                    <div class="card-body">
+                        <div class="input-group">
+                            <input type="text" class="form-control" id="webhook-url" value="{{ request.url_root }}webhook" readonly>
+                            <button class="btn btn-outline-secondary" onclick="copyWebhookUrl()">
+                                <i class="fas fa-copy"></i> Копировать
+                            </button>
+                        </div>
+                        <small class="text-muted">
+                            Используйте этот URL в настройках алертов TradingView
+                        </small>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Toast для уведомлений -->
+    <div class="toast-container position-fixed top-0 end-0 p-3">
+        <div id="notification-toast" class="toast" role="alert">
+            <div class="toast-header">
+                <strong class="me-auto">Уведомление</strong>
+                <button type="button" class="btn-close" data-bs-dismiss="toast"></button>
+            </div>
+            <div class="toast-body" id="toast-message">
+                Сообщение
+            </div>
+        </div>
+    </div>
+
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
+    <script>
+        function showToast(message, type = 'info') {
+            const toast = document.getElementById('notification-toast');
+            const toastBody = document.getElementById('toast-message');
+            
+            toastBody.textContent = message;
+            toast.className = `toast bg-${type}`;
+            
+            const bsToast = new bootstrap.Toast(toast);
+            bsToast.show();
+        }
+
+        function refreshStats() {
+            fetch('/api/stats')
+                .then(response => response.json())
+                .then(data => {
+                    document.getElementById('total-signals').textContent = data.total_signals;
+                    document.getElementById('successful-trades').textContent = data.successful_trades;
+                    document.getElementById('failed-trades').textContent = data.failed_trades;
+                    document.getElementById('active-positions').textContent = data.active_positions;
+                    document.getElementById('last-signal-time').textContent = data.last_signal_time || 'Нет данных';
+                    document.getElementById('last-signal-type').textContent = data.last_signal_type || 'Нет данных';
+                    
+                    showToast('Статистика обновлена', 'success');
+                })
+                .catch(error => {
+                    console.error('Ошибка обновления статистики:', error);
+                    showToast('Ошибка обновления статистики', 'danger');
+                });
+        }
+
+        function testConnection() {
+            showToast('Тестирование соединения...', 'info');
+            
+            fetch('/api/test_connection')
+                .then(response => response.json())
+                .then(data => {
+                    if (data.status === 'success') {
+                        showToast('Соединение с MEXC API успешно!', 'success');
+                    } else {
+                        showToast(`Ошибка соединения: ${data.message}`, 'danger');
+                    }
+                })
+                .catch(error => {
+                    console.error('Ошибка тестирования соединения:', error);
+                    showToast('Ошибка тестирования соединения', 'danger');
+                });
+        }
+
+        function copyWebhookUrl() {
+            const urlInput = document.getElementById('webhook-url');
+            urlInput.select();
+            urlInput.setSelectionRange(0, 99999);
+            
+            try {
+                navigator.clipboard.writeText(urlInput.value);
+                showToast('Webhook URL скопирован!', 'success');
+            } catch (err) {
+                document.execCommand('copy');
+                showToast('Webhook URL скопирован!', 'success');
+            }
+        }
+
+        // Автообновление статистики каждые 30 секунд
+        setInterval(refreshStats, 30000);
+    </script>
+</body>
+</html>
