@@ -1,1 +1,102 @@
+/* Дополнительные стили для торгового бота */
 
+.logs-container {
+    max-height: 70vh;
+    overflow-y: auto;
+}
+
+.log-entry {
+    transition: all 0.3s ease;
+    border: 1px solid var(--bs-border-color);
+}
+
+.log-entry:hover {
+    transform: translateY(-2px);
+    box-shadow: 0 4px 8px rgba(0, 0, 0, 0.1);
+}
+
+.log-message {
+    font-family: 'Courier New', monospace;
+    word-break: break-word;
+    white-space: pre-wrap;
+}
+
+.card {
+    border: 1px solid var(--bs-border-color);
+    box-shadow: 0 2px 4px rgba(0, 0, 0, 0.1);
+}
+
+.card-header {
+    background-color: var(--bs-dark);
+    border-bottom: 1px solid var(--bs-border-color);
+}
+
+.toast-container {
+    z-index: 1050;
+}
+
+/* Анимации для статистических карточек */
+.card.bg-primary,
+.card.bg-success,
+.card.bg-danger,
+.card.bg-info {
+    transition: transform 0.3s ease;
+}
+
+.card.bg-primary:hover,
+.card.bg-success:hover,
+.card.bg-danger:hover,
+.card.bg-info:hover {
+    transform: translateY(-5px);
+}
+
+/* Улучшенные badge стили */
+.badge {
+    font-size: 0.875em;
+}
+
+/* Кастомные цвета для уровней логов */
+.bg-success-subtle {
+    background-color: rgba(25, 135, 84, 0.1) !important;
+}
+
+.bg-danger-subtle {
+    background-color: rgba(220, 53, 69, 0.1) !important;
+}
+
+.bg-warning-subtle {
+    background-color: rgba(255, 193, 7, 0.1) !important;
+}
+
+.bg-info-subtle {
+    background-color: rgba(13, 202, 240, 0.1) !important;
+}
+
+/* Responsive улучшения */
+@media (max-width: 768px) {
+    .logs-container {
+        max-height: 50vh;
+    }
+    
+    .card-body {
+        padding: 1rem 0.75rem;
+    }
+}
+
+/* Прокрутка */
+.logs-container::-webkit-scrollbar {
+    width: 6px;
+}
+
+.logs-container::-webkit-scrollbar-track {
+    background: var(--bs-dark);
+}
+
+.logs-container::-webkit-scrollbar-thumb {
+    background: var(--bs-secondary);
+    border-radius: 3px;
+}
+
+.logs-container::-webkit-scrollbar-thumb:hover {
+    background: var(--bs-light);
+}
