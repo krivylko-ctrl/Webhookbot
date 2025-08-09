@@ -1,5 +1,0 @@
-Flask==2.3.3
-requests==2.31.0
-gunicorn==21.2.0
-ccxt==4.4.99
-python-telegram-bot==20.4
