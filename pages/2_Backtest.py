@@ -1,264 +1,319 @@
-import time
-import math
-import requests
+# 2_Backtest.py
+# Реальный бэктест: исторические 15m OHLC -> on_bar_close_15m() -> сделки/статистика
 import pandas as pd
 import numpy as np
-import streamlit as st
 from datetime import datetime, timedelta, timezone
+from typing import Dict, Optional, List
 
-# ==== UI ====
-st.set_page_config(page_title="Backtest", page_icon="📈", layout="wide")
-st.title("Бэктест стратегии KWIN")
+import streamlit as st
+import matplotlib.pyplot as plt
 
-colp1, colp2, colp3 = st.columns(3)
-period_map = {"30D":30, "60D":60, "180D":180}
-period_key = colp1.selectbox("Период бэктеста", list(period_map.keys()), index=1)
-start_capital = colp2.number_input("Начальный капитал ($)", min_value=50.0, value=300.0, step=50.0)
-commission_pct = colp3.number_input("Комиссия (%) за сделку (taker side)", min_value=0.0, value=0.055, step=0.005, format="%.3f")
+# --- Импорты проекта ---
+from config import Config
+from state_manager import StateManager
+from database import Database
 
-col1, col2, col3, col4 = st.columns(4)
-symbol = col1.text_input("Символ (Bybit Linear)", value="ETHUSDT")
-interval = col2.selectbox("TF", ["1","3","5","15","30","60","240"], index=3)
-risk_pct = col3.number_input("Риск % на сделку", min_value=0.1, max_value=10.0, value=3.0, step=0.1)
-rr_input = col4.number_input("RR фикса для фильтра NetPnL, R", min_value=0.5, max_value=5.0, value=1.3, step=0.1)
+# стратегия (с твоими последними патчами)
+from kwin_strategy import KWINStrategy
 
-colt1, colt2, colt3, colt4 = st.columns(4)
-enable_smart_trail = colt1.checkbox("✅ Smart Trailing", value=True)
-arm_after_rr = colt2.checkbox("Arm после RR≥X", value=True)
-arm_rr = colt3.number_input("Arm RR (R)", min_value=0.1, max_value=5.0, value=0.5, step=0.1)
-use_bar_trail = colt4.checkbox("Bar High/Low Trail", value=True)
+# Bybit API: пробуем несколько вариантов клиента (под твои файлы)
+try:
+    from bybit_api import BybitAPI
+except Exception:
+    try:
+        from bybit_v5_fixed import BybitAPI  # если у тебя класс там
+    except Exception:
+        BybitAPI = None
 
-colt5, colt6, colt7 = st.columns(3)
-trailing_perc = colt5.number_input("Trailing %", min_value=0.1, max_value=5.0, value=0.5, step=0.1)
-trailing_offset = colt6.number_input("Offset %", min_value=0.1, max_value=5.0, value=0.4, step=0.1)
-trail_lookback = colt7.number_input("Trail lookback bars", min_value=1, max_value=200, value=50, step=1)
 
-colq1, colq2, colq3 = st.columns(3)
-use_quality = colq1.checkbox("Фильтр качества SFP", value=True)
-wick_min_ticks = colq2.number_input("Min глубина тени (ticks)", min_value=0, value=7, step=1)
-close_back_pct = colq3.number_input("Min close-back % от тени", min_value=0.0, max_value=1.0, value=1.00, step=0.05)
+# ====================== Утилиты загрузки данных ======================
 
-run_btn = st.button("🚀 Запустить бэктест", type="primary", use_container_width=True)
+def load_klines_bybit(api, symbol: str, interval: str, days: int) -> List[Dict]:
+    """
+    Грузим исторические свечи с Bybit и нормализуем формат под стратегию.
+    Ожидаемый формат элемента:
+      {"timestamp": ms, "start": ms, "open": float, "high": float, "low": float, "close": float, "volume": float}
+    """
+    if api is None:
+        st.error("BybitAPI не инициализирован. Проверь импорт/креды.")
+        return []
 
-# ==== DATA: Bybit REST v5 ====
-BYBIT_BASE = "https://api.bybit.com"
-KL_ENDPOINT = "/v5/market/kline"
+    # Примерно 4 бара на час для 15m
+    bars = int(days * 24 * 4) + 20  # с запасом
+    try:
+        kl = api.get_klines(symbol, interval, bars) or []
+    except Exception as e:
+        st.error(f"Ошибка получения свечей: {e}")
+        return []
 
-@st.cache_data(show_spinner=False)
-def fetch_bybit_klines(symbol:str, interval:str, start_ms:int, end_ms:int)->pd.DataFrame:
-    """Тянем историю свечей циклом (Bybit v5 /v5/market/kline, max 1000 баров за запрос)."""
-    rows = []
-    cursor = None
-    while True:
-        params = {
-            "category": "linear",
-            "symbol": symbol,
-            "interval": interval,
-            "start": start_ms,
-            "end": end_ms,
-            "limit": 1000
-        }
-        if cursor:
-            params["cursor"] = cursor
-        r = requests.get(BYBIT_BASE + KL_ENDPOINT, params=params, timeout=30)
-        r.raise_for_status()
-        j = r.json()
-        if j.get("retCode") != 0:
-            raise RuntimeError(f"Bybit error: {j}")
-        result = j.get("result", {})
-        kl = result.get("list", [])
-        if not kl:
-            break
-        rows.extend(kl)
-        cursor = result.get("nextPageCursor")
-        if not cursor:
-            break
-        # анти rate-limit
-        time.sleep(0.15)
-    if not rows:
-        return pd.DataFrame()
-    # Bybit возвращает строки как [startTime, open, high, low, close, volume, turnover]
-    df = pd.DataFrame(rows, columns=["start","open","high","low","close","volume","turnover"])
-    df["start"] = pd.to_datetime(df["start"].astype("int64"), unit="ms", utc=True).dt.tz_convert("UTC")
-    for c in ["open","high","low","close","volume","turnover"]:
-        df[c] = pd.to_numeric(df[c], errors="coerce")
-    df = df.sort_values("start").reset_index(drop=True)
-    df = df.rename(columns={"start":"timestamp"})
-    return df[["timestamp","open","high","low","close","volume"]]
+    if not kl:
+        return []
 
-# ==== STRATEGY (приближенно к твоему Pine) ====
-def run_backtest(df: pd.DataFrame)->dict:
-    if df is None or df.empty:
+    # От старых к новым — чтобы кормить по закрытию баров
+    try:
+        kl.sort(key=lambda x: x.get("timestamp") or x.get("open_time") or x.get("start"))
+    except Exception:
+        pass
+
+    norm = []
+    for c in kl:
+        ts = c.get("timestamp") or c.get("open_time") or c.get("start")
+        if ts is None:
+            # пропускаем мусор
+            continue
+        try:
+            norm.append({
+                "timestamp": int(ts),
+                "start": int(ts),
+                "open": float(c["open"]),
+                "high": float(c["high"]),
+                "low": float(c["low"]),
+                "close": float(c["close"]),
+                "volume": float(c.get("volume", 0.0)),
+            })
+        except Exception:
+            # На случай строковых значений
+            try:
+                norm.append({
+                    "timestamp": int(ts),
+                    "start": int(ts),
+                    "open": float(c.get("open", 0)),
+                    "high": float(c.get("high", 0)),
+                    "low": float(c.get("low", 0)),
+                    "close": float(c.get("close", 0)),
+                    "volume": float(c.get("volume", 0.0)),
+                })
+            except Exception:
+                continue
+    return norm
+
+
+# ====================== Реальный бэктест через стратегию ======================
+
+def run_backtest_ohlc(period_days: int,
+                      initial_capital: float,
+                      commission_rate: float,
+                      symbol: str,
+                      config: Config) -> Dict[str, pd.DataFrame]:
+    """
+    1) In-memory БД и стейт (чтобы не трогать прод).
+    2) Загрузка исторических 15m свечей.
+    3) Кормим стратегию закрытиями баров: on_bar_close_15m().
+    4) Собираем сделки из БД и считаем эквити/метрики.
+    """
+    # In-memory DB (сделай поддержу memory=True в Database; если нет — временную SQLite)
+    try:
+        db = Database(memory=True)
+    except TypeError:
+        # если твой Database не умеет memory=True — создаём обычный, но с отдельным файлом
+        db = Database(db_path="backtest_tmp.sqlite")
+
+    state = StateManager(db)
+
+    if BybitAPI is None:
+        st.error("Не найден BybitAPI. Убедись, что bybit_api.py или bybit_v5_fixed.py доступны.")
         return {"trades": pd.DataFrame(), "equity": pd.DataFrame(), "stats": {}}
 
-    df = df.copy()
-    df["mTick"] = (df["close"] * 0 + 0.01)  # приближение; реально mintick зависят от символа/биржи
+    api = BybitAPI(config)  # в конструкторе должны читаться ключи/сети из ENV/Config
 
-    # pivot SFP на 15m = sfpLen=2, lookback 1 бар между плечами
-    sfpLen = 2
-    # делаем свинг-экстремумы
-    def pivot_low(i):
-        if i-sfpLen-1 < 0 or i+1 >= len(df): return False
-        window = df["low"].iloc[i-sfpLen-1:i+2]
-        return df["low"].iloc[i] == window.min() and df["low"].iloc[i] < df["low"].iloc[i-sfpLen]
-    def pivot_high(i):
-        if i-sfpLen-1 < 0 or i+1 >= len(df): return False
-        window = df["high"].iloc[i-sfpLen-1:i+2]
-        return df["high"].iloc[i] == window.max() and df["high"].iloc[i] > df["high"].iloc[i-sfpLen]
+    # Синхронизируем ключевые параметры из UI
+    config.days_back = int(period_days)
+    config.taker_fee_rate = float(commission_rate)
+    config.symbol = symbol
 
-    # сигналы
-    bull_sig = []
-    bear_sig = []
-    for i in range(len(df)):
-        bl = pivot_low(i) and (df["open"].iloc[i] > df["low"].iloc[i-sfpLen]) and (df["close"].iloc[i] > df["low"].iloc[i-sfpLen]) and (df["low"].iloc[i] < df["low"].iloc[i-sfpLen])
-        bh = pivot_high(i) and (df["open"].iloc[i] < df["high"].iloc[i-sfpLen]) and (df["close"].iloc[i] < df["high"].iloc[i-sfpLen]) and (df["high"].iloc[i] > df["high"].iloc[i-sfpLen])
-        bull_sig.append(bl)
-        bear_sig.append(bh)
-    df["bull"] = bull_sig
-    df["bear"] = bear_sig
+    # Инициализируем стратегию
+    strat = KWINStrategy(config, api, state, db)
 
-    # фильтр качества SFP
-    df["bullWickDepth"] = np.where(df["bull"], df["low"].shift(sfpLen) - df["low"], 0.0)
-    df["bearWickDepth"] = np.where(df["bear"], df["high"] - df["high"].shift(sfpLen), 0.0)
-    df["bullCloseBackOK"] = (df["close"] - df["low"]) >= df["bullWickDepth"] * close_back_pct
-    df["bearCloseBackOK"] = (df["high"] - df["close"]) >= df["bearWickDepth"] * close_back_pct
-    if use_quality:
-        df["bull"] = df["bull"] & (df["bullWickDepth"] >= wick_min_ticks * df["mTick"]) & df["bullCloseBackOK"]
-        df["bear"] = df["bear"] & (df["bearWickDepth"] >= wick_min_ticks * df["mTick"]) & df["bearCloseBackOK"]
+    # Подтянем equity (для риск-менеджмента/компаундинга)
+    try:
+        strat._update_equity()
+    except Exception:
+        pass
 
-    # симуляция
-    capital = start_capital
-    taker_fee = commission_pct / 100.0
-    trades = []
-    pos = 0  # 0 / +qty / -qty
-    entry = sl = qty = 0.0
-    long_armed = short_armed = (not arm_after_rr)
+    # Исторические 15m свечи
+    candles = load_klines_bybit(api, symbol, "15", period_days)
+    if not candles:
+        return {"trades": pd.DataFrame(), "equity": pd.DataFrame(), "stats": {}}
 
-    for i in range(1, len(df)):
-        o,h,l,c = df.loc[df.index[i], ["open","high","low","close"]]
-        ts = df.loc[df.index[i], "timestamp"]
+    # Кормим стратегию по закрытию (как Pine)
+    for c in candles:
+        strat.on_bar_close_15m(c)
 
-        # exits: trailing/bar-based
-        if pos > 0:
-            # bar trail
-            if enable_smart_trail and use_bar_trail and long_armed:
-                lb_low = df["low"].iloc[max(0, i-int(trail_lookback)):i].min()
-                bar_stop = max(lb_low, sl)
-                if l <= bar_stop:  # выбило стопом
-                    exit_price = bar_stop
-                    pnl = (exit_price - entry) * qty
-                    fee = (entry + exit_price) * qty * taker_fee
-                    capital += pnl - fee
-                    trades.append([ts, "LONG", entry, exit_price, qty, pnl - fee, capital])
-                    pos = 0
-                    qty = 0
-                    continue
-            # simple trailing % (fallback)
-            if enable_smart_trail and not use_bar_trail:
-                trail = entry * (trailing_perc/100.0)
-                trail_px = c - trail
-                ts_px = max(trail_px, sl)
-                if l <= ts_px:
-                    exit_price = ts_px
-                    pnl = (exit_price - entry) * qty
-                    fee = (entry + exit_price) * qty * taker_fee
-                    capital += pnl - fee
-                    trades.append([ts, "LONG", entry, exit_price, qty, pnl - fee, capital])
-                    pos = 0
-                    qty = 0
-                    continue
+    # Достаём сделки из in-memory БД
+    try:
+        trades = db.get_trades_by_period(period_days)
+    except Exception:
+        # если нет такого метода — забери все сделки, реализуй свой метод в БД
+        trades = db.get_all_trades() if hasattr(db, "get_all_trades") else []
 
-        if pos < 0:
-            if enable_smart_trail and use_bar_trail and short_armed:
-                lb_high = df["high"].iloc[max(0, i-int(trail_lookback)):i].max()
-                bar_stop = min(lb_high, sl)
-                if h >= bar_stop:
-                    exit_price = bar_stop
-                    pnl = (entry - exit_price) * abs(qty)
-                    fee = (entry + exit_price) * abs(qty) * taker_fee
-                    capital += pnl - fee
-                    trades.append([ts, "SHORT", entry, exit_price, abs(qty), pnl - fee, capital])
-                    pos = 0; qty = 0
-                    continue
-            if enable_smart_trail and not use_bar_trail:
-                trail = entry * (trailing_perc/100.0)
-                trail_px = c + trail
-                ts_px = min(trail_px, sl)
-                if h >= ts_px:
-                    exit_price = ts_px
-                    pnl = (entry - exit_price) * abs(qty)
-                    fee = (entry + exit_price) * abs(qty) * taker_fee
-                    capital += pnl - fee
-                    trades.append([ts, "SHORT", entry, exit_price, abs(qty), pnl - fee, capital])
-                    pos = 0; qty = 0
-                    continue
+    trades_df = pd.DataFrame(trades) if trades else pd.DataFrame()
 
-        # arm RR
-        if arm_after_rr and pos > 0 and not long_armed:
-            moved = c - entry
-            need = (entry - sl) * arm_rr
-            long_armed = moved >= need
-        if arm_after_rr and pos < 0 and not short_armed:
-            moved = entry - c
-            need = (sl - entry) * arm_rr
-            short_armed = moved >= need
+    # Если в БД нет факта выхода — лучше стратегию доработать.
+    # Пока для эквити берём только сделки с exit_price/exit_time.
+    capital = initial_capital
+    eq_times, eq_values = [], []
 
-        # entries (только если flat)
-        if pos == 0:
-            if df["bull"].iloc[i]:
-                sl = df["low"].shift(1).iloc[i]
-                entry = c
-                stop_size = entry - sl
-                if stop_size > 0:
-                    risk_amt = capital * (risk_pct/100.0)
-                    qty = risk_amt / stop_size
-                    pos = +1
-                    long_armed = (not arm_after_rr)
-            elif df["bear"].iloc[i]:
-                sl = df["high"].shift(1).iloc[i]
-                entry = c
-                stop_size = sl - entry
-                if stop_size > 0:
-                    risk_amt = capital * (risk_pct/100.0)
-                    qty = risk_amt / stop_size
-                    pos = -1
-                    short_armed = (not arm_after_rr)
+    if not trades_df.empty:
+        if "entry_time" in trades_df.columns:
+            trades_df["entry_time"] = pd.to_datetime(trades_df["entry_time"], utc=True, errors="coerce")
+        if "exit_time" in trades_df.columns:
+            trades_df["exit_time"] = pd.to_datetime(trades_df["exit_time"], utc=True, errors="coerce")
 
-    trades_df = pd.DataFrame(trades, columns=["time","side","entry","exit","qty","net_pnl","equity"])
-    eq = trades_df[["time","equity"]].copy()
-    return {"trades": trades_df, "equity": eq, "stats": {"final_capital": (trades_df["equity"].iloc[-1] if len(trades_df)>0 else start_capital)}}
+        # сорт по времени выхода (или входа)
+        sort_key = "exit_time" if "exit_time" in trades_df.columns else "entry_time"
+        trades_df = trades_df.sort_values(by=sort_key)
 
-# ==== RUN ====
-if run_btn:
-    if not period_key or not symbol or not interval:
-        st.error("Заполните все параметры")
-        st.stop()
-    
-    days = period_map[period_key]
-    end_dt = datetime.now(timezone.utc).replace(second=0, microsecond=0)
-    start_dt = end_dt - timedelta(days=days)
-    st.write(f"Загрузка данных Bybit: {symbol} {interval}m  {start_dt:%Y-%m-%d} → {end_dt:%Y-%m-%d}")
-    df = fetch_bybit_klines(str(symbol), str(interval), int(start_dt.timestamp()*1000), int(end_dt.timestamp()*1000))
-    if df is None or df.empty:
-        st.error("Не удалось получить исторические данные. Проверь SYMBOL/interval/доступность Bybit.")
-        st.stop()
+        wins = 0
+        total_pnl = 0.0
+        for _, tr in trades_df.iterrows():
+            entry = float(tr.get("entry_price", np.nan))
+            qty = float(tr.get("quantity", np.nan))
+            side = tr.get("direction", "")
+            exit_p = tr.get("exit_price", np.nan)
 
-    res = run_backtest(df)
-    trades = res["trades"]
-    equity = res["equity"]
+            if np.isnan(entry) or np.isnan(qty) or pd.isna(exit_p):
+                continue
+            exit_p = float(exit_p)
 
-    colA, colB = st.columns([2,1])
-    with colA:
-        st.subheader("Equity")
-        if not equity.empty:
-            equity = equity.set_index("time")
-            st.line_chart(equity)
+            if side == "long":
+                gross = (exit_p - entry) * qty
+            else:
+                gross = (entry - exit_p) * qty
+
+            fee_in = entry * qty * commission_rate
+            fee_out = exit_p * qty * commission_rate
+            pnl = gross - fee_in - fee_out
+
+            capital += pnl
+            total_pnl += pnl
+            if pnl > 0:
+                wins += 1
+
+            t = tr.get("exit_time") or tr.get("entry_time")
+            eq_times.append(pd.to_datetime(t))
+            eq_values.append(capital)
+
+        winrate = (wins / len(trades_df)) * 100 if len(trades_df) else 0.0
+    else:
+        winrate = 0.0
+        total_pnl = 0.0
+
+    equity_df = pd.DataFrame({"time": eq_times, "equity": eq_values}) if eq_values else pd.DataFrame()
+    stats = {
+        "final_capital": capital,
+        "trades": int(len(trades_df)),
+        "winrate_pct": round(winrate, 2),
+        "total_pnl": round(total_pnl, 2),
+    }
+    return {"trades": trades_df, "equity": equity_df, "stats": stats}
+
+
+# ====================== UI (Streamlit page) ======================
+
+def main():
+    st.set_page_config(page_title="Backtest — KWIN", layout="wide")
+    st.title("KWIN — Backtest (15m OHLC → Strategy)")
+
+    # Сайдбар: параметры
+    st.sidebar.header("Параметры бэктеста")
+    symbol = st.sidebar.text_input("Symbol", value="ETHUSDT")
+    period_days = st.sidebar.selectbox("Период", options=[30, 60, 180], index=0)
+    start_capital = st.sidebar.number_input("Initial Capital (USDT)", min_value=1.0, value=100.0, step=10.0)
+    commission_rate = st.sidebar.number_input("Commission (taker, decimal)", min_value=0.0, value=0.00055, step=0.00005, format="%.5f")
+
+    # Секция конфигурации стратегии (дубли твоих настроек из UI)
+    st.sidebar.header("Strategy Config (ключевые)")
+    risk_pct = st.sidebar.number_input("Risk % per trade", min_value=0.1, max_value=10.0, value=3.0, step=0.1, format="%.1f")
+    risk_reward = st.sidebar.number_input("TP Risk/Reward Ratio", min_value=0.5, value=1.3, step=0.1)
+    sfp_len = st.sidebar.number_input("SFP Length", min_value=2, value=2, step=1)
+    use_sfp_quality = st.sidebar.checkbox("Filter: SFP quality (wick+closeback)", value=True)
+    wick_min_ticks = st.sidebar.number_input("SFP: min wick depth (ticks)", min_value=0, value=7, step=1)
+    close_back_pct = st.sidebar.number_input("SFP: min close-back (0..1)", min_value=0.0, max_value=1.0, value=1.0, step=0.05)
+
+    enable_smart_trail = st.sidebar.checkbox("Enable Smart Trailing TP", value=True)
+    use_arm_after_rr = st.sidebar.checkbox("Enable Arm after RR≥X", value=True)
+    arm_rr = st.sidebar.number_input("Arm RR (R)", min_value=0.1, value=0.5, step=0.1, format="%.1f")
+    use_bar_trail = st.sidebar.checkbox("Use Bar-Low/High Smart Trail", value=True)
+    trail_lookback = st.sidebar.number_input("Trail lookback bars", min_value=1, value=50, step=1)
+    trail_buf_ticks = st.sidebar.number_input("Trail buffer (ticks)", min_value=0, value=40, step=1)
+
+    limit_qty_enabled = st.sidebar.checkbox("Limit Max Position Qty", value=True)
+    max_qty_manual = st.sidebar.number_input("Max Qty (asset units)", min_value=0.01, value=50.0, step=0.01, format="%.2f")
+
+    min_net_profit = st.sidebar.number_input("Min Net Profit (USDT)", min_value=0.0, value=1.2, step=0.1)
+    min_order_qty = st.sidebar.number_input("Min Order Qty", min_value=0.0, value=0.01, step=0.01, format="%.2f")
+    qty_step = st.sidebar.number_input("Qty Step", min_value=0.0, value=0.01, step=0.01, format="%.2f")
+
+    # Собираем Config так, чтобы он совпадал с твоей стратегией
+    config = Config()
+    config.symbol = symbol
+    config.days_back = int(period_days)
+    config.risk_pct = float(risk_pct)
+    config.risk_reward = float(risk_reward)
+    config.sfp_len = int(sfp_len)
+
+    config.use_sfp_quality = bool(use_sfp_quality)
+    config.wick_min_ticks = int(wick_min_ticks)
+    config.close_back_pct = float(close_back_pct)  # 0..1!
+
+    config.enable_smart_trail = bool(enable_smart_trail)
+    config.use_arm_after_rr = bool(use_arm_after_rr)
+    config.arm_rr = float(arm_rr)
+    config.use_bar_trail = bool(use_bar_trail)
+    config.trail_lookback = int(trail_lookback)
+    config.trail_buf_ticks = int(trail_buf_ticks)
+
+    config.limit_qty_enabled = bool(limit_qty_enabled)
+    config.max_qty_manual = float(max_qty_manual)
+
+    config.min_net_profit = float(min_net_profit)
+    config.min_order_qty = float(min_order_qty)
+    config.qty_step = float(qty_step)
+
+    config.taker_fee_rate = float(commission_rate)
+
+    run_btn = st.button("Запустить бэктест")
+
+    if run_btn:
+        with st.spinner("Запускаю бэктест..."):
+            res = run_backtest_ohlc(
+                period_days=period_days,
+                initial_capital=start_capital,
+                commission_rate=commission_rate,
+                symbol=symbol,
+                config=config
+            )
+
+        trades_df = res.get("trades", pd.DataFrame())
+        equity_df = res.get("equity", pd.DataFrame())
+        stats = res.get("stats", {})
+
+        # Метрики
+        col1, col2, col3, col4 = st.columns(4)
+        col1.metric("Сделок", value=stats.get("trades", 0))
+        col2.metric("Winrate", f"{stats.get('winrate_pct', 0.0)}%")
+        col3.metric("Итоговый капитал", f"{stats.get('final_capital', start_capital):.2f}")
+        col4.metric("Total PnL", f"{stats.get('total_pnl', 0.0):.2f}")
+
+        # График эквити
+        st.subheader("Equity Curve")
+        if not equity_df.empty:
+            fig, ax = plt.subplots()
+            ax.plot(equity_df["time"], equity_df["equity"])
+            ax.set_xlabel("Time")
+            ax.set_ylabel("Equity (USDT)")
+            ax.grid(True, alpha=0.3)
+            st.pyplot(fig)
         else:
-            st.info("Сделок нет за выбранный период.")
-    with colB:
-        st.subheader("Итог")
-        st.metric("Финальный капитал", f"${res['stats'].get('final_capital', start_capital):,.2f}")
-        st.metric("Сделок", len(trades))
+            st.info("Нет данных эквити (в БД отсутствуют закрытия сделок). Убедись, что стратегия записывает exit.")
 
-    st.subheader("Сделки")
-    st.dataframe(trades, use_container_width=True)
+        # Таблица сделок
+        st.subheader("Сделки")
+        if not trades_df.empty:
+            st.dataframe(trades_df)
+        else:
+            st.info("Сделок не найдено за выбранный период. Проверь условия детекции/окно бэктеста.")
+
+
+if __name__ == "__main__":
+    main()
