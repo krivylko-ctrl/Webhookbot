@@ -2,6 +2,7 @@
 # Реальный бэктест: исторические 15m OHLC -> on_bar_close_15m() -> сделки/статистика
 import pandas as pd
 import numpy as np
+import os
 from datetime import datetime, timedelta, timezone
 from typing import Dict, Optional, List
 
