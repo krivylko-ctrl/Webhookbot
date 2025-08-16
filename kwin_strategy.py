@@ -21,12 +21,15 @@ class KWINStrategy:
         self.trail_engine = TrailEngine(config, state_manager, bybit_api)
         self.analytics = TradingAnalytics()
 
-        # История (новейший бар — индекс 0, как в Pine-модели)
+        # История (новейший бар — индекс 0)
         self.candles_15m = []
         self.candles_1m = []
         self.candles_1h = []
         self.last_processed_time = None
         self.last_candle_close_15m = None
+
+        # для бэктеста: последний закрытый бар, по которому считаем цену/время входа
+        self._bt_last_bar = None
 
         # Состояние входов (сбрасываем ТОЛЬКО на новом 15м баре)
         self.can_enter_long = True
@@ -39,7 +42,7 @@ class KWINStrategy:
         self.min_order_qty = 0.01
         self._init_instrument_info()  # подтянуть реальные фильтры инструмента
 
-        # Нормализация close_back_pct в [0..1] (в Pine у тебя это доля, не проценты)
+        # Нормализация close_back_pct в [0..1]
         if getattr(self.config, "close_back_pct", 0) > 1.0:
             self.config.close_back_pct = self.config.close_back_pct / 100.0
         elif self.config.close_back_pct < 0.0:
@@ -61,8 +64,7 @@ class KWINStrategy:
         out = []
         for k in raw:
             ts = k.get("timestamp") or k.get("start") or k.get("open_time") or k.get("t") or 0
-            # если пришли секунды — переводим в мс
-            if ts and ts < 10_000_000_000:
+            if ts and ts < 10_000_000_000:  # секунды -> миллисекунды
                 ts = int(ts) * 1000
             out.append({
                 "timestamp": int(ts),
@@ -81,8 +83,7 @@ class KWINStrategy:
         try:
             if self.api:
                 if hasattr(self.api, "set_market_type") and hasattr(self.config, "market_type"):
-                    # ожидается 'linear' / 'contract' и т.п.
-                    self.api.set_market_type(self.config.market_type)
+                    self.api.set_market_type(self.config.market_type)  # 'linear'/'contract'
                 if hasattr(self.api, "get_instruments_info"):
                     info = self.api.get_instruments_info(self.symbol) or {}
                     pf = info.get("priceFilter") or {}
@@ -114,11 +115,11 @@ class KWINStrategy:
     def on_bar_close_15m(self, candle: Dict):
         """ТОЛЬКО здесь триггерим обработку нового 15м бара (как в Pine)."""
         try:
-            # Нормализуем одиночную свечу и ставим в начало
             norm = self._normalize_klines([candle])
             if not norm:
                 return
             c = norm[0]
+            self._bt_last_bar = c  # <-- ключ: используем для цены/времени входа в бэктесте
             self.candles_15m.insert(0, c)
             if len(self.candles_15m) > 200:
                 self.candles_15m = self.candles_15m[:200]
@@ -145,7 +146,7 @@ class KWINStrategy:
             print(f"Error in on_bar_close_60m: {e}")
 
     def on_bar_close_1m(self, candle: Dict):
-        # Можно использовать для более частого трейлинга (входы НЕ даём)
+        # можно дергать трейлинг чаще, но входов тут нет
         pass
 
     def update_candles(self):
@@ -153,10 +154,8 @@ class KWINStrategy:
         try:
             if not self.api:
                 return
-            # 15m
             kl_15 = self.api.get_klines(self.symbol, "15", 100) or []
             self.candles_15m = self._normalize_klines(kl_15)
-            # 1m
             kl_1 = self.api.get_klines(self.symbol, "1", 10) or []
             self.candles_1m = self._normalize_klines(kl_1)
         except Exception as e:
@@ -185,12 +184,10 @@ class KWINStrategy:
         if len(self.candles_15m) < sfp_len + 2:
             return
 
-        # окно бэктеста по UTC полуночи
         current_ts = self.candles_15m[0]["timestamp"]  # ms
         if not self._is_in_backtest_window_utc(current_ts):
             return
 
-        # SFP
         bull_sfp = self._detect_bull_sfp()
         bear_sfp = self._detect_bear_sfp()
 
@@ -202,7 +199,7 @@ class KWINStrategy:
     # -------------------- SFP (как в твоём Pine) --------------------
 
     def _detect_bull_sfp(self) -> bool:
-        """Bull SFP: pivotlow(sfpLen,1) на баре [1] + cur low<low[sfpLen] и open/close>low[sfpLen]."""
+        """Bull SFP: pivotlow(sfpLen,1) на баре [1] + cur low < low[sfpLen] и open/close > low[sfpLen]."""
         sfpLen = int(getattr(self.config, "sfp_len", 2) or 2)
         if len(self.candles_15m) < sfpLen + 2:
             return False
@@ -226,7 +223,7 @@ class KWINStrategy:
         return True
 
     def _detect_bear_sfp(self) -> bool:
-        """Bear SFP: pivothigh(sfpLen,1) на баре [1] + cur high>high[sfpLen] и open/close<high[sfpLen]."""
+        """Bear SFP: pivothigh(sfpLen,1) на баре [1] + cur high > high[sfpLen] и open/close < high[sfpLen]."""
         sfpLen = int(getattr(self.config, "sfp_len", 2) or 2)
         if len(self.candles_15m) < sfpLen + 2:
             return False
@@ -278,9 +275,9 @@ class KWINStrategy:
                 return
 
             prev = self.candles_15m[1]                   # ПРЕДЫДУЩАЯ 15m свеча
-            stop_loss = float(prev["low"])               # SL как в Pine: за LOW предыдущей
+            stop_loss = float(prev["low"])               # SL: за LOW предыдущей
 
-            # sanity-guard от битых свечей (можно убрать, если хочешь 1:1 без защиты)
+            # защитный ограничитель на “неадекватно широкий” стоп (опционально)
             max_stop_pct = float(getattr(self.config, "max_stop_pct", 0.08))
             stop_size = entry_price - stop_loss
             if stop_size <= 0 or stop_size > entry_price * max_stop_pct:
@@ -306,6 +303,11 @@ class KWINStrategy:
                 stop_loss=price_round(stop_loss, self.tick_size),
             )
             if res:
+                # ВРЕМЯ ВХОДА = время текущего закрытого бара (для бэктеста 1:1 с Pine)
+                entry_ts = (self._bt_last_bar["timestamp"] if self._bt_last_bar else None)
+                entry_dt = (datetime.fromtimestamp(entry_ts/1000, tz=timezone.utc)
+                            if entry_ts else datetime.now(timezone.utc))
+
                 trade = {
                     "symbol": self.symbol,
                     "direction": "long",
@@ -313,7 +315,7 @@ class KWINStrategy:
                     "stop_loss": stop_loss,
                     "take_profit": take_profit,
                     "quantity": quantity,
-                    "entry_time": datetime.now(timezone.utc),
+                    "entry_time": entry_dt,
                     "status": "open",
                 }
                 self.db.save_trade(trade)
@@ -340,7 +342,7 @@ class KWINStrategy:
                 return
 
             prev = self.candles_15m[1]                   # ПРЕДЫДУЩАЯ 15m свеча
-            stop_loss = float(prev["high"])              # SL как в Pine: за HIGH предыдущей
+            stop_loss = float(prev["high"])              # SL: за HIGH предыдущей
 
             max_stop_pct = float(getattr(self.config, "max_stop_pct", 0.08))
             stop_size = stop_loss - entry_price
@@ -367,6 +369,10 @@ class KWINStrategy:
                 stop_loss=price_round(stop_loss, self.tick_size),
             )
             if res:
+                entry_ts = (self._bt_last_bar["timestamp"] if self._bt_last_bar else None)
+                entry_dt = (datetime.fromtimestamp(entry_ts/1000, tz=timezone.utc)
+                            if entry_ts else datetime.now(timezone.utc))
+
                 trade = {
                     "symbol": self.symbol,
                     "direction": "short",
@@ -374,7 +380,7 @@ class KWINStrategy:
                     "stop_loss": stop_loss,
                     "take_profit": take_profit,
                     "quantity": quantity,
-                    "entry_time": datetime.now(timezone.utc),
+                    "entry_time": entry_dt,
                     "status": "open",
                 }
                 self.db.save_trade(trade)
@@ -397,7 +403,13 @@ class KWINStrategy:
     # -------------------- Подсистемы --------------------
 
     def _get_current_price(self) -> Optional[float]:
+        """
+        В бэктесте используем close последнего закрытого 15m-бара,
+        в онлайне — last_price с биржи.
+        """
         try:
+            if self._bt_last_bar:  # ключ к честному бэктесту
+                return float(self._bt_last_bar["close"])
             if not self.api:
                 return None
             t = self.api.get_ticker(self.symbol) or {}
@@ -441,8 +453,9 @@ class KWINStrategy:
                 return False
 
             gross = abs(take_profit - entry_price) * quantity
-            fee_in = entry_price * quantity * float(getattr(self.config, "taker_fee_rate", 0.00055))
-            fee_out = take_profit * quantity * float(getattr(self.config, "taker_fee_rate", 0.00055))
+            fee_rate = float(getattr(self.config, "taker_fee_rate", 0.00055))
+            fee_in = entry_price * quantity * fee_rate
+            fee_out = take_profit * quantity * fee_rate
             net = gross - (fee_in + fee_out)
             return net >= float(getattr(self.config, "min_net_profit", 1.2))
         except Exception as e:
