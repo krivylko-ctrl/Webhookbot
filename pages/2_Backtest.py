@@ -32,7 +32,7 @@ except Exception:
 def load_klines_bybit(api, symbol: str, interval: str, days: int) -> List[Dict]:
     """
     Грузим исторические свечи с Bybit и нормализуем формат под стратегию.
-    Ожидаемый формат элемента:
+    Элемент:
       {"timestamp": ms, "start": ms, "open": float, "high": float, "low": float, "close": float, "volume": float}
     """
     if api is None:
@@ -60,7 +60,6 @@ def load_klines_bybit(api, symbol: str, interval: str, days: int) -> List[Dict]:
     for c in kl:
         ts = c.get("timestamp") or c.get("open_time") or c.get("start")
         if ts is None:
-            # пропускаем мусор
             continue
         try:
             norm.append({
@@ -73,7 +72,7 @@ def load_klines_bybit(api, symbol: str, interval: str, days: int) -> List[Dict]:
                 "volume": float(c.get("volume", 0.0)),
             })
         except Exception:
-            # На случай строковых значений
+            # запасной парсер
             try:
                 norm.append({
                     "timestamp": int(ts),
@@ -89,6 +88,80 @@ def load_klines_bybit(api, symbol: str, interval: str, days: int) -> List[Dict]:
     return norm
 
 
+# ================== Compound helpers (P&L + equity) ==================
+# (вставка, подписанная мной)
+
+def _calc_trade_pnl(direction: str,
+                    entry_price: float,
+                    exit_price: float,
+                    qty: float,
+                    taker_fee_rate: float) -> float:
+    """
+    Возвращает ЧИСТЫЙ PnL в USDT с учётом двойной комиссии.
+    qty — в базовой валюте (например, ETH), цены — в USDT.
+    """
+    gross = (exit_price - entry_price) * qty if direction == "long" else (entry_price - exit_price) * qty
+    fees = (entry_price + exit_price) * qty * taker_fee_rate  # вход + выход
+    return gross - fees
+
+
+def _close_open_position(state: StateManager,
+                         db: Database,
+                         cfg: Config,
+                         exit_price: float,
+                         exit_time):
+    """
+    Закрыть открытую позицию в бэктесте:
+    - посчитать PnL (нетто),
+    - обновить equity (compound),
+    - записать сделку в БД.
+    """
+    pos = state.get_current_position()
+    if not pos or pos.get("status") != "open":
+        return
+
+    direction   = pos["direction"]
+    entry_price = float(pos["entry_price"])
+    qty         = float(pos["size"])  # qty в ETH (или другой базовой)
+    fee_rate    = float(getattr(cfg, "taker_fee_rate", 0.00055))
+
+    pnl_net = _calc_trade_pnl(direction, entry_price, exit_price, qty, fee_rate)
+
+    # --- обновляем equity (compound) ---
+    old_eq = float(state.get_equity() or 0.0)
+    new_eq = old_eq + pnl_net
+    state.set_equity(new_eq)
+
+    # --- фиксируем сделку в БД ---
+    trade = {
+        "symbol":      getattr(cfg, "symbol", "ETHUSDT"),
+        "direction":   direction,
+        "entry_price": entry_price,
+        "exit_price":  float(exit_price),
+        "stop_loss":   pos.get("stop_loss"),
+        "take_profit": pos.get("take_profit"),
+        "quantity":    qty,
+        "pnl":         pnl_net,
+        "rr":          None,
+        "entry_time":  pos.get("entry_time"),
+        "exit_time":   exit_time,
+        "status":      "closed",
+    }
+    try:
+        db.save_trade(trade)
+        db.save_equity_snapshot(new_eq)
+    except Exception:
+        pass
+
+    # --- закрываем локально позицию ---
+    pos["status"]     = "closed"
+    pos["exit_price"] = float(exit_price)
+    pos["exit_time"]  = exit_time
+    state.set_position(pos)
+
+    print(f"[EXIT] {direction.upper()} qty={qty} @ {exit_price}  PnL={pnl_net:.2f}  equity: {old_eq:.2f} → {new_eq:.2f}")
+
+
 # ====================== Реальный бэктест через стратегию ======================
 
 def run_backtest_ohlc(period_days: int,
@@ -97,28 +170,31 @@ def run_backtest_ohlc(period_days: int,
                       symbol: str,
                       config: Config) -> Dict[str, pd.DataFrame]:
     """
-    1) In-memory БД и стейт (чтобы не трогать прод).
+    1) In-memory БД и стейт (не трогаем прод).
     2) Загрузка исторических 15m свечей.
     3) Кормим стратегию закрытиями баров: on_bar_close_15m().
-    4) Собираем сделки из БД и считаем эквити/метрики.
+    4) Внутри прохода по барам эмулируем SL/TP на следующем баре (как в Pine).
+    5) Собираем сделки из БД и считаем эквити/метрики.
     """
-    # In-memory DB (сделай поддержу memory=True в Database; если нет — временную SQLite)
+    # In-memory DB
     try:
         db = Database(memory=True)
     except TypeError:
-        # если твой Database не умеет memory=True — создаём обычный, но с отдельным файлом
         db = Database(db_path="backtest_tmp.sqlite")
 
     state = StateManager(db)
+    state.set_equity(float(initial_capital))  # стартовый капитал для компаундинга
 
     if BybitAPI is None:
         st.error("Не найден BybitAPI. Убедись, что bybit_api.py или bybit_v5_fixed.py доступны.")
         return {"trades": pd.DataFrame(), "equity": pd.DataFrame(), "stats": {}}
 
-    api = BybitAPI( api_key=os.getenv("BYBIT_API_KEY"), api_secret=os.getenv("BYBIT_API_SECRET"))
+    api = BybitAPI(
+        api_key=os.getenv("BYBIT_API_KEY"),
+        api_secret=os.getenv("BYBIT_API_SECRET")
+    )
 
-
-    # Синхронизируем ключевые параметры из UI
+    # Синхронизируем параметры
     config.days_back = int(period_days)
     config.taker_fee_rate = float(commission_rate)
     config.symbol = symbol
@@ -126,86 +202,131 @@ def run_backtest_ohlc(period_days: int,
     # Инициализируем стратегию
     strat = KWINStrategy(config, api, state, db)
 
-    # Подтянем equity (для риск-менеджмента/компаундинга)
+    # Подтянем equity (если есть на счёте) — но старт компаундинга = initial_capital
     try:
         strat._update_equity()
     except Exception:
         pass
 
-    # Исторические 15m свечи
+    # Исторические 15m свечи (от старых к новым)
     candles = load_klines_bybit(api, symbol, "15", period_days)
     if not candles:
         return {"trades": pd.DataFrame(), "equity": pd.DataFrame(), "stats": {}}
 
-    # Кормим стратегию по закрытию (как Pine)
-    for c in candles:
-        strat.on_bar_close_15m(c)
+    # === Основной проход по барам ===
+    # Логика Pine: вход на закрытии бара t, а SL/TP могут сработать на баре t+1 по его high/low.
+    for bar in candles:
+        # 1) Если позиция УЖЕ открыта с прошлого бара — проверим SL/TP на текущем баре по high/low.
+        pos = state.get_current_position()
+        if pos and pos.get("status") == "open":
+            bar_high = float(bar["high"])
+            bar_low  = float(bar["low"])
+            cur_time = bar.get("close_time") or bar["timestamp"]
 
-    # Достаём сделки из in-memory БД
+            sl = float(pos.get("stop_loss") or 0)
+            tp = pos.get("take_profit")
+            # ВАЖНО: сначала SL, затем TP — при касании обеих зон на одном баре
+            if pos["direction"] == "long" and sl > 0 and bar_low <= sl:
+                _close_open_position(state, db, config, exit_price=sl, exit_time=cur_time)
+            elif pos["direction"] == "short" and sl > 0 and bar_high >= sl:
+                _close_open_position(state, db, config, exit_price=sl, exit_time=cur_time)
+            else:
+                if tp is not None:
+                    tp = float(tp)
+                    if pos["direction"] == "long" and bar_high >= tp:
+                        _close_open_position(state, db, config, exit_price=tp, exit_time=cur_time)
+                    if pos["direction"] == "short" and bar_low <= tp:
+                        _close_open_position(state, db, config, exit_price=tp, exit_time=cur_time)
+
+        # 2) Теперь передаём бар в стратегию — это «закрытие» бара, где стратегия может ВОЙТИ.
+        strat.on_bar_close_15m(bar)
+
+    # Достаём сделки из БД
     try:
         trades = db.get_trades_by_period(period_days)
     except Exception:
-        # если нет такого метода — забери все сделки, реализуй свой метод в БД
         trades = db.get_all_trades() if hasattr(db, "get_all_trades") else []
 
     trades_df = pd.DataFrame(trades) if trades else pd.DataFrame()
 
-    # Если в БД нет факта выхода — лучше стратегию доработать.
-    # Пока для эквити берём только сделки с exit_price/exit_time.
-    capital = initial_capital
+    # Строим equity-линию по сохранённым снимкам (если есть) или по сделкам
+    capital = float(initial_capital)
     eq_times, eq_values = [], []
 
-    if not trades_df.empty:
-        if "entry_time" in trades_df.columns:
-            trades_df["entry_time"] = pd.to_datetime(trades_df["entry_time"], utc=True, errors="coerce")
-        if "exit_time" in trades_df.columns:
-            trades_df["exit_time"] = pd.to_datetime(trades_df["exit_time"], utc=True, errors="coerce")
+    # Попробуем взять equity snapshots из БД (если реализовано)
+    equity_df = pd.DataFrame()
+    try:
+        snaps = db.get_equity_snapshots(period_days) if hasattr(db, "get_equity_snapshots") else []
+        if snaps:
+            equity_df = pd.DataFrame(snaps)
+            if {"time", "equity"} <= set(equity_df.columns):
+                equity_df["time"] = pd.to_datetime(equity_df["time"], utc=True, errors="coerce")
+                equity_df = equity_df.sort_values("time")
+    except Exception:
+        pass
 
-        # сорт по времени выхода (или входа)
-        sort_key = "exit_time" if "exit_time" in trades_df.columns else "entry_time"
-        trades_df = trades_df.sort_values(by=sort_key)
+    if equity_df.empty:
+        # fallback: строим по закрытым сделкам
+        if not trades_df.empty:
+            if "entry_time" in trades_df.columns:
+                trades_df["entry_time"] = pd.to_datetime(trades_df["entry_time"], utc=True, errors="coerce")
+            if "exit_time" in trades_df.columns:
+                trades_df["exit_time"] = pd.to_datetime(trades_df["exit_time"], utc=True, errors="coerce")
 
-        wins = 0
-        total_pnl = 0.0
-        for _, tr in trades_df.iterrows():
-            entry = float(tr.get("entry_price", np.nan))
-            qty = float(tr.get("quantity", np.nan))
-            side = tr.get("direction", "")
-            exit_p = tr.get("exit_price", np.nan)
+            sort_key = "exit_time" if "exit_time" in trades_df.columns else "entry_time"
+            trades_df = trades_df.sort_values(by=sort_key)
 
-            if np.isnan(entry) or np.isnan(qty) or pd.isna(exit_p):
-                continue
-            exit_p = float(exit_p)
+            wins = 0
+            total_pnl = 0.0
+            for _, tr in trades_df.iterrows():
+                entry = float(tr.get("entry_price", np.nan))
+                qty = float(tr.get("quantity", np.nan))
+                side = tr.get("direction", "")
+                exit_p = tr.get("exit_price", np.nan)
 
-            if side == "long":
-                gross = (exit_p - entry) * qty
-            else:
-                gross = (entry - exit_p) * qty
+                if np.isnan(entry) or np.isnan(qty) or pd.isna(exit_p):
+                    continue
+                exit_p = float(exit_p)
 
-            fee_in = entry * qty * commission_rate
-            fee_out = exit_p * qty * commission_rate
-            pnl = gross - fee_in - fee_out
+                gross = (exit_p - entry) * qty if side == "long" else (entry - exit_p) * qty
+                fee_in = entry * qty * commission_rate
+                fee_out = exit_p * qty * commission_rate
+                pnl = gross - fee_in - fee_out
 
-            capital += pnl
-            total_pnl += pnl
-            if pnl > 0:
-                wins += 1
+                capital += pnl
+                total_pnl += pnl
+                if pnl > 0:
+                    wins += 1
 
-            t = tr.get("exit_time") or tr.get("entry_time")
-            eq_times.append(pd.to_datetime(t))
-            eq_values.append(capital)
+                t = tr.get("exit_time") or tr.get("entry_time")
+                eq_times.append(pd.to_datetime(t))
+                eq_values.append(capital)
 
-        winrate = (wins / len(trades_df)) * 100 if len(trades_df) else 0.0
+            winrate = (wins / len(trades_df)) * 100 if len(trades_df) else 0.0
+        else:
+            winrate = 0.0
+            total_pnl = 0.0
+
+        equity_df = pd.DataFrame({"time": eq_times, "equity": eq_values}) if eq_values else pd.DataFrame()
     else:
-        winrate = 0.0
+        # если есть снимки — метрики ниже посчитаем по сделкам (как обычно)
         total_pnl = 0.0
+        winrate = 0.0
+        if not trades_df.empty:
+            wins = 0
+            for _, tr in trades_df.iterrows():
+                if "pnl" in tr and not pd.isna(tr["pnl"]):
+                    total_pnl += float(tr["pnl"])
+                    if float(tr["pnl"]) > 0:
+                        wins += 1
+            winrate = (wins / len(trades_df)) * 100 if len(trades_df) else 0.0
+        capital = equity_df["equity"].iloc[-1] if not equity_df.empty else initial_capital
 
-    equity_df = pd.DataFrame({"time": eq_times, "equity": eq_values}) if eq_values else pd.DataFrame()
     stats = {
-        "final_capital": capital,
+        "final_capital": float(capital),
         "trades": int(len(trades_df)),
-        "winrate_pct": round(winrate, 2),
-        "total_pnl": round(total_pnl, 2),
+        "winrate_pct": round(float(winrate), 2),
+        "total_pnl": round(float(total_pnl), 2),
     }
     return {"trades": trades_df, "equity": equity_df, "stats": stats}
 
@@ -223,7 +344,7 @@ def main():
     start_capital = st.sidebar.number_input("Initial Capital (USDT)", min_value=1.0, value=100.0, step=10.0)
     commission_rate = st.sidebar.number_input("Commission (taker, decimal)", min_value=0.0, value=0.00055, step=0.00005, format="%.5f")
 
-    # Секция конфигурации стратегии (дубли твоих настроек из UI)
+    # Секция конфигурации стратегии
     st.sidebar.header("Strategy Config (ключевые)")
     risk_pct = st.sidebar.number_input("Risk % per trade", min_value=0.1, max_value=10.0, value=3.0, step=0.1, format="%.1f")
     risk_reward = st.sidebar.number_input("TP Risk/Reward Ratio", min_value=0.5, value=1.3, step=0.1)
@@ -246,7 +367,7 @@ def main():
     min_order_qty = st.sidebar.number_input("Min Order Qty", min_value=0.0, value=0.01, step=0.01, format="%.2f")
     qty_step = st.sidebar.number_input("Qty Step", min_value=0.0, value=0.01, step=0.01, format="%.2f")
 
-    # Собираем Config так, чтобы он совпадал с твоей стратегией
+    # Собираем Config
     config = Config()
     config.symbol = symbol
     config.days_back = int(period_days)
