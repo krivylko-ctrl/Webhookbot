@@ -114,7 +114,8 @@ def run_backtest_ohlc(period_days: int,
         st.error("Не найден BybitAPI. Убедись, что bybit_api.py или bybit_v5_fixed.py доступны.")
         return {"trades": pd.DataFrame(), "equity": pd.DataFrame(), "stats": {}}
 
-    api = BybitAPI(config)  # в конструкторе должны читаться ключи/сети из ENV/Config
+    api = BybitAPI( api_key=os.getenv("BYBIT_API_KEY"), api_secret=os.getenv("BYBIT_API_SECRET"))
+
 
     # Синхронизируем ключевые параметры из UI
     config.days_back = int(period_days)
