@@ -1,396 +1,260 @@
-import streamlit as st
+import time
+import math
+import requests
 import pandas as pd
-import plotly.graph_objects as go
-from plotly.subplots import make_subplots
-from datetime import datetime, timedelta
 import numpy as np
+import streamlit as st
+from datetime import datetime, timedelta, timezone
 
-from database import Database
-from config import Config
-from bybit_api import BybitAPI
-from kwin_strategy import KWINStrategy
-from state_manager import StateManager
-import utils
-
+# ==== UI ====
 st.set_page_config(page_title="Backtest", page_icon="📈", layout="wide")
+st.title("Бэктест стратегии KWIN")
 
-def main():
-    st.title("📈 Бэктест стратегии KWIN")
-    
-    # Инициализация компонентов
-    @st.cache_resource
-    def init_components():
-        config = Config()
-        db = Database()
-        state_manager = StateManager(db)
-        return config, db, state_manager
-    
-    config, db, state_manager = init_components()
-    
-    # === НАСТРОЙКИ БЭКТЕСТА ===
-    st.markdown("### ⚙️ Настройки бэктеста")
-    
-    col1, col2, col3 = st.columns(3)
-    
-    with col1:
-        period = st.selectbox(
-            "📅 Период бэктеста",
-            options=[30, 60, 180],
-            index=0,
-            help="Количество дней для анализа"
-        )
-    
-    with col2:
-        initial_capital = st.number_input(
-            "💰 Начальный капитал ($)",
-            min_value=100.0,
-            max_value=100000.0,
-            value=1000.0,
-            step=100.0
-        )
-    
-    with col3:
-        commission_rate = st.number_input(
-            "💸 Комиссия (%)",
-            min_value=0.0,
-            max_value=1.0,
-            value=0.055,
-            step=0.001,
-            format="%.3f"
-        )
-    
-    # === РЕЗУЛЬТАТЫ БЭКТЕСТА ===
-    if st.button("🚀 Запустить бэктест", use_container_width=True):
-        with st.spinner("Выполняется бэктест..."):
-            results = run_backtest(period, initial_capital, commission_rate, db)
-            
-            if results:
-                display_backtest_results(results)
-            else:
-                st.error("Не удалось выполнить бэктест. Недостаточно данных.")
-    
-    # === АНАЛИЗ СУЩЕСТВУЮЩИХ СДЕЛОК ===
-    st.markdown("### 📊 Анализ реальных сделок")
-    
-    period_analysis = st.selectbox(
-        "Период для анализа",
-        options=[30, 60, 180],
-        key="analysis_period"
-    )
-    
-    trades = db.get_trades_by_period(period_analysis)
-    
-    if trades:
-        display_trades_analysis(trades, initial_capital)
-    else:
-        st.info(f"Нет сделок за последние {period_analysis} дней")
+colp1, colp2, colp3 = st.columns(3)
+period_map = {"30D":30, "60D":60, "180D":180}
+period_key = colp1.selectbox("Период бэктеста", list(period_map.keys()), index=1)
+start_capital = colp2.number_input("Начальный капитал ($)", min_value=50.0, value=300.0, step=50.0)
+commission_pct = colp3.number_input("Комиссия (%) за сделку (taker side)", min_value=0.0, value=0.055, step=0.005, format="%.3f")
 
-def run_backtest(period_days: int, initial_capital: float, commission_rate: float, db: Database) -> dict:
-    """Выполнение бэктеста на исторических данных"""
-    try:
-        # Получаем сделки за период
-        trades = db.get_trades_by_period(period_days)
-        
-        if not trades:
-            return None
-        
-        # Симуляция торговли
-        capital = initial_capital
-        equity_curve = [initial_capital]
-        timestamps = [datetime.now() - timedelta(days=period_days)]
-        
-        total_trades = 0
-        winning_trades = 0
-        total_pnl = 0
-        max_drawdown = 0
-        peak_equity = initial_capital
-        
-        trade_results = []
-        
-        for trade in trades:
-            if trade['status'] == 'closed' and trade['pnl'] is not None:
-                # Применяем комиссию если она отличается от сохраненной
-                pnl = trade['pnl']
-                
-                # Пересчитываем PnL с новой комиссией если нужно
-                if commission_rate != 0.055:  # Стандартная комиссия Bybit
-                    entry_price = trade['entry_price']
-                    exit_price = trade['exit_price'] or entry_price
-                    quantity = trade['quantity']
-                    direction = trade['direction']
-                    
-                    pnl = utils.calculate_pnl(
-                        entry_price, exit_price, quantity, direction,
-                        include_fees=True, fee_rate=commission_rate/100
-                    )
-                
-                capital += pnl
-                total_pnl += pnl
-                total_trades += 1
-                
-                if pnl > 0:
-                    winning_trades += 1
-                
-                # Обновляем кривую equity
-                equity_curve.append(capital)
-                timestamps.append(pd.to_datetime(trade['exit_time']))
-                
-                # Рассчитываем максимальную просадку
-                if capital > peak_equity:
-                    peak_equity = capital
-                
-                current_drawdown = (peak_equity - capital) / peak_equity * 100
-                max_drawdown = max(max_drawdown, current_drawdown)
-                
-                trade_results.append({
-                    'entry_time': trade['entry_time'],
-                    'exit_time': trade['exit_time'],
-                    'direction': trade['direction'],
-                    'pnl': pnl,
-                    'equity': capital,
-                    'rr': trade.get('rr', 0)
-                })
-        
-        # Расчет метрик
-        win_rate = (winning_trades / total_trades * 100) if total_trades > 0 else 0
-        avg_pnl = total_pnl / total_trades if total_trades > 0 else 0
-        total_return = ((capital - initial_capital) / initial_capital * 100) if initial_capital > 0 else 0
-        
-        return {
-            'initial_capital': initial_capital,
-            'final_capital': capital,
-            'total_return': total_return,
-            'total_pnl': total_pnl,
-            'total_trades': total_trades,
-            'winning_trades': winning_trades,
-            'losing_trades': total_trades - winning_trades,
-            'win_rate': win_rate,
-            'avg_pnl': avg_pnl,
-            'max_drawdown': max_drawdown,
-            'equity_curve': equity_curve,
-            'timestamps': timestamps,
-            'trade_results': trade_results
+col1, col2, col3, col4 = st.columns(4)
+symbol = col1.text_input("Символ (Bybit Linear)", value="ETHUSDT")
+interval = col2.selectbox("TF", ["1","3","5","15","30","60","240"], index=3)
+risk_pct = col3.number_input("Риск % на сделку", min_value=0.1, max_value=10.0, value=3.0, step=0.1)
+rr_input = col4.number_input("RR фикса для фильтра NetPnL, R", min_value=0.5, max_value=5.0, value=1.3, step=0.1)
+
+colt1, colt2, colt3, colt4 = st.columns(4)
+enable_smart_trail = colt1.checkbox("✅ Smart Trailing", value=True)
+arm_after_rr = colt2.checkbox("Arm после RR≥X", value=True)
+arm_rr = colt3.number_input("Arm RR (R)", min_value=0.1, max_value=5.0, value=0.5, step=0.1)
+use_bar_trail = colt4.checkbox("Bar High/Low Trail", value=True)
+
+colt5, colt6, colt7 = st.columns(3)
+trailing_perc = colt5.number_input("Trailing %", min_value=0.1, max_value=5.0, value=0.5, step=0.1)
+trailing_offset = colt6.number_input("Offset %", min_value=0.1, max_value=5.0, value=0.4, step=0.1)
+trail_lookback = colt7.number_input("Trail lookback bars", min_value=1, max_value=200, value=50, step=1)
+
+colq1, colq2, colq3 = st.columns(3)
+use_quality = colq1.checkbox("Фильтр качества SFP", value=True)
+wick_min_ticks = colq2.number_input("Min глубина тени (ticks)", min_value=0, value=7, step=1)
+close_back_pct = colq3.number_input("Min close-back % от тени", min_value=0.0, max_value=1.0, value=1.00, step=0.05)
+
+run_btn = st.button("🚀 Запустить бэктест", type="primary", use_container_width=True)
+
+# ==== DATA: Bybit REST v5 ====
+BYBIT_BASE = "https://api.bybit.com"
+KL_ENDPOINT = "/v5/market/kline"
+
+@st.cache_data(show_spinner=False)
+def fetch_bybit_klines(symbol:str, interval:str, start_ms:int, end_ms:int)->pd.DataFrame:
+    """Тянем историю свечей циклом (Bybit v5 /v5/market/kline, max 1000 баров за запрос)."""
+    rows = []
+    cursor = None
+    while True:
+        params = {
+            "category": "linear",
+            "symbol": symbol,
+            "interval": interval,
+            "start": start_ms,
+            "end": end_ms,
+            "limit": 1000
         }
-    
-    except Exception as e:
-        st.error(f"Ошибка при выполнении бэктеста: {e}")
-        return None
+        if cursor:
+            params["cursor"] = cursor
+        r = requests.get(BYBIT_BASE + KL_ENDPOINT, params=params, timeout=30)
+        r.raise_for_status()
+        j = r.json()
+        if j.get("retCode") != 0:
+            raise RuntimeError(f"Bybit error: {j}")
+        result = j.get("result", {})
+        kl = result.get("list", [])
+        if not kl:
+            break
+        rows.extend(kl)
+        cursor = result.get("nextPageCursor")
+        if not cursor:
+            break
+        # анти rate-limit
+        time.sleep(0.15)
+    if not rows:
+        return pd.DataFrame()
+    # Bybit возвращает строки как [startTime, open, high, low, close, volume, turnover]
+    df = pd.DataFrame(rows, columns=["start","open","high","low","close","volume","turnover"])
+    df["start"] = pd.to_datetime(df["start"].astype("int64"), unit="ms", utc=True).dt.tz_convert("UTC")
+    for c in ["open","high","low","close","volume","turnover"]:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+    df = df.sort_values("start").reset_index(drop=True)
+    df = df.rename(columns={"start":"timestamp"})
+    return df[["timestamp","open","high","low","close","volume"]]
 
-def display_backtest_results(results: dict):
-    """Отображение результатов бэктеста"""
-    
-    # === ОСНОВНЫЕ МЕТРИКИ ===
-    st.markdown("### 📊 Результаты бэктеста")
-    
-    col1, col2, col3, col4 = st.columns(4)
-    
-    with col1:
-        st.metric(
-            "💰 Финальный капитал",
-            utils.format_currency(results['final_capital']),
-            delta=utils.format_currency(results['total_pnl'])
-        )
-        st.metric("📊 Всего сделок", results['total_trades'])
-    
-    with col2:
-        st.metric(
-            "📈 Общая доходность",
-            utils.format_percentage(results['total_return']),
-        )
-        st.metric("🎯 Win Rate", utils.format_percentage(results['win_rate']))
-    
-    with col3:
-        st.metric("💵 Общий PnL", utils.format_currency(results['total_pnl']))
-        st.metric("✅ Прибыльных", results['winning_trades'])
-    
-    with col4:
-        st.metric("📉 Макс. просадка", utils.format_percentage(results['max_drawdown']))
-        st.metric("❌ Убыточных", results['losing_trades'])
-    
-    # === КРИВАЯ EQUITY ===
-    st.markdown("### 💰 Кривая Equity")
-    
-    fig_equity = go.Figure()
-    
-    fig_equity.add_trace(go.Scatter(
-        x=results['timestamps'],
-        y=results['equity_curve'],
-        mode='lines',
-        name='Equity',
-        line=dict(color='#1f77b4', width=2)
-    ))
-    
-    fig_equity.update_layout(
-        title="Развитие капитала во времени",
-        xaxis_title="Дата",
-        yaxis_title="Капитал ($)",
-        height=500,
-        showlegend=False
-    )
-    
-    st.plotly_chart(fig_equity, use_container_width=True)
-    
-    # === РАСПРЕДЕЛЕНИЕ PnL ===
-    st.markdown("### 📊 Распределение PnL")
-    
-    if results['trade_results']:
-        pnl_values = [trade['pnl'] for trade in results['trade_results']]
-        
-        col1, col2 = st.columns(2)
-        
-        with col1:
-            # Гистограмма PnL
-            fig_hist = go.Figure(data=[go.Histogram(x=pnl_values, nbinsx=20)])
-            fig_hist.update_layout(
-                title="Распределение PnL по сделкам",
-                xaxis_title="PnL ($)",
-                yaxis_title="Количество сделок",
-                height=400
-            )
-            st.plotly_chart(fig_hist, use_container_width=True)
-        
-        with col2:
-            # Статистика PnL
-            st.markdown("#### 📈 Статистика PnL")
-            
-            pnl_array = np.array(pnl_values)
-            
-            metrics_data = {
-                "Среднее": np.mean(pnl_array),
-                "Медиана": np.median(pnl_array),
-                "Стандартное отклонение": np.std(pnl_array),
-                "Минимум": np.min(pnl_array),
-                "Максимум": np.max(pnl_array),
-                "25-й процентиль": np.percentile(pnl_array, 25),
-                "75-й процентиль": np.percentile(pnl_array, 75)
-            }
-            
-            for metric, value in metrics_data.items():
-                st.write(f"**{metric}:** {utils.format_currency(value)}")
-    
-    # === ТАБЛИЦА СДЕЛОК ===
-    st.markdown("### 📋 Детали сделок")
-    
-    if results['trade_results']:
-        df_trades = pd.DataFrame(results['trade_results'])
-        
-        # Форматирование
-        df_trades['entry_time'] = pd.to_datetime(df_trades['entry_time']).dt.strftime('%Y-%m-%d %H:%M')
-        df_trades['exit_time'] = pd.to_datetime(df_trades['exit_time']).dt.strftime('%Y-%m-%d %H:%M')
-        df_trades['pnl'] = df_trades['pnl'].round(2)
-        df_trades['equity'] = df_trades['equity'].round(2)
-        df_trades['rr'] = df_trades['rr'].round(2)
-        
-        # Переименование колонок
-        column_mapping = {
-            'entry_time': 'Время входа',
-            'exit_time': 'Время выхода',
-            'direction': 'Направление',
-            'pnl': 'PnL ($)',
-            'equity': 'Equity ($)',
-            'rr': 'RR'
-        }
-        
-        df_display = df_trades.rename(columns=column_mapping)
-        
-        st.dataframe(df_display, use_container_width=True, hide_index=True)
+# ==== STRATEGY (приближенно к твоему Pine) ====
+def run_backtest(df: pd.DataFrame)->dict:
+    if df is None or df.empty:
+        return {"trades": pd.DataFrame(), "equity": pd.DataFrame(), "stats": {}}
 
-def display_trades_analysis(trades: list, initial_capital: float):
-    """Анализ реальных сделок"""
-    
-    if not trades:
-        return
-    
-    df = pd.DataFrame(trades)
-    closed_trades = df[df['status'] == 'closed'].copy()
-    
-    if closed_trades.empty:
-        st.info("Нет закрытых сделок для анализа")
-        return
-    
-    # Фильтруем сделки с валидными данными
-    valid_trades = closed_trades.dropna(subset=['pnl', 'entry_time', 'exit_time'])
-    
-    if valid_trades.empty:
-        st.info("Нет валидных данных для анализа")
-        return
-    
-    # === ОСНОВНЫЕ МЕТРИКИ ===
-    col1, col2, col3, col4 = st.columns(4)
-    
-    total_trades = len(valid_trades)
-    winning_trades = len(valid_trades[valid_trades['pnl'] > 0])
-    total_pnl = valid_trades['pnl'].sum()
-    win_rate = (winning_trades / total_trades * 100) if total_trades > 0 else 0
-    
-    with col1:
-        st.metric("📊 Всего сделок", total_trades)
-        st.metric("✅ Прибыльных", winning_trades)
-    
-    with col2:
-        st.metric("🎯 Win Rate", utils.format_percentage(win_rate))
-        st.metric("❌ Убыточных", total_trades - winning_trades)
-    
-    with col3:
-        st.metric("💵 Общий PnL", utils.format_currency(total_pnl))
-        avg_pnl = valid_trades['pnl'].mean()
-        st.metric("📊 Средний PnL", utils.format_currency(avg_pnl))
-    
-    with col4:
-        max_win = valid_trades['pnl'].max()
-        max_loss = valid_trades['pnl'].min()
-        st.metric("📈 Макс. прибыль", utils.format_currency(max_win))
-        st.metric("📉 Макс. убыток", utils.format_currency(max_loss))
-    
-    # === ГРАФИК PnL ПО ВРЕМЕНИ ===
-    st.markdown("### 📈 PnL по времени")
-    
-    valid_trades['exit_time'] = pd.to_datetime(valid_trades['exit_time'])
-    valid_trades = valid_trades.sort_values('exit_time')
-    valid_trades['cumulative_pnl'] = valid_trades['pnl'].cumsum()
-    
-    fig_pnl = go.Figure()
-    
-    # Кумулятивный PnL
-    fig_pnl.add_trace(go.Scatter(
-        x=valid_trades['exit_time'],
-        y=valid_trades['cumulative_pnl'],
-        mode='lines+markers',
-        name='Кумулятивный PnL',
-        line=dict(color='#1f77b4', width=2)
-    ))
-    
-    fig_pnl.update_layout(
-        title="Кумулятивный PnL по времени",
-        xaxis_title="Дата",
-        yaxis_title="PnL ($)",
-        height=400
-    )
-    
-    st.plotly_chart(fig_pnl, use_container_width=True)
-    
-    # === ДОПОЛНИТЕЛЬНАЯ СТАТИСТИКА ===
-    col1, col2 = st.columns(2)
-    
-    with col1:
-        st.markdown("#### 📊 Распределение по направлениям")
-        direction_counts = valid_trades['direction'].value_counts()
-        for direction, count in direction_counts.items():
-            st.write(f"**{direction.upper()}:** {count} сделок")
-    
-    with col2:
-        st.markdown("#### ⏱️ Статистика времени удержания")
-        if 'entry_time' in valid_trades.columns:
-            valid_trades['entry_time'] = pd.to_datetime(valid_trades['entry_time'])
-            valid_trades['hold_time'] = (valid_trades['exit_time'] - valid_trades['entry_time']).dt.total_seconds() / 3600
-            
-            avg_hold_time = valid_trades['hold_time'].mean()
-            max_hold_time = valid_trades['hold_time'].max()
-            min_hold_time = valid_trades['hold_time'].min()
-            
-            st.write(f"**Среднее время:** {utils.format_time_duration(avg_hold_time)}")
-            st.write(f"**Максимальное:** {utils.format_time_duration(max_hold_time)}")
-            st.write(f"**Минимальное:** {utils.format_time_duration(min_hold_time)}")
+    df = df.copy()
+    df["mTick"] = (df["close"] * 0 + 0.01)  # приближение; реально mintick зависят от символа/биржи
 
-if __name__ == "__main__":
-    main()
+    # pivot SFP на 15m = sfpLen=2, lookback 1 бар между плечами
+    sfpLen = 2
+    # делаем свинг-экстремумы
+    def pivot_low(i):
+        if i-sfpLen-1 < 0 or i+1 >= len(df): return False
+        window = df["low"].iloc[i-sfpLen-1:i+2]
+        return df["low"].iloc[i] == window.min() and df["low"].iloc[i] < df["low"].iloc[i-sfpLen]
+    def pivot_high(i):
+        if i-sfpLen-1 < 0 or i+1 >= len(df): return False
+        window = df["high"].iloc[i-sfpLen-1:i+2]
+        return df["high"].iloc[i] == window.max() and df["high"].iloc[i] > df["high"].iloc[i-sfpLen]
+
+    # сигналы
+    bull_sig = []
+    bear_sig = []
+    for i in range(len(df)):
+        bl = pivot_low(i) and (df["open"].iloc[i] > df["low"].iloc[i-sfpLen]) and (df["close"].iloc[i] > df["low"].iloc[i-sfpLen]) and (df["low"].iloc[i] < df["low"].iloc[i-sfpLen])
+        bh = pivot_high(i) and (df["open"].iloc[i] < df["high"].iloc[i-sfpLen]) and (df["close"].iloc[i] < df["high"].iloc[i-sfpLen]) and (df["high"].iloc[i] > df["high"].iloc[i-sfpLen])
+        bull_sig.append(bl)
+        bear_sig.append(bh)
+    df["bull"] = bull_sig
+    df["bear"] = bear_sig
+
+    # фильтр качества SFP
+    df["bullWickDepth"] = np.where(df["bull"], df["low"].shift(sfpLen) - df["low"], 0.0)
+    df["bearWickDepth"] = np.where(df["bear"], df["high"] - df["high"].shift(sfpLen), 0.0)
+    df["bullCloseBackOK"] = (df["close"] - df["low"]) >= df["bullWickDepth"] * close_back_pct
+    df["bearCloseBackOK"] = (df["high"] - df["close"]) >= df["bearWickDepth"] * close_back_pct
+    if use_quality:
+        df["bull"] = df["bull"] & (df["bullWickDepth"] >= wick_min_ticks * df["mTick"]) & df["bullCloseBackOK"]
+        df["bear"] = df["bear"] & (df["bearWickDepth"] >= wick_min_ticks * df["mTick"]) & df["bearCloseBackOK"]
+
+    # симуляция
+    capital = start_capital
+    taker_fee = commission_pct / 100.0
+    trades = []
+    pos = 0  # 0 / +qty / -qty
+    entry = sl = qty = 0.0
+    long_armed = short_armed = (not arm_after_rr)
+
+    for i in range(1, len(df)):
+        o,h,l,c = df.loc[df.index[i], ["open","high","low","close"]]
+        ts = df.loc[df.index[i], "timestamp"]
+
+        # exits: trailing/bar-based
+        if pos > 0:
+            # bar trail
+            if enable_smart_trail and use_bar_trail and long_armed:
+                lb_low = df["low"].iloc[max(0, i-int(trail_lookback)):i].min()
+                bar_stop = max(lb_low, sl)
+                if l <= bar_stop:  # выбило стопом
+                    exit_price = bar_stop
+                    pnl = (exit_price - entry) * qty
+                    fee = (entry + exit_price) * qty * taker_fee
+                    capital += pnl - fee
+                    trades.append([ts, "LONG", entry, exit_price, qty, pnl - fee, capital])
+                    pos = 0
+                    qty = 0
+                    continue
+            # simple trailing % (fallback)
+            if enable_smart_trail and not use_bar_trail:
+                trail = entry * (trailing_perc/100.0)
+                trail_px = c - trail
+                ts_px = max(trail_px, sl)
+                if l <= ts_px:
+                    exit_price = ts_px
+                    pnl = (exit_price - entry) * qty
+                    fee = (entry + exit_price) * qty * taker_fee
+                    capital += pnl - fee
+                    trades.append([ts, "LONG", entry, exit_price, qty, pnl - fee, capital])
+                    pos = 0
+                    qty = 0
+                    continue
+
+        if pos < 0:
+            if enable_smart_trail and use_bar_trail and short_armed:
+                lb_high = df["high"].iloc[max(0, i-int(trail_lookback)):i].max()
+                bar_stop = min(lb_high, sl)
+                if h >= bar_stop:
+                    exit_price = bar_stop
+                    pnl = (entry - exit_price) * abs(qty)
+                    fee = (entry + exit_price) * abs(qty) * taker_fee
+                    capital += pnl - fee
+                    trades.append([ts, "SHORT", entry, exit_price, abs(qty), pnl - fee, capital])
+                    pos = 0; qty = 0
+                    continue
+            if enable_smart_trail and not use_bar_trail:
+                trail = entry * (trailing_perc/100.0)
+                trail_px = c + trail
+                ts_px = min(trail_px, sl)
+                if h >= ts_px:
+                    exit_price = ts_px
+                    pnl = (entry - exit_price) * abs(qty)
+                    fee = (entry + exit_price) * abs(qty) * taker_fee
+                    capital += pnl - fee
+                    trades.append([ts, "SHORT", entry, exit_price, abs(qty), pnl - fee, capital])
+                    pos = 0; qty = 0
+                    continue
+
+        # arm RR
+        if arm_after_rr and pos > 0 and not long_armed:
+            moved = c - entry
+            need = (entry - sl) * arm_rr
+            long_armed = moved >= need
+        if arm_after_rr and pos < 0 and not short_armed:
+            moved = entry - c
+            need = (sl - entry) * arm_rr
+            short_armed = moved >= need
+
+        # entries (только если flat)
+        if pos == 0:
+            if df["bull"].iloc[i]:
+                sl = df["low"].shift(1).iloc[i]
+                entry = c
+                stop_size = entry - sl
+                if stop_size > 0:
+                    risk_amt = capital * (risk_pct/100.0)
+                    qty = risk_amt / stop_size
+                    pos = +1
+                    long_armed = (not arm_after_rr)
+            elif df["bear"].iloc[i]:
+                sl = df["high"].shift(1).iloc[i]
+                entry = c
+                stop_size = sl - entry
+                if stop_size > 0:
+                    risk_amt = capital * (risk_pct/100.0)
+                    qty = risk_amt / stop_size
+                    pos = -1
+                    short_armed = (not arm_after_rr)
+
+    trades_df = pd.DataFrame(trades, columns=["time","side","entry","exit","qty","net_pnl","equity"])
+    eq = trades_df[["time","equity"]].copy()
+    return {"trades": trades_df, "equity": eq, "stats": {"final_capital": (trades_df["equity"].iloc[-1] if len(trades_df)>0 else start_capital)}}
+
+# ==== RUN ====
+if run_btn:
+    days = period_map[period_key]
+    end_dt = datetime.now(timezone.utc).replace(second=0, microsecond=0)
+    start_dt = end_dt - timedelta(days=days)
+    st.write(f"Загрузка данных Bybit: {symbol} {interval}m  {start_dt:%Y-%m-%d} → {end_dt:%Y-%m-%d}")
+    df = fetch_bybit_klines(symbol, interval, int(start_dt.timestamp()*1000), int(end_dt.timestamp()*1000))
+    if df is None or df.empty:
+        st.error("Не удалось получить исторические данные. Проверь SYMBOL/interval/доступность Bybit.")
+        st.stop()
+
+    res = run_backtest(df)
+    trades = res["trades"]
+    equity = res["equity"]
+
+    colA, colB = st.columns([2,1])
+    with colA:
+        st.subheader("Equity")
+        if not equity.empty:
+            equity = equity.set_index("time")
+            st.line_chart(equity)
+        else:
+            st.info("Сделок нет за выбранный период.")
+    with colB:
+        st.subheader("Итог")
+        st.metric("Финальный капитал", f"${res['stats'].get('final_capital', start_capital):,.2f}")
+        st.metric("Сделок", len(trades))
+
+    st.subheader("Сделки")
+    st.dataframe(trades, use_container_width=True)
