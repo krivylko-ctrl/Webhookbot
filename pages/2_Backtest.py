@@ -71,14 +71,14 @@ def _normalize_klines(raw: List[Dict]) -> List[Dict]:
 @st.cache_data(show_spinner=False)
 def load_klines_bybit_window(symbol: str, days: int) -> List[Dict]:
     """
-    Реальные 15m свечи Bybit Futures за точное окно [UTC-сейчас - days, UTC-сейчас].
-    Пытаемся пройтись пагинацией: запрашиваем "до" некоторой точки и двигаем окно назад,
-    пока не соберём весь диапазон. Работает с большинством обёрток Bybit v5.
+    Реальные 15m свечи Bybit Futures за [UTC-сейчас - days, UTC-сейчас].
+    Совместимо с разными обёртками: пробуем несколько сигнатур.
+    Если пагинации нет – берём большой limit и обрезаем окно.
     """
     _api = BybitAPI(api_key=os.getenv("BYBIT_API_KEY"),
                     api_secret=os.getenv("BYBIT_API_SECRET"))
 
-    # выбрать фьючерсную/линейную категорию, если метод есть
+    # выбрать фьючерсную категорию, если метод есть
     try:
         if hasattr(_api, "set_market_type"):
             for mt in ("linear", "contract", "futures"):
@@ -91,62 +91,77 @@ def load_klines_bybit_window(symbol: str, days: int) -> List[Dict]:
         pass
 
     start_ms, end_ms = _window_ms(days)
+    want_bars = days * 96  # 96 баров на день на 15м
+    max_chunk = 1000
 
-    # хотим ~96 баров/день * days, но берём с запасом
-    want_bars = days * 96
-    max_chunk = 1000  # общий лимит bybit за вызов на большинстве эндпоинтов
     bars: List[Dict] = []
 
-    # будем идти НАЗАД от end_ms
-    cursor_end = end_ms
-    safety = 0
-    while len(bars) < want_bars and cursor_end > start_ms and safety < 20:
-        safety += 1
-        limit = min(max_chunk, want_bars - len(bars) + 200)
+    # ---------- Вариант А: простая выборка последнего большого куска ----------
+    # многие обёртки поддерживают только (symbol, interval, limit)
+    try:
+        raw = _api.get_klines(symbol, "15", min(max_chunk, want_bars + 200)) or []
+        if raw:
+            chunk = _normalize_klines(raw)
+            bars = [b for b in chunk if start_ms <= b["timestamp"] <= end_ms]
+    except Exception:
+        pass
 
-        raw = []
-        # набор "гибких" вариантов вызова (у разных обёрток параметры различаются)
-        for kwargs in (
-            {"symbol": symbol, "interval": "15", "limit": limit, "end": cursor_end},
-            {"symbol": symbol, "interval": "15", "limit": limit, "to": cursor_end},
-            {"symbol": symbol, "interval": "15", "limit": limit, "endTime": cursor_end},
-            {"symbol": symbol, "category": "linear", "interval": "15", "limit": limit, "end": cursor_end},
-        ):
-            try:
-                raw = _api.get_klines(**kwargs) or []
-                if raw:
-                    break
-            except TypeError:
-                continue
-            except Exception:
-                raw = []
-        if not raw:
-            break
+    # если данных не хватило – попробуем пагинацию по from/start
+    if len(bars) < want_bars * 0.9:
+        cursor_from = start_ms
+        safety = 0
+        while cursor_from < end_ms and len(bars) < want_bars + 300 and safety < 30:
+            safety += 1
+            limit = min(max_chunk, want_bars - len(bars) + 300)
 
-        chunk = _normalize_klines(raw)
-        # оставим только то, что попадает в окно
-        chunk = [b for b in chunk if start_ms <= b["timestamp"] <= end_ms]
+            raw = []
+            # разные варианты параметров "начала"
+            for kwargs in (
+                {"symbol": symbol, "interval": "15", "limit": limit, "from": int(cursor_from // 1000)},   # сек
+                {"symbol": symbol, "interval": "15", "limit": limit, "start": cursor_from},               # мс
+                {"symbol": symbol, "interval": "15", "limit": limit, "startTime": cursor_from},           # мс
+            ):
+                try:
+                    raw = _api.get_klines(**kwargs) or []
+                    if raw:
+                        break
+                except TypeError:
+                    continue
+                except Exception:
+                    raw = []
 
-        if not chunk:
-            break
+            if not raw:
+                break
 
-        # двигаем "курсор" назад от самого старого в чанке
-        oldest = chunk[0]["timestamp"]
-        cursor_end = oldest - 1
+            chunk = _normalize_klines(raw)
+            if not chunk:
+                break
 
-        bars.extend(chunk)
+            # фильтруем строго по окну
+            chunk = [b for b in chunk if start_ms <= b["timestamp"] <= end_ms]
+            if not chunk:
+                break
 
-        # защита от дубликатов
-        bars = sorted({b["timestamp"]: b for b in bars}.values(), key=lambda x: x["timestamp"])
+            bars.extend(chunk)
+            # защита от дубликатов
+            bars = sorted({b["timestamp"]: b for b in bars}.values(), key=lambda x: x["timestamp"])
 
-    # если данных много — обрезаем строго по окну
+            # сдвигаем курсор вперёд
+            cursor_from = bars[-1]["timestamp"] + 1
+
+    # финальная очистка окна
     bars = [b for b in bars if start_ms <= b["timestamp"] <= end_ms]
+    bars.sort(key=lambda x: x["timestamp"])
 
-    # sanity-check: последняя свеча должна быть не старше ~часа от UTC-сейчас
-    if bars:
-        last_gap_min = int((_utc_now_ms() - bars[-1]["timestamp"]) / 60_000)
-        if last_gap_min > 120:
-            st.warning(f"Последняя свеча отстаёт на {last_gap_min} мин. Проверь категорию/символ/таймзону API.")
+    # диагностический вывод (помогает понять, почему пусто)
+    if not bars:
+        st.warning("Не удалось получить исторические свечи Bybit за выбранный период. "
+                   "Скорее всего, обёртка get_klines поддерживает только (symbol, interval, limit).")
+    else:
+        first_dt = datetime.utcfromtimestamp(bars[0]["timestamp"]/1000)
+        last_dt  = datetime.utcfromtimestamp(bars[-1]["timestamp"]/1000)
+        st.caption(f"Свечи загружены: {len(bars)} шт.  "
+                   f"окно: {first_dt:%Y-%m-%d %H:%M} — {last_dt:%Y-%m-%d %H:%M} UTC")
 
     return bars
 
