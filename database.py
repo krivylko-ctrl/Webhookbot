@@ -138,13 +138,20 @@ class Database:
                     None if trade_data.get("stop_loss") is None else float(trade_data.get("stop_loss")),
                     None if trade_data.get("take_profit") is None else float(trade_data.get("take_profit")),
                     float(trade_data.get("quantity")),
-                    _to_iso(trade_data.get("entry_time") or datetime.utcnow()),
+                    to_iso(trade_data.get("entry_time") or datetime.utcnow()),
                     trade_data.get("status", "open"),
                 ),
             )
-            trade_id = c.lastrowid or 0
             conn.commit()
-            return trade_id
+            return c.lastrowid   # <-- возвращаем id
+
+    def add_trade(self, trade_data: Dict) -> int:
+        """
+        Backward-compat alias.
+        Старый код мог вызывать db.add_trade(...). Делаем совместимость,
+        проксируя в save_trade(...).
+        """
+        return self.save_trade(trade_data)
 
     def update_trade_exit(self, trade_data: Dict, fee_rate: float = 0.00055):
         """
