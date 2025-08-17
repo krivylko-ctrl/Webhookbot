@@ -1,270 +1,287 @@
 import streamlit as st
-import pandas as pd
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
+import pandas as pd
 from datetime import datetime, timedelta
-import time
+import sys
+import os
+from math import isnan
 
-from bybit_api import BybitAPI
-from kwin_strategy import KWINStrategy
-from state_manager import StateManager
+# Добавляем путь к родительской директории
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from analytics import TradingAnalytics, TrailingLogger
 from database import Database
-from config import Config
-import utils
 
-st.set_page_config(page_title="Dashboard", page_icon="📊", layout="wide")
+# ===================== Вспомогательные =====================
+
+def _safe_num(x, default=0.0):
+    try:
+        if x is None:
+            return default
+        if isinstance(x, (int, float)):
+            return float(x)
+        if isinstance(x, str) and x.strip() == "":
+            return default
+        v = float(x)
+        if v != v:  # NaN
+            return default
+        return v
+    except Exception:
+        return default
+
+def _compute_max_drawdown_pct(equity_curve: pd.Series) -> float:
+    """Максимальная просадка в % по equity_curve."""
+    if equity_curve is None or equity_curve.empty:
+        return 0.0
+    roll_max = equity_curve.cummax()
+    dd = (equity_curve / roll_max - 1.0) * 100.0
+    return float(dd.min()) if not dd.empty else 0.0
+
+def _compute_max_drawdown_abs(equity_curve: pd.Series) -> float:
+    """Максимальная абсолютная просадка ($) по equity_curve."""
+    if equity_curve is None or equity_curve.empty:
+        return 0.0
+    roll_max = equity_curve.cummax()
+    dd_abs = equity_curve - roll_max
+    return float(dd_abs.min()) if not dd_abs.empty else 0.0
+
+def _to_equity_series(equity_curve_raw) -> pd.Series:
+    """Преобразует что угодно в pd.Series для расчётов просадок."""
+    try:
+        if equity_curve_raw is None:
+            return pd.Series(dtype=float)
+
+        if isinstance(equity_curve_raw, dict):
+            df = pd.DataFrame(
+                [{"timestamp": k, "equity": v} for k, v in equity_curve_raw.items()]
+            )
+        else:
+            # предполагаем list
+            if len(equity_curve_raw) == 0:
+                return pd.Series(dtype=float)
+            if isinstance(equity_curve_raw[0], dict):
+                df = pd.DataFrame(equity_curve_raw)
+            else:
+                # list of tuples
+                df = pd.DataFrame(equity_curve_raw, columns=["timestamp", "equity"])
+
+        if "timestamp" not in df.columns or "equity" not in df.columns:
+            return pd.Series(dtype=float)
+
+        # нормализация времени
+        ts = pd.to_datetime(df["timestamp"], unit="ms", errors="coerce")
+        if ts.isna().all():
+            # попробуем без unit
+            ts = pd.to_datetime(df["timestamp"], errors="coerce")
+        df["ts"] = ts
+        df = df.dropna(subset=["ts"]).sort_values("ts")
+        s = pd.Series(df["equity"].astype(float).values, index=df["ts"].values)
+        return s
+    except Exception:
+        return pd.Series(dtype=float)
+
+# ===================== Графики =====================
+
+def create_performance_chart(stats: dict):
+    """Создание графика производительности"""
+    fig = make_subplots(
+        rows=2, cols=2,
+        subplot_titles=[
+            'Winrate по направлениям (%)',
+            'PnL метрики (USDT)',
+            'Risk/Reward статистика',
+            'ROI динамика (%)'
+        ],
+        specs=[[{"type": "bar"}, {"type": "bar"}],
+               [{"type": "bar"}, {"type": "scatter"}]]
+    )
+    
+    # 1. Winrate
+    winrate = stats.get('winrate', {})
+    wr_total = _safe_num(winrate.get('total', 0))
+    wr_long  = _safe_num(winrate.get('long', 0))
+    wr_short = _safe_num(winrate.get('short', 0))
+
+    fig.add_trace(
+        go.Bar(
+            x=['Total', 'Long', 'Short'],
+            y=[wr_total, wr_long, wr_short],
+            name='Winrate'
+        ),
+        row=1, col=1
+    )
+    
+    # 2. PnL метрики
+    pnl = stats.get('pnl', {})
+    total_pnl   = _safe_num(pnl.get('total_pnl', 0))
+    gross_profit= _safe_num(pnl.get('gross_profit', 0))
+    gross_loss  = _safe_num(pnl.get('gross_loss', 0))
+    avg_win     = _safe_num(pnl.get('avg_win', 0))
+    avg_loss    = _safe_num(pnl.get('avg_loss', 0))
+
+    bars = [total_pnl, gross_profit, -abs(gross_loss), avg_win, -abs(avg_loss)]
+    colors = ['#00D4AA' if x >= 0 else '#FF4B4B' for x in bars]
+    fig.add_trace(
+        go.Bar(
+            x=['Total PnL', 'Gross Profit', 'Gross Loss', 'Avg Win', 'Avg Loss'],
+            y=bars,
+            name='PnL',
+            marker_color=colors
+        ),
+        row=1, col=2
+    )
+    
+    # 3. Risk/Reward
+    rr = stats.get('risk_reward', {})
+    fig.add_trace(
+        go.Bar(
+            x=['Avg RR', 'Max RR', 'Min RR'],
+            y=[_safe_num(rr.get('avg_rr', 0)),
+               _safe_num(rr.get('max_rr', 0)),
+               _safe_num(rr.get('min_rr', 0))],
+            name='Risk/Reward'
+        ),
+        row=2, col=1
+    )
+    
+    # 4. ROI
+    roi = stats.get('roi', {})
+    fig.add_trace(
+        go.Scatter(
+            x=['Total ROI', 'Monthly ROI', 'Daily ROI'],
+            y=[_safe_num(roi.get('total_roi', 0)),
+               _safe_num(roi.get('monthly_roi', 0)),
+               _safe_num(roi.get('daily_roi', 0))],
+            mode='lines+markers',
+            name='ROI'
+        ),
+        row=2, col=2
+    )
+    
+    fig.update_layout(
+        height=600,
+        showlegend=False,
+        title_text="Комплексная аналитика торгов",
+        title_x=0.5
+    )
+    
+    return fig
+
+def create_equity_drawdown_chart(equity_curve: pd.Series):
+    """Строит 2 оси: Equity ($) и Drawdown (%)"""
+    if equity_curve is None or equity_curve.empty:
+        return go.Figure()
+
+    roll_max = equity_curve.cummax()
+    dd_pct = (equity_curve / roll_max - 1.0) * 100.0
+
+    fig = make_subplots(rows=1, cols=1, specs=[[{"secondary_y": True}]])
+    fig.add_trace(
+        go.Scatter(x=equity_curve.index, y=equity_curve.values, name="Equity ($)", mode="lines"),
+        row=1, col=1, secondary_y=False
+    )
+    fig.add_trace(
+        go.Scatter(x=dd_pct.index, y=dd_pct.values, name="Drawdown (%)", mode="lines"),
+        row=1, col=1, secondary_y=True
+    )
+    fig.update_layout(height=420, title_text="Equity & Drawdown")
+    fig.update_yaxes(title_text="Equity ($)", secondary_y=False)
+    fig.update_yaxes(title_text="Drawdown (%)", secondary_y=True)
+    return fig
+
+# ===================== Инициализация =====================
+
+st.set_page_config(
+    page_title="KWIN Bot - Аналитика",
+    page_icon="📈",
+    layout="wide"
+)
+
+@st.cache_resource
+def init_analytics():
+    """Инициализация модулей аналитики"""
+    db = Database()
+    analytics = TradingAnalytics()
+    trail_logger = TrailingLogger()
+    return analytics, trail_logger, db
 
 def main():
-    st.title("📊 Dashboard")
+    """Основная функция страницы аналитики"""
+    st.title("📈 Аналитика и статистика KWIN Bot")
+    st.markdown("---")
     
-    # Инициализация компонентов (используем кэширование)
-    @st.cache_resource
-    def init_components():
-        config = Config()
-        db = Database()
-        state_manager = StateManager(db)
-        
-        # API ключи из environment variables
-        import os
-        api_key = os.getenv("BYBIT_API_KEY", "")
-        api_secret = os.getenv("BYBIT_API_SECRET", "")
-        
-        if api_key and api_secret:
-            bybit_api = BybitAPI(api_key, api_secret, testnet=False)
-        else:
-            bybit_api = None
-        
-        strategy = KWINStrategy(config, bybit_api, state_manager, db)
-        
-        return config, db, state_manager, bybit_api, strategy
+    analytics, trail_logger, db = init_analytics()
     
-    config, db, state_manager, bybit_api, strategy = init_components()
-    
-    # Проверка подключения
-    if bybit_api is None:
-        st.error("⚠️ API ключи Bybit не настроены")
-        st.stop()
-    
-    # Автообновление каждые 5 секунд
-    if 'last_update' not in st.session_state:
-        st.session_state.last_update = 0
-    
-    current_time = time.time()
-    if current_time - st.session_state.last_update > 5:
-        st.session_state.last_update = current_time
-        if bybit_api:
-            strategy.run_cycle()
-        st.rerun()
-    
-    # === ОСНОВНЫЕ МЕТРИКИ ===
-    st.markdown("### 📈 Основные метрики")
-    
-    col1, col2, col3, col4, col5 = st.columns(5)
-    
+    # Период анализа
+    col1, col2 = st.columns([3, 1])
     with col1:
-        equity = state_manager.get_equity()
-        st.metric("💰 Equity", f"${equity:.2f}")
-    
+        st.subheader("📊 Периодная аналитика")
     with col2:
-        position = state_manager.get_current_position()
-        if position:
-            pos_text = f"{position.get('size', 0):.4f} ETH"
-            pos_direction = position.get('direction', '').upper()
-            st.metric("📍 Позиция", f"{pos_direction} {pos_text}")
-        else:
-            st.metric("📍 Позиция", "Нет позиции")
+        period = st.selectbox(
+            "Период:",
+            [30, 60, 90, 180],
+            index=0,
+            format_func=lambda x: f"{x} дней"
+        )
     
-    with col3:
+    # Получаем статистику
+    try:
+        stats = analytics.get_comprehensive_stats(period)
+        
+        # Equity curve
+        equity_curve_raw = None
         try:
-            ticker = bybit_api.get_ticker("ETHUSDT")
-            current_price = ticker['last_price'] if ticker else 0
-            st.metric("💹 Цена ETH", f"${current_price:.2f}")
-        except:
-            st.metric("💹 Цена ETH", "Ошибка")
-    
-    with col4:
-        trades_today = db.get_trades_count_today()
-        st.metric("📊 Сделки сегодня", trades_today)
-    
-    with col5:
-        pnl_today = db.get_pnl_today()
-        st.metric("💵 PnL сегодня", utils.format_currency(pnl_today))
-    
-    # === ТЕКУЩАЯ ПОЗИЦИЯ ===
-    if position:
-        st.markdown("### 🎯 Текущая позиция")
+            if hasattr(analytics, "get_equity_curve"):
+                equity_curve_raw = analytics.get_equity_curve(period)
+        except Exception:
+            equity_curve_raw = None
+        equity_series = _to_equity_series(equity_curve_raw)
+
+        total_trades = int(_safe_num(stats.get('total_trades', 0)))
         
-        col1, col2, col3, col4 = st.columns(4)
-        
-        with col1:
-            st.write(f"**Направление:** {position.get('direction', '').upper()}")
-            st.write(f"**Размер:** {position.get('size', 0):.4f} ETH")
-        
-        with col2:
-            entry_price = position.get('entry_price', 0)
-            st.write(f"**Вход:** ${entry_price:.2f}")
-            
-            # Текущий PnL
-            if current_price and entry_price:
-                current_pnl = utils.calculate_pnl(
-                    entry_price, current_price, position.get('size', 0), 
-                    position.get('direction'), include_fees=True
-                )
-                pnl_color = "green" if current_pnl >= 0 else "red"
-                st.markdown(f"**Текущий PnL:** <span style='color:{pnl_color}'>{utils.format_currency(current_pnl)}</span>", 
-                           unsafe_allow_html=True)
-        
-        with col3:
-            st.write(f"**Stop Loss:** ${position.get('stop_loss', 0):.2f}")
-            st.write(f"**Take Profit:** ${position.get('take_profit', 0):.2f}")
-        
-        with col4:
-            armed_status = "🟢 Armed" if position.get('armed', False) else "🔴 Not Armed"
-            st.write(f"**Статус:** {armed_status}")
-            
-            # Текущий RR
-            if current_price and entry_price:
-                current_rr = utils.calculate_rr(
-                    entry_price, current_price, position.get('stop_loss', 0), 
-                    position.get('direction')
-                )
-                st.write(f"**Текущий RR:** {current_rr:.2f}")
-    
-    # === СТАТИСТИКА ЗА ПЕРИОДЫ ===
-    st.markdown("### 📊 Статистика производительности")
-    
-    period_tabs = st.tabs(["30 дней", "60 дней", "180 дней"])
-    
-    for i, period in enumerate([30, 60, 180]):
-        with period_tabs[i]:
-            stats = db.get_performance_stats(days=period)
-            
-            col1, col2, col3, col4 = st.columns(4)
+        if total_trades > 0:
+            # Основные метрики
+            col1, col2, col3, col4, col5 = st.columns(5)
             
             with col1:
-                st.metric("Всего сделок", stats.get('total_trades', 0))
-                st.metric("Прибыльных", stats.get('winning_trades', 0))
+                st.metric("Всего сделок", total_trades)
             
             with col2:
-                win_rate = stats.get('win_rate', 0)
-                st.metric("Win Rate", utils.format_percentage(win_rate))
-                avg_rr = stats.get('avg_rr', 0)
-                st.metric("Средний RR", f"{avg_rr:.2f}")
+                winrate = _safe_num(stats.get('winrate', {}).get('total', 0))
+                st.metric("Общий Winrate", f"{winrate:.2f}%")
             
             with col3:
-                total_pnl = stats.get('total_pnl', 0)
-                st.metric("Общий PnL", utils.format_currency(total_pnl))
-                avg_pnl = stats.get('avg_pnl', 0)
-                st.metric("Средний PnL", utils.format_currency(avg_pnl))
+                total_pnl = _safe_num(stats.get('pnl', {}).get('total_pnl', 0))
+                pnl_color = "normal" if total_pnl >= 0 else "inverse"
+                st.metric("Общий PnL", f"${total_pnl:.2f}", delta_color=pnl_color)
             
             with col4:
-                max_win = stats.get('max_win', 0)
-                st.metric("Макс. прибыль", utils.format_currency(max_win))
-                max_loss = stats.get('max_loss', 0)
-                st.metric("Макс. убыток", utils.format_currency(max_loss))
-    
-    # === ГРАФИК EQUITY ===
-    st.markdown("### 💰 Кривая Equity")
-    
-    equity_data = db.get_equity_history(days=30)
-    
-    if equity_data:
-        df_equity = pd.DataFrame(equity_data)
-        df_equity['timestamp'] = pd.to_datetime(df_equity['timestamp'])
-        
-        fig_equity = go.Figure()
-        fig_equity.add_trace(go.Scatter(
-            x=df_equity['timestamp'],
-            y=df_equity['equity'],
-            mode='lines',
-            name='Equity',
-            line=dict(color='#1f77b4', width=2)
-        ))
-        
-        fig_equity.update_layout(
-            title="Изменение Equity за последние 30 дней",
-            xaxis_title="Дата",
-            yaxis_title="Equity ($)",
-            height=400,
-            showlegend=False
-        )
-        
-        st.plotly_chart(fig_equity, use_container_width=True)
-    else:
-        st.info("Нет данных для отображения кривой equity")
-    
-    # === ПОСЛЕДНИЕ СДЕЛКИ ===
-    st.markdown("### 📋 Последние сделки")
-    
-    recent_trades = db.get_recent_trades(10)
-    
-    if recent_trades:
-        df_trades = pd.DataFrame(recent_trades)
-        
-        # Форматирование для отображения
-        display_columns = ['entry_time', 'direction', 'entry_price', 'exit_price', 
-                          'quantity', 'pnl', 'rr', 'status']
-        
-        for col in display_columns:
-            if col in df_trades.columns:
-                if col == 'entry_time':
-                    df_trades[col] = pd.to_datetime(df_trades[col]).dt.strftime('%Y-%m-%d %H:%M')
-                elif col in ['pnl']:
-                    df_trades[col] = df_trades[col].round(2)
-                elif col in ['rr']:
-                    df_trades[col] = df_trades[col].round(2)
-                elif col in ['entry_price', 'exit_price']:
-                    df_trades[col] = df_trades[col].round(2)
-                elif col in ['quantity']:
-                    df_trades[col] = df_trades[col].round(4)
-        
-        # Переименование колонок для отображения
-        column_mapping = {
-            'entry_time': 'Время входа',
-            'direction': 'Направление',
-            'entry_price': 'Цена входа',
-            'exit_price': 'Цена выхода',
-            'quantity': 'Количество',
-            'pnl': 'PnL ($)',
-            'rr': 'RR',
-            'status': 'Статус'
-        }
-        
-        df_display = df_trades[display_columns].rename(columns=column_mapping)
-        
-        st.dataframe(df_display, use_container_width=True, hide_index=True)
-    else:
-        st.info("Нет сделок для отображения")
-    
-    # === УПРАВЛЕНИЕ БОТОМ ===
-    st.markdown("### 🎛️ Управление ботом")
-    
-    col1, col2, col3 = st.columns(3)
-    
-    with col1:
-        if st.button("▶️ Запустить бота", use_container_width=True):
-            state_manager.set_bot_status("running")
-            st.success("Бот запущен!")
-            st.rerun()
-    
-    with col2:
-        if st.button("⏹️ Остановить бота", use_container_width=True):
-            state_manager.set_bot_status("stopped")
-            st.warning("Бот остановлен!")
-            st.rerun()
-    
-    with col3:
-        if st.button("🔄 Обновить данные", use_container_width=True):
-            if bybit_api:
-                strategy.run_cycle()
-            st.success("Данные обновлены!")
-            st.rerun()
-    
-    # Статус бота
-    bot_status = state_manager.get_bot_status()
-    status_color = "green" if bot_status == "running" else "red"
-    st.markdown(f"**Статус бота:** <span style='color:{status_color}'>{bot_status.upper()}</span>", 
-               unsafe_allow_html=True)
+                profit_factor = _safe_num(stats.get('pnl', {}).get('profit_factor', 0))
+                st.metric("Profit Factor", f"{profit_factor:.2f}")
+            
+            with col5:
+                avg_rr = _safe_num(stats.get('risk_reward', {}).get('avg_rr', 0))
+                st.metric("Средний RR", f"{avg_rr:.2f}")
+            
+            # Графики производительности
+            st.plotly_chart(
+                create_performance_chart(stats),
+                use_container_width=True
+            )
+
+            # Equity & Drawdown
+            if equity_series is not None and not equity_series.empty:
+                st.subheader("📉 Equity & Drawdown")
+                st.plotly_chart(
+                    create_equity_drawdown_chart(equity_series),
+                    use_container_width=True
+                )
+        else:
+            st.info("Нет торговых данных для анализа за выбранный период")
+            
+    except Exception as e:
+        st.error(f"Ошибка получения статистики: {e}")
 
 if __name__ == "__main__":
     main()
