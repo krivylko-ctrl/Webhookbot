@@ -70,25 +70,30 @@ def _normalize_klines(raw: List[Dict]) -> List[Dict]:
 
 @st.cache_data(show_spinner=False)
 def load_klines_bybit_window(symbol: str, days: int) -> List[Dict]:
-    """
-    Реальные 15m свечи Bybit Futures за [UTC-сейчас - days, UTC-сейчас].
-    Совместимо с разными обёртками: пробуем несколько сигнатур.
-    Если пагинации нет – берём большой limit и обрезаем окно.
-    """
     _api = BybitAPI(api_key=os.getenv("BYBIT_API_KEY"),
                     api_secret=os.getenv("BYBIT_API_SECRET"))
-
-    # выбрать фьючерсную категорию, если метод есть
+    # выбрать фьючерсы, если умеет
     try:
         if hasattr(_api, "set_market_type"):
-            for mt in ("linear", "contract", "futures"):
-                try:
-                    _api.set_market_type(mt)
-                    break
-                except Exception:
-                    continue
+            _api.set_market_type("linear")
     except Exception:
         pass
+
+    start_ms, end_ms = _window_ms(days)
+
+    # 1) пробуем новый метод с окном
+    if hasattr(_api, "get_klines_window_v5"):
+        bars = _api.get_klines_window_v5(symbol, "15", start_ms, end_ms, category="linear") or []
+        return bars
+
+    # 2) fallback — как у тебя сейчас (может урезаться по limit)
+    want_bars = days * 96
+    try:
+        raw = _api.get_klines(symbol, "15", min(1000, want_bars + 200)) or []
+    except Exception:
+        return []
+    bars = _normalize_klines(raw)
+    return [b for b in bars if start_ms <= b["timestamp"] <= end_ms]
 
     start_ms, end_ms = _window_ms(days)
     want_bars = days * 96  # 96 баров на день на 15м
