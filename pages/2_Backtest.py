@@ -13,6 +13,11 @@ from database import Database
 from config import Config
 from bybit_api import BybitAPI
 
+# Заглушки для бэктеста
+api = None
+db = Database(memory=True)   # или Database("kwin_bot.db")
+state = StateManager(db)
+
 def main():
     st.set_page_config(
         page_title="KWIN Backtest",
