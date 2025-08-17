@@ -4,7 +4,7 @@
 import os
 import sys
 from datetime import datetime, timedelta, timezone
-from typing import List, Dict, Optional, Tuple
+from typing import List, Dict, Tuple
 
 import numpy as np
 import pandas as pd
@@ -25,7 +25,6 @@ from state_manager import StateManager
 api = None
 db = Database(memory=True)               # или Database("kwin_bot.db")
 state = StateManager(db)
-
 
 # ====================== Вспомогательные ======================
 def _utc_now_ms() -> int:
@@ -59,7 +58,7 @@ def _normalize_klines(raw: List[Dict]) -> List[Dict]:
         if ts is None:
             continue
         out.append({
-            "timestamp": ts,  # В МИЛЛИСЕКУНДАХ! (нужно стратегии)
+            "timestamp": ts,  # МИЛЛИСЕКУНДЫ
             "open":  float(k.get("open",  k.get("o", 0.0))),
             "high":  float(k.get("high",  k.get("h", 0.0))),
             "low":   float(k.get("low",   k.get("l", 0.0))),
@@ -98,34 +97,21 @@ def load_klines_bybit_window(symbol: str, days: int) -> List[Dict]:
     kl = [b for b in kl if start_ms <= b["timestamp"] <= end_ms]
     return kl
 
-
 # ====================== Paper API (эмулятор) ======================
 class PaperBybitAPI:
-    """
-    Эмулятор методов, которые вызывает стратегия.
-    НИКАКИХ реальных запросов, только «подтверждения».
-    """
+    """Эмулятор методов, которые вызывает стратегия (никаких реальных запросов)."""
     def __init__(self):
         self._price = None
-
     def set_price(self, price: float):
         self._price = float(price)
-
     def get_ticker(self, symbol: str):
-        # стратегия читает mark_price/last_price
         return {"mark_price": self._price, "last_price": self._price}
-
     def place_order(self, **kwargs):
-        # стратегия ждёт, что что-то «правдивое» вернётся
         return {"status": "Filled", "orderId": "paper"}
-
     def modify_order(self, **kwargs):
         return {"status": "OK"}
-
     def get_wallet_balance(self):
-        # не используется в бэктесте; оставляем заглушку
         return {"list": []}
-
 
 # ====================== Расчёт PnL и закрытия ======================
 def _calc_trade_pnl(direction: str, entry_price: float, exit_price: float,
@@ -150,7 +136,6 @@ def _close_open_position(state: StateManager, db: Database, cfg: Config,
     new_eq = old_eq + pnl_net
     state.set_equity(new_eq)
 
-    # запись «закрытой» сделки
     trade = {
         "symbol": getattr(cfg, "symbol", "ETHUSDT"),
         "direction": direction,
@@ -175,43 +160,30 @@ def _close_open_position(state: StateManager, db: Database, cfg: Config,
     except Exception:
         pass
 
-    # обновим локальное состояние
     pos["status"]     = "closed"
     pos["exit_price"] = float(exit_price)
     pos["exit_time"]  = trade["exit_time"]
     state.set_position(pos)
 
-
 # ====================== Реальный бэктест через стратегию ======================
 def run_backtest(strategy: KWINStrategy, candles: List[Dict], initial_capital: float) -> Dict[str, pd.DataFrame]:
-    """
-    Прогоняем исторические 15m свечи по стратегии:
-    - входы/SL/TP принимает стратегия (paper API);
-    - закрытия по бару, комиссия учитывается;
-    - equity и сделки читаем из БД.
-    """
-    # equity старт
+    """Прогоняем исторические 15m свечи по стратегии (paper API)."""
     state.set_equity(float(initial_capital))
-
-    # эмулятор цен для стратегии
     paper_api = PaperBybitAPI()
-    strategy.api = paper_api  # подменяем реальный API
+    strategy.api = paper_api  # подменяем API
 
     equity_points = []
 
-    # прогон от старых к новым
-    for bar in candles:
-        # подадим стратегии «текущую цену»
+    for bar in candles:  # от старых к новым
         paper_api.set_price(float(bar["close"]))
 
-        # если есть открытая — проверим SL/TP на этом баре
+        # проверка SL/TP на текущем баре
         pos = state.get_current_position()
         if pos and pos.get("status") == "open":
             bar_high = float(bar["high"])
             bar_low  = float(bar["low"])
             sl = float(pos.get("stop_loss") or 0)
             tp = pos.get("take_profit")
-
             if pos["direction"] == "long" and sl > 0 and bar_low <= sl:
                 _close_open_position(state, db, strategy.config, exit_price=sl, exit_ts_ms=bar["timestamp"])
             elif pos["direction"] == "short" and sl > 0 and bar_high >= sl:
@@ -224,8 +196,7 @@ def run_backtest(strategy: KWINStrategy, candles: List[Dict], initial_capital: f
                     if pos["direction"] == "short" and bar_low <= tp:
                         _close_open_position(state, db, strategy.config, exit_price=tp, exit_ts_ms=bar["timestamp"])
 
-        # подадим бар в стратегию (закрытие 15m)
-        # добавим entry_time_ts в позицию при открытии — стратегия этого не делает
+        # подадим бар в стратегию
         before_pos = state.get_current_position()
         strategy.on_bar_close_15m(bar)
         after_pos = state.get_current_position()
@@ -233,25 +204,23 @@ def run_backtest(strategy: KWINStrategy, candles: List[Dict], initial_capital: f
             after_pos["entry_time_ts"] = int(bar["timestamp"])
             state.set_position(after_pos)
 
-        # снапшот equity (по одному на бар)
         equity_points.append({"timestamp": bar["timestamp"], "equity": float(state.get_equity() or initial_capital)})
 
-    # если в конце осталась открытая — закроем по последней цене
+    # закрыть возможную открытую позицию по последней цене
     last_bar = candles[-1]
     last_price = float(last_bar["close"])
     pos = state.get_current_position()
     if pos and pos.get("status") == "open":
         _close_open_position(state, db, strategy.config, exit_price=last_price, exit_ts_ms=last_bar["timestamp"])
 
-    # вытаскиваем сделки и эквити
     trades_list = []
     if hasattr(db, "get_recent_trades"):
         trades_list = db.get_recent_trades(100000)
     elif hasattr(db, "get_trades"):
         trades_list = db.get_trades()
     trades_df = pd.DataFrame(trades_list)
-
     equity_df = pd.DataFrame(equity_points)
+
     return {
         "trades_df": trades_df,
         "equity_df": equity_df,
@@ -259,13 +228,11 @@ def run_backtest(strategy: KWINStrategy, candles: List[Dict], initial_capital: f
         "initial_equity": float(initial_capital),
     }
 
-
 # ====================== UI ======================
 def main():
     st.set_page_config(page_title="KWIN Backtest", page_icon="📈", layout="wide")
     st.title("📊 KWIN Strategy Backtest — Bybit Futures 15m (от «сейчас» назад)")
 
-    # Параметры бэктеста
     col1, col2 = st.columns(2)
     with col1:
         start_capital = st.number_input("Начальный капитал ($)", min_value=100, value=10_000, step=100)
@@ -274,7 +241,6 @@ def main():
         symbol   = st.selectbox("Торговая пара", ["ETHUSDT", "BTCUSDT"], index=0)
         fee_rate = st.number_input("Комиссия (%)", min_value=0.01, max_value=1.0, value=0.055, step=0.005)
 
-    # Настройки стратегии
     st.subheader("⚙️ Параметры стратегии")
     c1, c2, c3 = st.columns(3)
     with c1:
@@ -293,42 +259,35 @@ def main():
     if st.button("🚀 Запустить бэктест", type="primary"):
         with st.spinner("Загружаю свечи и запускаю прогон стратегии..."):
             try:
-                # загружаем реальные свечи
                 candles = load_klines_bybit_window(symbol, period_days)
                 if not candles:
                     st.warning("Не удалось получить исторические свечи Bybit за выбранный период.")
                     return
 
-                # конфиг стратегии
                 config = Config()
                 config.symbol = symbol
-                config.days_back = int(period_days)                 # ВАЖНО для фильтра окна в стратегии
+                config.days_back = int(period_days)
                 config.risk_reward = float(risk_reward)
                 config.sfp_len = int(sfp_len)
                 config.risk_pct = float(risk_pct)
 
                 config.enable_smart_trail = bool(enable_smart_trail)
-                config.trailing_perc = float(trailing_perc) / 100.0  # проценты → десятичная доля для трейла
+                config.trailing_perc = float(trailing_perc) / 100.0
                 config.trailing_offset_perc = float(trailing_offset) / 100.0
-                config.trailing_offset = float(trailing_offset)       # на случай, если используется где-то ещё
+                config.trailing_offset = float(trailing_offset)
 
                 config.use_sfp_quality = bool(use_sfp_quality)
                 config.wick_min_ticks = int(wick_min_ticks)
-                # close_back_pct ожидается в [0..1]
                 config.close_back_pct = float(close_back_pct if close_back_pct <= 1 else close_back_pct / 100.0)
                 config.taker_fee_rate = float(fee_rate) / 100.0
 
-                # Создаём стратегию (API подменим на paper внутри run_backtest)
                 strategy = KWINStrategy(config, api, state, db)
-
-                # Запуск
                 results = run_backtest(strategy, candles, start_capital)
                 display_backtest_results(results, f"Bybit Futures 15m — {symbol}")
 
             except Exception as e:
                 st.error(f"Ошибка выполнения бэктеста: {e}")
                 st.exception(e)
-
 
 # ====================== вывод результатов ======================
 def display_backtest_results(results, data_source_label: str):
@@ -339,19 +298,18 @@ def display_backtest_results(results, data_source_label: str):
 
     # --- НОРМАЛИЗАЦИЯ ВРЕМЕНИ ДЛЯ ГРАФИКОВ/МЕТРИК ---
     if not equity_df.empty and "timestamp" in equity_df.columns:
-    equity_df["timestamp"] = (
-        pd.to_datetime(equity_df["timestamp"], utc=True, errors="coerce")
-          .dt.tz_localize(None)
-    )
-    equity_df = equity_df.sort_values("timestamp")
+        # если пришло число — это мс; если дата — просто делаем tz-naive
+        if np.issubdtype(equity_df["timestamp"].dtype, np.number):
+            equity_df["timestamp"] = pd.to_datetime(equity_df["timestamp"], unit="ms", utc=True)
+        else:
+            equity_df["timestamp"] = pd.to_datetime(equity_df["timestamp"], utc=True, errors="coerce")
+        equity_df["timestamp"] = equity_df["timestamp"].dt.tz_localize(None)
+        equity_df = equity_df.sort_values("timestamp")
 
     if not trades_df.empty:
-    for col in ("entry_time", "exit_time"):
-        if col in trades_df.columns:
-            trades_df[col] = (
-                pd.to_datetime(trades_df[col], utc=True, errors="coerce")
-                  .dt.tz_localize(None)
-            )
+        for col in ("entry_time", "exit_time"):
+            if col in trades_df.columns:
+                trades_df[col] = pd.to_datetime(trades_df[col], utc=True, errors="coerce").dt.tz_localize(None)
 
     # Метрики
     if trades_df.empty:
@@ -370,10 +328,7 @@ def display_backtest_results(results, data_source_label: str):
         profit_factor = (gross_profit / gross_loss) if gross_loss > 0 else (float("inf") if gross_profit > 0 else 0.0)
 
         if not equity_df.empty and len(equity_df) > 1:
-            # timestamp в мс → pandas
-            if np.issubdtype(equity_df["timestamp"].dtype, np.number):
-                equity_df["timestamp"] = pd.to_datetime(equity_df["timestamp"], unit="ms", utc=True)
-            eq = equity_df.rename(columns={"timestamp": "time"}).copy()
+            eq = equity_df.copy()
             eq["cummax"]  = eq["equity"].cummax()
             eq["drawdown"] = (eq["equity"] - eq["cummax"]) / eq["cummax"] * 100.0
             max_dd = float(eq["drawdown"].min())
@@ -398,8 +353,6 @@ def display_backtest_results(results, data_source_label: str):
     # График Equity
     if not equity_df.empty and len(equity_df) > 1:
         st.subheader("📊 Кривая Equity")
-        if np.issubdtype(equity_df["timestamp"].dtype, np.number):
-            equity_df["timestamp"] = pd.to_datetime(equity_df["timestamp"], unit="ms", utc=True)
         fig = make_subplots(rows=2, cols=1, row_heights=[0.7, 0.3],
                             subplot_titles=("Equity", "Drawdown"),
                             shared_xaxes=True, vertical_spacing=0.05)
@@ -428,7 +381,9 @@ def display_backtest_results(results, data_source_label: str):
                 disp[col] = pd.to_datetime(disp[col], errors="coerce").dt.tz_localize(None)
         for col in ("pnl", "rr", "entry_price", "exit_price"):
             if col in disp.columns:
-                disp[col] = pd.to_numeric(disp[col], errors="coerce").round(2)
+                disp[col] = pd.to_numeric(disp[col], errors="coerce")
+                if col in ("pnl", "rr", "entry_price", "exit_price"):
+                    disp[col] = disp[col].round(2)
         if "quantity" in disp.columns:
             disp["quantity"] = pd.to_numeric(disp["quantity"], errors="coerce").round(4)
         view_cols_pref = ["entry_time", "direction", "entry_price", "exit_price", "quantity", "pnl", "rr", "status"]
