@@ -1,9 +1,10 @@
 # 2_Backtest.py
 # Реальный бэктест: исторические 15m OHLC -> on_bar_close_15m() -> сделки/статистика
+
 import os
 import pandas as pd
 import numpy as np
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from typing import Dict, Optional, List
 
 import streamlit as st
@@ -14,10 +15,10 @@ from config import Config
 from state_manager import StateManager
 from database import Database
 
-# стратегия (с твоими последними патчами)
+# стратегия (с последними патчами)
 from kwin_strategy import KWINStrategy
 
-# Bybit API: пробуем несколько вариантов клиента (под твои файлы)
+# Bybit API: пробуем несколько вариантов клиента
 try:
     from bybit_api import BybitAPI
 except Exception:
@@ -88,8 +89,7 @@ def load_klines_bybit(api, symbol: str, interval: str, days: int) -> List[Dict]:
     return norm
 
 
-# ================== Compound helpers (P&L + equity) ==================
-# (вставка, подписанная мной)
+# ================== P&L + equity helpers ==================
 
 def _calc_trade_pnl(direction: str,
                     entry_price: float,
@@ -132,7 +132,7 @@ def _close_open_position(state: StateManager,
     new_eq = old_eq + pnl_net
     state.set_equity(new_eq)
 
-    # --- фиксируем сделку в БД ---
+    # --- фиксируем сделку в БД (расчёт RR опционален; если нужно, можно вычислить) ---
     trade = {
         "symbol":      getattr(cfg, "symbol", "ETHUSDT"),
         "direction":   direction,
@@ -160,6 +160,29 @@ def _close_open_position(state: StateManager,
     state.set_position(pos)
 
     print(f"[EXIT] {direction.upper()} qty={qty} @ {exit_price}  PnL={pnl_net:.2f}  equity: {old_eq:.2f} → {new_eq:.2f}")
+
+
+def _dd_from_equity(equity_series: pd.Series) -> Dict[str, float]:
+    """Расчёт максимальной просадки ($ и %) из серии equity (по времени)."""
+    if equity_series.empty:
+        return {"max_dd_abs": 0.0, "max_dd_pct": 0.0}
+
+    roll_max = equity_series.cummax()
+    dd = equity_series - roll_max
+    dd_pct = equity_series / roll_max - 1.0
+    max_dd_abs = float(dd.min())  # отрицательное значение
+    max_dd_pct = float(dd_pct.min()) * 100.0  # %
+    return {"max_dd_abs": round(max_dd_abs, 2), "max_dd_pct": round(max_dd_pct, 2)}
+
+
+def _profit_factor_from_trades(trades_df: pd.DataFrame) -> float:
+    if trades_df.empty or "pnl" not in trades_df.columns:
+        return 0.0
+    wins = trades_df.loc[trades_df["pnl"] > 0, "pnl"].sum()
+    losses = -trades_df.loc[trades_df["pnl"] < 0, "pnl"].sum()
+    if losses <= 0:
+        return float("inf") if wins > 0 else 0.0
+    return round(wins / losses, 3)
 
 
 # ====================== Реальный бэктест через стратегию ======================
@@ -225,7 +248,8 @@ def run_backtest_ohlc(period_days: int,
 
             sl = float(pos.get("stop_loss") or 0)
             tp = pos.get("take_profit")
-            # ВАЖНО: сначала SL, затем TP — при касании обеих зон на одном баре
+
+            # Порядок: сначала SL, затем TP (как в Pine при касании обеих зон)
             if pos["direction"] == "long" and sl > 0 and bar_low <= sl:
                 _close_open_position(state, db, config, exit_price=sl, exit_time=cur_time)
             elif pos["direction"] == "short" and sl > 0 and bar_high >= sl:
@@ -238,7 +262,8 @@ def run_backtest_ohlc(period_days: int,
                     if pos["direction"] == "short" and bar_low <= tp:
                         _close_open_position(state, db, config, exit_price=tp, exit_time=cur_time)
 
-        # 2) Теперь передаём бар в стратегию — это «закрытие» бара, где стратегия может ВОЙТИ.
+        # 2) Теперь передаём бар в стратегию — это «закрытие» бара, где стратегия может ВОЙТИ
+        #    и/или подвинуть Smart Trailing (он применяется в run_cycle, вызываемом внутри on_bar_close_15m).
         strat.on_bar_close_15m(bar)
 
     # Достаём сделки из БД
@@ -299,7 +324,7 @@ def run_backtest_ohlc(period_days: int,
                     wins += 1
 
                 t = tr.get("exit_time") or tr.get("entry_time")
-                eq_times.append(pd.to_datetime(t))
+                eq_times.append(pd.to_datetime(t, utc=True, errors="coerce"))
                 eq_values.append(capital)
 
             winrate = (wins / len(trades_df)) * 100 if len(trades_df) else 0.0
@@ -320,13 +345,26 @@ def run_backtest_ohlc(period_days: int,
                     if float(tr["pnl"]) > 0:
                         wins += 1
             winrate = (wins / len(trades_df)) * 100 if len(trades_df) else 0.0
-        capital = equity_df["equity"].iloc[-1] if not equity_df.empty else initial_capital
+        capital = float(equity_df["equity"].iloc[-1]) if not equity_df.empty else initial_capital
+
+    # --- Доп. метрики ---
+    if not equity_df.empty:
+        dd = _dd_from_equity(equity_df["equity"].astype(float))
+    else:
+        dd = {"max_dd_abs": 0.0, "max_dd_pct": 0.0}
+
+    profit_factor = _profit_factor_from_trades(trades_df) if not trades_df.empty else 0.0
+    avg_trade_pnl = float(trades_df["pnl"].mean()) if ("pnl" in trades_df.columns and not trades_df.empty) else 0.0
 
     stats = {
-        "final_capital": float(capital),
+        "final_capital": round(float(capital), 2),
         "trades": int(len(trades_df)),
         "winrate_pct": round(float(winrate), 2),
         "total_pnl": round(float(total_pnl), 2),
+        "max_dd_abs": dd["max_dd_abs"],   # $
+        "max_dd_pct": dd["max_dd_pct"],   # %
+        "profit_factor": profit_factor,
+        "avg_trade_pnl": round(avg_trade_pnl, 2),
     }
     return {"trades": trades_df, "equity": equity_df, "stats": stats}
 
@@ -340,7 +378,7 @@ def main():
     # Сайдбар: параметры
     st.sidebar.header("Параметры бэктеста")
     symbol = st.sidebar.text_input("Symbol", value="ETHUSDT")
-    period_days = st.sidebar.selectbox("Период", options=[30, 60, 180], index=0)
+    period_days = st.sidebar.selectbox("Период", options=[30, 60, 90, 180], index=0)
     start_capital = st.sidebar.number_input("Initial Capital (USDT)", min_value=1.0, value=100.0, step=10.0)
     commission_rate = st.sidebar.number_input("Commission (taker, decimal)", min_value=0.0, value=0.00055, step=0.00005, format="%.5f")
 
@@ -353,13 +391,19 @@ def main():
     wick_min_ticks = st.sidebar.number_input("SFP: min wick depth (ticks)", min_value=0, value=7, step=1)
     close_back_pct = st.sidebar.number_input("SFP: min close-back (0..1)", min_value=0.0, max_value=1.0, value=1.0, step=0.05)
 
+    st.sidebar.markdown("---")
+    st.sidebar.subheader("Smart Trailing")
     enable_smart_trail = st.sidebar.checkbox("Enable Smart Trailing TP", value=True)
     use_arm_after_rr = st.sidebar.checkbox("Enable Arm after RR≥X", value=True)
     arm_rr = st.sidebar.number_input("Arm RR (R)", min_value=0.1, value=0.5, step=0.1, format="%.1f")
+    # ВАЖНО: добавили недостающие поля процентного трейла
+    trailing_perc = st.sidebar.number_input("Percent trailing, % of entry", min_value=0.0, value=0.5, step=0.1, format="%.2f")
+    trailing_offset_perc = st.sidebar.number_input("Trailing offset, % of entry", min_value=0.0, value=0.4, step=0.1, format="%.2f")
     use_bar_trail = st.sidebar.checkbox("Use Bar-Low/High Smart Trail", value=True)
     trail_lookback = st.sidebar.number_input("Trail lookback bars", min_value=1, value=50, step=1)
     trail_buf_ticks = st.sidebar.number_input("Trail buffer (ticks)", min_value=0, value=40, step=1)
 
+    st.sidebar.markdown("---")
     limit_qty_enabled = st.sidebar.checkbox("Limit Max Position Qty", value=True)
     max_qty_manual = st.sidebar.number_input("Max Qty (asset units)", min_value=0.01, value=50.0, step=0.01, format="%.2f")
 
@@ -385,6 +429,10 @@ def main():
     config.use_bar_trail = bool(use_bar_trail)
     config.trail_lookback = int(trail_lookback)
     config.trail_buf_ticks = int(trail_buf_ticks)
+
+    # НОВОЕ: проценты для первичного трейла
+    config.trailing_perc = float(trailing_perc)
+    config.trailing_offset_perc = float(trailing_offset_perc)
 
     config.limit_qty_enabled = bool(limit_qty_enabled)
     config.max_qty_manual = float(max_qty_manual)
@@ -418,11 +466,18 @@ def main():
         col3.metric("Итоговый капитал", f"{stats.get('final_capital', start_capital):.2f}")
         col4.metric("Total PnL", f"{stats.get('total_pnl', 0.0):.2f}")
 
+        col5, col6, col7 = st.columns(3)
+        col5.metric("Max DD ($)", f"{stats.get('max_dd_abs', 0.0):.2f}")
+        col6.metric("Max DD (%)", f"{stats.get('max_dd_pct', 0.0):.2f}%")
+        pf = stats.get("profit_factor", 0.0)
+        pf_str = "∞" if pf == float("inf") else f"{pf}"
+        col7.metric("Profit Factor", pf_str)
+
         # График эквити
         st.subheader("Equity Curve")
         if not equity_df.empty:
             fig, ax = plt.subplots()
-            ax.plot(equity_df["time"], equity_df["equity"])
+            ax.plot(pd.to_datetime(equity_df["time"]), equity_df["equity"])
             ax.set_xlabel("Time")
             ax.set_ylabel("Equity (USDT)")
             ax.grid(True, alpha=0.3)
@@ -433,7 +488,20 @@ def main():
         # Таблица сделок
         st.subheader("Сделки")
         if not trades_df.empty:
-            st.dataframe(trades_df)
+            # немного приводим формат
+            for col in ("entry_time", "exit_time"):
+                if col in trades_df.columns:
+                    trades_df[col] = pd.to_datetime(trades_df[col], utc=True, errors="coerce").dt.tz_convert(None)
+            for col in ("entry_price", "exit_price", "quantity", "pnl", "rr"):
+                if col in trades_df.columns:
+                    trades_df[col] = pd.to_numeric(trades_df[col], errors="coerce")
+                    if col in ("entry_price", "exit_price", "pnl", "rr"):
+                        trades_df[col] = trades_df[col].round(2)
+                    if col == "quantity":
+                        trades_df[col] = trades_df[col].round(4)
+
+            view_cols = [c for c in ["entry_time", "direction", "entry_price", "exit_price", "quantity", "pnl", "rr", "status", "exit_reason"] if c in trades_df.columns]
+            st.dataframe(trades_df[view_cols].sort_values("entry_time", ascending=False), use_container_width=True)
         else:
             st.info("Сделок не найдено за выбранный период. Проверь условия детекции/окно бэктеста.")
 
