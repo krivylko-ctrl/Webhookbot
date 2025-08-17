@@ -71,11 +71,14 @@ def _normalize_klines(raw: List[Dict]) -> List[Dict]:
 @st.cache_data(show_spinner=False)
 def load_klines_bybit_window(symbol: str, days: int) -> List[Dict]:
     """
-    Реальные свечи Bybit Futures: берём запас по лимиту и режем последние N дней (UTC).
+    Реальные 15m свечи Bybit Futures за точное окно [UTC-сейчас - days, UTC-сейчас].
+    Пытаемся пройтись пагинацией: запрашиваем "до" некоторой точки и двигаем окно назад,
+    пока не соберём весь диапазон. Работает с большинством обёрток Bybit v5.
     """
     _api = BybitAPI(api_key=os.getenv("BYBIT_API_KEY"),
                     api_secret=os.getenv("BYBIT_API_SECRET"))
-    # если клиент поддерживает выбор категории — выберем фьючерсы/перп
+
+    # выбрать фьючерсную/линейную категорию, если метод есть
     try:
         if hasattr(_api, "set_market_type"):
             for mt in ("linear", "contract", "futures"):
@@ -88,14 +91,64 @@ def load_klines_bybit_window(symbol: str, days: int) -> List[Dict]:
         pass
 
     start_ms, end_ms = _window_ms(days)
-    need = int(days * 96 * 1.2) + 50  # 96 баров/день, небольшой запас
-    try:
-        raw = _api.get_klines(symbol, "15", need) or []
-    except Exception:
-        return []
-    kl = _normalize_klines(raw)
-    kl = [b for b in kl if start_ms <= b["timestamp"] <= end_ms]
-    return kl
+
+    # хотим ~96 баров/день * days, но берём с запасом
+    want_bars = days * 96
+    max_chunk = 1000  # общий лимит bybit за вызов на большинстве эндпоинтов
+    bars: List[Dict] = []
+
+    # будем идти НАЗАД от end_ms
+    cursor_end = end_ms
+    safety = 0
+    while len(bars) < want_bars and cursor_end > start_ms and safety < 20:
+        safety += 1
+        limit = min(max_chunk, want_bars - len(bars) + 200)
+
+        raw = []
+        # набор "гибких" вариантов вызова (у разных обёрток параметры различаются)
+        for kwargs in (
+            {"symbol": symbol, "interval": "15", "limit": limit, "end": cursor_end},
+            {"symbol": symbol, "interval": "15", "limit": limit, "to": cursor_end},
+            {"symbol": symbol, "interval": "15", "limit": limit, "endTime": cursor_end},
+            {"symbol": symbol, "category": "linear", "interval": "15", "limit": limit, "end": cursor_end},
+        ):
+            try:
+                raw = _api.get_klines(**kwargs) or []
+                if raw:
+                    break
+            except TypeError:
+                continue
+            except Exception:
+                raw = []
+        if not raw:
+            break
+
+        chunk = _normalize_klines(raw)
+        # оставим только то, что попадает в окно
+        chunk = [b for b in chunk if start_ms <= b["timestamp"] <= end_ms]
+
+        if not chunk:
+            break
+
+        # двигаем "курсор" назад от самого старого в чанке
+        oldest = chunk[0]["timestamp"]
+        cursor_end = oldest - 1
+
+        bars.extend(chunk)
+
+        # защита от дубликатов
+        bars = sorted({b["timestamp"]: b for b in bars}.values(), key=lambda x: x["timestamp"])
+
+    # если данных много — обрезаем строго по окну
+    bars = [b for b in bars if start_ms <= b["timestamp"] <= end_ms]
+
+    # sanity-check: последняя свеча должна быть не старше ~часа от UTC-сейчас
+    if bars:
+        last_gap_min = int((_utc_now_ms() - bars[-1]["timestamp"]) / 60_000)
+        if last_gap_min > 120:
+            st.warning(f"Последняя свеча отстаёт на {last_gap_min} мин. Проверь категорию/символ/таймзону API.")
+
+    return bars
 
 # ====================== Paper API (эмулятор) ======================
 class PaperBybitAPI:
