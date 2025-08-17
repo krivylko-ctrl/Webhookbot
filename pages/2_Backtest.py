@@ -12,8 +12,9 @@ from kwin_strategy import KWINStrategy
 from database import Database
 from config import Config
 from bybit_api import BybitAPI
+from state_manager import StateManager   # ← ДОБАВЛЕНА ЭТА СТРОКА
 
-# Заглушки для бэктеста
+# Заглушки для бэктеста (должны быть ДО def main())
 api = None
 db = Database(memory=True)   # или Database("kwin_bot.db")
 state = StateManager(db)
@@ -21,9 +22,10 @@ state = StateManager(db)
 def main():
     st.set_page_config(
         page_title="KWIN Backtest",
-        page_icon="📊",
+        page_icon="📈",
         layout="wide"
     )
+    ...
     
     st.title("📊 KWIN Strategy Backtest")
     st.markdown("Тестирование стратегии на исторических данных")
