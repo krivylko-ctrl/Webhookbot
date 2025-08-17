@@ -1,309 +1,371 @@
-import requests
-import json
-import time
-import hashlib
-import hmac
-from urllib.parse import urlencode
-import websocket
-import threading
-from typing import Dict, List, Optional, Callable
+import math
+from typing import Dict, Optional, List
+from datetime import datetime, timezone
 
-class BybitAPI:
-    """Класс для работы с Bybit API v5"""
-    
-    def __init__(self, api_key: str, api_secret: str, testnet: bool = False):
-        self.api_key = api_key
-        self.api_secret = api_secret
-        self.testnet = testnet
-        
-        # По умолчанию linear (деривативы), можно изменить через set_market_type
-        self.market_type = "linear"
-        
-        if testnet:
-            self.base_url = "https://api-testnet.bybit.com"
-            self.ws_url = "wss://stream-testnet.bybit.com/v5/public/linear"
-        else:
-            self.base_url = "https://api.bybit.com"
-            self.ws_url = "wss://stream.bybit.com/v5/public/linear"
-        
-        self.session = requests.Session()
-        self.ws = None
-        self.ws_callbacks = {}
-    
-    def set_market_type(self, market_type: str):
-        """Установить тип рынка: 'linear' или 'spot'"""
-        self.market_type = market_type
-        if self.testnet:
-            self.ws_url = f"wss://stream-testnet.bybit.com/v5/public/{market_type}"
-        else:
-            self.ws_url = f"wss://stream.bybit.com/v5/public/{market_type}"
-        
-    def _generate_signature(self, params: str, timestamp: str) -> str:
-        """Генерация подписи для запроса"""
-        param_str = timestamp + self.api_key + "5000" + params
-        signature = hmac.new(
-            bytes(self.api_secret, "utf-8"),
-            param_str.encode("utf-8"),
-            hashlib.sha256
-        ).hexdigest()
-        return signature
-    
-    def _send_request(self, method: str, endpoint: str, params: Optional[Dict] = None) -> Dict:
-        """Отправка HTTP запроса"""
-        if params is None:
-            params = {}
-        
-        url = f"{self.base_url}{endpoint}"
-        timestamp = str(int(time.time() * 1000))
-        
-        if method == "GET":
-            param_str = urlencode(params) if params else ""
-        else:
-            param_str = json.dumps(params) if params else ""
-        
-        signature = self._generate_signature(param_str, timestamp)
-        
-        headers = {
-            "X-BAPI-API-KEY": self.api_key,
-            "X-BAPI-SIGN": signature,
-            "X-BAPI-SIGN-TYPE": "2",
-            "X-BAPI-TIMESTAMP": timestamp,
-            "X-BAPI-RECV-WINDOW": "5000",
-            "Content-Type": "application/json"
-        }
-        
+from config import Config
+from state_manager import StateManager
+from utils import price_round
+from analytics import TrailingLogger
+
+
+class TrailEngine:
+    """Движок Smart Trailing для управления стоп-лоссами"""
+
+    def __init__(self, config: Config, state_manager: StateManager, bybit_api):
+        self.config = config
+        self.state = state_manager
+        self.api = bybit_api
+
+        # Логгер трейлинга (совместим с аналитической страницей)
+        self.trail_logger = TrailingLogger()
+
+        # Служебные поля
+        self.last_trail_price_long: Optional[float] = None
+        self.last_trail_price_short: Optional[float] = None
+
+    # ============== Публичная точка входа ==============
+
+    def process_trailing(self, position: Dict, current_price: float):
+        """Основная логика обработки трейлинга"""
+        if not position or not current_price:
+            return
+
+        direction = position.get("direction")
+        if direction == "long":
+            self._process_long_trailing(position, current_price)
+        elif direction == "short":
+            self._process_short_trailing(position, current_price)
+
+    # ============== ЛОНГ ==============
+
+    def _process_long_trailing(self, position: Dict, current_price: float):
+        """Обработка трейлинга для лонг позиции"""
         try:
-            if method == "GET":
-                response = self.session.get(url, params=params, headers=headers)
-            elif method == "POST":
-                response = self.session.post(url, data=param_str, headers=headers)
-            else:
-                raise ValueError(f"Unsupported method: {method}")
-            
-            response.raise_for_status()
-            return response.json()
-        
-        except requests.exceptions.RequestException as e:
-            print(f"API Request Error: {e}")
-            return {"retCode": -1, "retMsg": str(e)}
-    
-    def get_server_time(self) -> Optional[int]:
-        """Получить время сервера"""
-        response = self._send_request("GET", "/v5/market/time")
-        if response.get("retCode") == 0:
-            return int(response["result"]["timeSecond"])
-        else:
-            print(f"Server time error: {response}")
-        return None
-    
-    def get_klines(self, symbol: str, interval: str, limit: int = 200) -> Optional[List[Dict]]:
-        """Получить исторические свечи"""
-        params = {
-            "category": self.market_type,
-            "symbol": symbol,
-            "interval": interval,
-            "limit": limit
-        }
-        
-        response = self._send_request("GET", "/v5/market/kline", params)
-        if response.get("retCode") == 0:
-            klines = []
-            for item in response["result"]["list"]:
-                klines.append({
-                    "timestamp": int(item[0]),
-                    "open": float(item[1]),
-                    "high": float(item[2]),
-                    "low": float(item[3]),
-                    "close": float(item[4]),
-                    "volume": float(item[5])
-                })
-            # КРИТИЧНЫЙ ПАТЧ: TV-эквивалент - последний элемент = самая свежая закрытая свеча
-            klines.sort(key=lambda x: x["timestamp"], reverse=True)
-            return klines
-        return None
-    
-    def get_ticker(self, symbol: str) -> Optional[Dict]:
-        """Получить текущую цену"""
-        params = {
-            "category": self.market_type,
-            "symbol": symbol
-        }
-        
-        response = self._send_request("GET", "/v5/market/tickers", params)
-        if response.get("retCode") == 0 and response["result"]["list"]:
-            ticker = response["result"]["list"][0]
-            return {
-                "symbol": ticker["symbol"],
-                "last_price": float(ticker["lastPrice"]),
-                "bid": float(ticker["bid1Price"]),
-                "ask": float(ticker["ask1Price"]),
-                "volume": float(ticker["volume24h"])
-            }
-        return None
-    
-    def get_wallet_balance(self) -> Optional[Dict]:
-        """Получить баланс кошелька"""
-        params = {"accountType": "SPOT"}
-        
-        response = self._send_request("GET", "/v5/account/wallet-balance", params)
-        if response.get("retCode") == 0:
-            return response["result"]
-        return None
-    
-    def place_order(self, symbol: str, side: str, order_type: str, qty: float, 
-                   price: Optional[float] = None, stop_loss: Optional[float] = None, 
-                   take_profit: Optional[float] = None, order_link_id: Optional[str] = None,
-                   reduce_only: bool = False) -> Optional[Dict]:
-        """Разместить ордер"""
-        params = {
-            "category": self.market_type,
-            "symbol": symbol,
-            "side": side.title(),
-            "orderType": order_type.title(),
-            "qty": str(qty)
-        }
-        
-        # Дополнительные параметры для безопасности
-        if reduce_only:
-            params["reduceOnly"] = "true"
-        if order_link_id:
-            params["orderLinkId"] = order_link_id
-            
-        # triggerBy: на Bybit задай triggerBy="LastPrice" для консистентности с TV
-        if order_type.lower() in ["stop", "conditional"]:
-            params["triggerBy"] = "LastPrice"
-        
-        if price:
-            params["price"] = str(price)
-        if stop_loss:
-            params["stopLoss"] = str(stop_loss)
-        if take_profit:
-            params["takeProfit"] = str(take_profit)
-        
-        response = self._send_request("POST", "/v5/order/create", params)
-        if response.get("retCode") == 0:
-            return response["result"]
-        return None
-    
+            entry_price = float(position.get("entry_price") or 0)
+            current_sl = float(position.get("stop_loss") or 0)
+            armed = bool(position.get("armed", False))
+            if entry_price <= 0 or current_sl <= 0:
+                return
 
-    
-    def cancel_order(self, symbol: str, order_id: str) -> bool:
-        """Отменить ордер"""
-        params = {
-            "category": self.market_type,
-            "symbol": symbol,
-            "orderId": order_id
-        }
-        
-        response = self._send_request("POST", "/v5/order/cancel", params)
-        return response.get("retCode") == 0
-    
-    def get_open_orders(self, symbol: Optional[str] = None) -> Optional[List[Dict]]:
-        """Получить открытые ордера"""
-        params = {"category": self.market_type}
-        if symbol:
-            params["symbol"] = symbol
-        
-        response = self._send_request("GET", "/v5/order/realtime", params)
-        if response.get("retCode") == 0:
-            return response["result"]["list"]
-        return None
-    
-    def get_order_history(self, symbol: Optional[str] = None, limit: int = 50) -> Optional[List[Dict]]:
-        """Получить историю ордеров"""
-        params = {
-            "category": self.market_type,
-            "limit": limit
-        }
-        if symbol:
-            params["symbol"] = symbol
-        
-        response = self._send_request("GET", "/v5/order/history", params)
-        if response.get("retCode") == 0:
-            return response["result"]["list"]
-        return None
-    
-    def update_position_stop_loss(self, symbol: str, stop_loss: float) -> Optional[Dict]:
-        """Обновить стоп-лосс позиции (для деривативов)"""
-        if self.market_type == "linear":
-            params = {
-                "category": "linear", 
-                "symbol": symbol, 
-                "stopLoss": str(stop_loss)
-            }
-            response = self._send_request("POST", "/v5/position/trading-stop", params)
-            if response.get("retCode") == 0:
-                return response["result"]
-        return None
-    
-    def get_instruments_info(self, symbol: str) -> Optional[Dict]:
-        """Получить информацию об инструменте"""
-        params = {
-            "category": self.market_type,
-            "symbol": symbol
-        }
-        
-        response = self._send_request("GET", "/v5/market/instruments-info", params)
-        if response.get("retCode") == 0 and response["result"]["list"]:
-            return response["result"]["list"][0]
-        return None
-    
-    def start_websocket(self, on_message: Optional[Callable] = None):
-        """Запустить WebSocket соединение"""
-        def on_ws_message(ws, message):
+            # 1) Арм по RR (как в стратегии)
+            if self.config.use_arm_after_rr and not armed:
+                moved = current_price - entry_price
+                need = (entry_price - current_sl) * float(getattr(self.config, "arm_rr", 0.5))
+                if moved >= need:
+                    position["armed"] = True
+                    armed = True
+                    if hasattr(self.state, "update_position_armed"):
+                        self.state.update_position_armed(True)
+                    print(f"Long position armed at RR: {moved / max(entry_price - current_sl, 1e-9):.2f}")
+
+            if not armed:
+                return
+
+            new_sl = current_sl
+
+            # 2) Баровый трейл (по закрытым барам)
+            if self.config.use_bar_trail:
+                new_sl = self._calculate_bar_trail_long(current_sl)
+
+            # 3) Процент+offset трейл (термины Pine: trail_points = entry * pct, trail_offset = entry * offset)
+            per = float(getattr(self.config, "trailing_perc", 0.0)) / 100.0
+            off = float(getattr(self.config, "trailing_offset_perc", 0.0)) / 100.0
+            if per > 0.0:
+                cand = self._calc_pct_offset_long(entry_price=entry_price,
+                                                  current_price=current_price,
+                                                  current_sl=current_sl,
+                                                  pct=per, offset=off)
+                new_sl = max(new_sl, cand)
+
+            # 4) Применяем только улучшение SL
+            if new_sl > current_sl:
+                self._log_trail(position, current_sl, new_sl, current_price, trigger="Long Trail Update")
+                self._update_stop_loss(position, new_sl)
+
+        except Exception as e:
+            print(f"Error in long trailing: {e}")
+
+    # ============== ШОРТ ==============
+
+    def _process_short_trailing(self, position: Dict, current_price: float):
+        """Обработка трейлинга для шорт позиции"""
+        try:
+            entry_price = float(position.get("entry_price") or 0)
+            current_sl = float(position.get("stop_loss") or 0)
+            armed = bool(position.get("armed", False))
+            if entry_price <= 0 or current_sl <= 0:
+                return
+
+            # 1) Арм по RR
+            if self.config.use_arm_after_rr and not armed:
+                moved = entry_price - current_price
+                need = (current_sl - entry_price) * float(getattr(self.config, "arm_rr", 0.5))
+                if moved >= need:
+                    position["armed"] = True
+                    armed = True
+                    if hasattr(self.state, "update_position_armed"):
+                        self.state.update_position_armed(True)
+                    print(f"Short position armed at RR: {moved / max(current_sl - entry_price, 1e-9):.2f}")
+
+            if not armed:
+                return
+
+            new_sl = current_sl
+
+            # 2) Баровый трейл
+            if self.config.use_bar_trail:
+                new_sl = self._calculate_bar_trail_short(current_sl)
+
+            # 3) Процент+offset трейл
+            per = float(getattr(self.config, "trailing_perc", 0.0)) / 100.0
+            off = float(getattr(self.config, "trailing_offset_perc", 0.0)) / 100.0
+            if per > 0.0:
+                cand = self._calc_pct_offset_short(entry_price=entry_price,
+                                                   current_price=current_price,
+                                                   current_sl=current_sl,
+                                                   pct=per, offset=off)
+                new_sl = min(new_sl, cand)
+
+            # 4) Применяем только улучшение SL
+            if new_sl < current_sl:
+                self._log_trail(position, current_sl, new_sl, current_price, trigger="Short Trail Update")
+                self._update_stop_loss(position, new_sl)
+
+        except Exception as e:
+            print(f"Error in short trailing: {e}")
+
+    # ============== Баровый трейл (15m, закрытые бары) ==============
+
+    def _get_closed_15m_window(self, lookback: int) -> List[Dict]:
+        """
+        Возвращает список последних ЗАКРЫТЫХ 15m свечей длиной lookback.
+        Гарантированно исключаем текущий незакрытый бар.
+        """
+        if not self.api or lookback <= 0:
+            return []
+
+        # Берём с запасом: lookback + 2, отсортируем по timestamp убыванию (newest-first)
+        kl = self.api.get_klines(self.config.symbol, "15", lookback + 2) or []
+        if not kl:
+            return []
+
+        def _ts(c):
+            return c.get("timestamp") or c.get("start") or c.get("open_time") or c.get("t") or 0
+
+        # Нормализация и сортировка newest-first
+        norm = []
+        for c in kl:
             try:
-                data = json.loads(message)
-                if on_message:
-                    on_message(data)
-                
-                # Обработка подписок
-                if "topic" in data:
-                    topic = data["topic"]
-                    if topic in self.ws_callbacks:
-                        self.ws_callbacks[topic](data)
-            except Exception as e:
-                print(f"WebSocket message error: {e}")
-        
-        def on_ws_error(ws, error):
-            print(f"WebSocket error: {error}")
-        
-        def on_ws_close(ws, close_status_code, close_msg):
-            print("WebSocket connection closed")
-        
-        def on_ws_open(ws):
-            print("WebSocket connection opened")
-        
-        try:
-            from websocket import WebSocketApp  # type: ignore
-            self.ws = WebSocketApp(
-            self.ws_url,
-            on_open=on_ws_open,
-            on_message=on_ws_message,
-            on_error=on_ws_error,
-            on_close=on_ws_close
-            )
-            
-            # Запуск в отдельном потоке
-            ws_thread = threading.Thread(target=self.ws.run_forever)
-            ws_thread.daemon = True
-            ws_thread.start()
-        except ImportError:
-            print("WebSocket library not available")
-    
-    def subscribe_kline(self, symbol: str, interval: str, callback: Callable):
-        """Подписаться на свечи через WebSocket"""
-        if not self.ws:
-            self.start_websocket()
-        
-        topic = f"kline.{interval}.{symbol}"
-        self.ws_callbacks[topic] = callback
-        
-        subscribe_msg = {
-            "op": "subscribe",
-            "args": [topic]
-        }
-        
-        if self.ws:
-            self.ws.send(json.dumps(subscribe_msg))
-    
+                ts = int(_ts(c))
+                if ts and ts < 10_000_000_000:  # сек -> мс
+                    ts *= 1000
+                norm.append({
+                    "timestamp": ts,
+                    "open": float(c.get("open")),
+                    "high": float(c.get("high")),
+                    "low": float(c.get("low")),
+                    "close": float(c.get("close")),
+                })
+            except Exception:
+                continue
 
+        norm.sort(key=lambda x: x["timestamp"], reverse=True)
+        if len(norm) < lookback + 1:
+            return []
+
+        # Исключаем текущий бар [0], берём закрытые [1 : lookback+1]
+        return norm[1:lookback + 1]
+
+    def _calculate_bar_trail_long(self, current_sl: float) -> float:
+        """BarTrail по закрытым барам: lowest(low, N)[1] − buffer"""
+        try:
+            lookback = int(getattr(self.config, "trail_lookback", 50) or 50)
+            if lookback <= 0:
+                return current_sl
+
+            closed = self._get_closed_15m_window(lookback)
+            if not closed:
+                return current_sl
+
+            lb_low = min(float(c["low"]) for c in closed)
+            tick = self._tick_size()
+            buf = float(getattr(self.config, "trail_buf_ticks", 0)) * tick
+            bar_trail_sl = lb_low - buf
+            return max(bar_trail_sl, current_sl)
+        except Exception as e:
+            print(f"Error calculating bar trail long: {e}")
+            return current_sl
+
+    def _calculate_bar_trail_short(self, current_sl: float) -> float:
+        """BarTrail по закрытым барам: highest(high, N)[1] + buffer"""
+        try:
+            lookback = int(getattr(self.config, "trail_lookback", 50) or 50)
+            if lookback <= 0:
+                return current_sl
+
+            closed = self._get_closed_15m_window(lookback)
+            if not closed:
+                return current_sl
+
+            lb_high = max(float(c["high"]) for c in closed)
+            tick = self._tick_size()
+            buf = float(getattr(self.config, "trail_buf_ticks", 0)) * tick
+            bar_trail_sl = lb_high + buf
+            return min(bar_trail_sl, current_sl)
+        except Exception as e:
+            print(f"Error calculating bar trail short: {e}")
+            return current_sl
+
+    # ============== Процент + offset (в терминах Pine) ==============
+
+    def _calc_pct_offset_long(self, entry_price: float, current_price: float,
+                              current_sl: float, pct: float, offset: float) -> float:
+        """
+        Эмуляция strategy.exit(trail_points=entry*pct, trail_offset=entry*offset) для лонга.
+        Используем «пик» со входа из state, если он есть.
+        """
+        try:
+            pos = self.state.get_current_position() if hasattr(self.state, "get_current_position") else None
+            peak = float(pos.get("peak", entry_price)) if pos else entry_price
+            trail_points = entry_price * pct
+            offset_pts = entry_price * offset
+            cand = peak - trail_points
+            # не ближе к цене, чем offset
+            cand = min(cand, current_price - offset_pts)
+            return max(cand, current_sl)
+        except Exception:
+            return current_sl
+
+    def _calc_pct_offset_short(self, entry_price: float, current_price: float,
+                               current_sl: float, pct: float, offset: float) -> float:
+        """Эмуляция для шорта (используем «дно» со входа)."""
+        try:
+            pos = self.state.get_current_position() if hasattr(self.state, "get_current_position") else None
+            trough = float(pos.get("trough", entry_price)) if pos else entry_price
+            trail_points = entry_price * pct
+            offset_pts = entry_price * offset
+            cand = trough + trail_points
+            cand = max(cand, current_price + offset_pts)
+            return min(cand, current_sl)
+        except Exception:
+            return current_sl
+
+    # ============== Обновление стоп-лосса на бирже/эмуляция ==============
+
+    def _update_stop_loss(self, position: Dict, new_sl: float):
+        """Правильный апдейт стопа: округляем по тик-сайзу и пытаемся обновить позицию/ордер."""
+        try:
+            symbol = position.get("symbol", self.config.symbol)
+            tick = self._tick_size()
+            new_sl_rounded = price_round(float(new_sl), tick)
+
+            result = None
+
+            # 1) Универсальный маршрут — если есть modify_order у API-обвязки
+            if hasattr(self.api, "modify_order"):
+                try:
+                    result = self.api.modify_order(symbol=symbol, stop_loss=new_sl_rounded)
+                except TypeError:
+                    # альтернативные сигнатуры
+                    result = self.api.modify_order(symbol=symbol, sl=new_sl_rounded)
+
+            # 2) Деривативный маршрут
+            if not result and hasattr(self.api, "update_position_stop_loss"):
+                result = self.api.update_position_stop_loss(symbol, new_sl_rounded)
+
+            # 3) Фолбэк — условный стоп-ордер reduce-only
+            if not result and hasattr(self.api, "place_order"):
+                direction = position.get("direction")
+                size = float(position.get("size") or 0)
+                side = "sell" if direction == "long" else "buy"
+                try:
+                    result = self.api.place_order(
+                        symbol=symbol,
+                        side=side,
+                        order_type="stop",
+                        qty=size,
+                        price=new_sl_rounded,
+                        reduce_only=True
+                    )
+                except TypeError:
+                    # на случай другой сигнатуры
+                    result = self.api.place_order(
+                        symbol=symbol,
+                        side=side,
+                        order_type="stop",
+                        qty=size,
+                        stop_loss=new_sl_rounded
+                    )
+
+            if result:
+                # Обновляем состояние
+                old_sl = float(position.get("stop_loss") or 0)
+                position["stop_loss"] = new_sl_rounded
+                if hasattr(self.state, "update_position_stop_loss"):
+                    self.state.update_position_stop_loss(new_sl_rounded)
+                else:
+                    self.state.set_position(position)
+
+                print(f"[TRAIL] Stop loss updated to: {new_sl_rounded:.4f}")
+                self._log_trailing_update(position, old_sl, new_sl_rounded)
+
+        except Exception as e:
+            print(f"Error updating stop loss: {e}")
+
+    # ============== Логирование ==============
+
+    def _log_trail(self, position: Dict, old_sl: float, new_sl: float, current_price: float, trigger: str):
+        """Лог движения трейла для страницы аналитики (единообразные поля)."""
+        try:
+            direction = position.get("direction")
+            entry_price = float(position.get("entry_price") or 0)
+            qty = float(position.get("size") or 0)
+            unrealized = 0.0
+            if direction == "long":
+                unrealized = (current_price - entry_price) * qty
+            elif direction == "short":
+                unrealized = (entry_price - current_price) * qty
+
+            trail_distance = abs(new_sl - old_sl)
+            self.trail_logger.log_trail_movement(
+                position=position,
+                old_sl=float(old_sl),
+                new_sl=float(new_sl),
+                current_price=float(current_price),
+                trigger_type=trigger,
+                lookback_value=int(getattr(self.config, "trail_lookback", 0) or 0),
+                buffer_ticks=int(getattr(self.config, "trail_buf_ticks", 0) or 0),
+                trail_distance=float(trail_distance),
+                unrealized_pnl=float(unrealized),
+                arm_status=bool(position.get("armed", False)),
+                timestamp=datetime.now(timezone.utc)
+            )
+        except Exception as e:
+            print(f"Error logging trail movement: {e}")
+
+    def _log_trailing_update(self, position: Dict, old_sl: float, new_sl: float):
+        """Короткий вспомогательный лог для отладки (stdout)"""
+        try:
+            data = {
+                "ts": datetime.now(timezone.utc).isoformat(),
+                "symbol": position.get("symbol"),
+                "direction": position.get("direction"),
+                "old_sl": float(old_sl),
+                "new_sl": float(new_sl),
+                "action": "trailing_update_applied"
+            }
+            print(f"Trailing log: {data}")
+        except Exception as e:
+            print(f"Error logging trailing update: {e}")
+
+    # ============== Вспомогательное ==============
+
+    def _tick_size(self) -> float:
+        """Единый источник тик-сайза: config → state → дефолт."""
+        tick = getattr(self.config, "tick_size", None)
+        if tick and tick > 0:
+            return float(tick)
+        tick = getattr(self.state, "tick_size", None)
+        if tick and tick > 0:
+            return float(tick)
+        return 0.01
