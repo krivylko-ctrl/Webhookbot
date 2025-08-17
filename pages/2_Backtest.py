@@ -76,7 +76,8 @@ def main():
                 db = Database(memory=True)
                 
                 # Инициализируем стратегию
-                strategy = KWINStrategy(config=config, database=db)
+                # нужно:
+                strategy = KWINStrategy(config, api, state, db)
                 
                 # Запускаем бэктест
                 results = run_backtest(strategy, period_days, start_capital)
