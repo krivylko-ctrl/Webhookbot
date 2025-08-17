@@ -1,61 +1,93 @@
 # trail_engine.py
-from datetime import datetime
+from __future__ import annotations
+from dataclasses import dataclass
+
+@dataclass
+class _CfgView:
+    # Ожидаем, что в config есть эти поля; ставим безопасные дефолты на случай отсутствия
+    trailing_perc: float = 0.5          # проценты, например 0.5 -> 0.5%
+    trailing_offset_perc: float = 0.4   # проценты, например 0.4 -> 0.4%
+    use_arm_after_rr: bool = True
+    arm_rr: float = 0.5                 # в R
+    # ниже просто для совместимости, они не используются здесь:
+    # (наличие атрибутов в конфиге не обязательно)
 
 class SmartTrailEngine:
-    def __init__(self, config):
-        self.config = config
-        self.active = False
-        self.entry_price = None
-        self.stop_loss = None
-        self.direction = None
+    """
+    Процентный Smart Trail.
+    - Никакого bar-trail: только trailing как % от цены входа (+ опциональный offset).
+    - Активация (arming) по RR, если включено use_arm_after_rr.
+    """
+    def __init__(self, config, *_, **__):
+        # берём только то, что нужно; остальное игнорируем (совместимость сигнатуры)
+        # обеспечим наличие нужных полей
+        self.config = _CfgView(
+            trailing_perc=getattr(config, "trailing_perc", 0.5),
+            trailing_offset_perc=getattr(config, "trailing_offset_perc", 0.4),
+            use_arm_after_rr=getattr(config, "use_arm_after_rr", True),
+            arm_rr=getattr(config, "arm_rr", 0.5),
+        )
+        self.reset()
 
-    def on_entry(self, entry_price, stop_loss, direction):
-        """Инициализация трейла при входе в сделку"""
-        self.entry_price = entry_price
-        self.stop_loss = stop_loss
-        self.direction = direction
-        self.active = False  # активируется только после достижения armRR
+    # ---- публичный API ----
+    def on_entry(self, entry_price: float, stop_loss: float, direction: str):
+        """Вызывай при открытии позиции: фиксируем базовые значения."""
+        self.entry_price = float(entry_price)
+        self.stop_loss = float(stop_loss)
+        self.direction = str(direction)
+        # активировать сразу или ждать RR — по настройке
+        self.active = not self.config.use_arm_after_rr
         return self.stop_loss
 
-    def update(self, current_price):
-        """Обновление стопа на закрытии бара"""
-        if not self.entry_price or not self.stop_loss:
+    def update(self, current_price: float):
+        """
+        Обновление стопа на закрытии бара.
+        Возвращает новое значение SL (или старое, если не изменился).
+        """
+        if self.entry_price is None or self.stop_loss is None or self.direction is None:
             return self.stop_loss
 
-        # === Проверка активации трейла (armRR) ===
-        rr = None
-        if self.direction == "long":
-            risk = self.entry_price - self.stop_loss
-            rr = (current_price - self.entry_price) / risk if risk > 0 else 0
-        elif self.direction == "short":
-            risk = self.stop_loss - self.entry_price
-            rr = (self.entry_price - current_price) / risk if risk > 0 else 0
+        current_price = float(current_price)
 
-        if rr is not None and rr >= self.config.arm_rr:
-            self.active = True
+        # 1) Активация по RR (если требуется)
+        if not self.active and self.config.use_arm_after_rr:
+            risk = abs(self.entry_price - self.stop_loss)
+            if risk > 0:
+                if self.direction == "long":
+                    rr = (current_price - self.entry_price) / risk
+                else:
+                    rr = (self.entry_price - current_price) / risk
+                if rr >= float(self.config.arm_rr):
+                    self.active = True
 
         if not self.active:
             return self.stop_loss
 
-        # === Основная логика процентного трейла ===
-        trail_dist = self.entry_price * self.config.trailing_perc
-        offset = self.entry_price * self.config.trailing_offset_perc
+        # 2) Процентный трейл (проценты заданы как 0.5 -> 0.5%)
+        trail_dist = self.entry_price * (float(self.config.trailing_perc) / 100.0)
+        offset     = self.entry_price * (float(self.config.trailing_offset_perc) / 100.0)
 
         if self.direction == "long":
-            candidate_sl = current_price - trail_dist - offset
-            if candidate_sl > self.stop_loss:
-                self.stop_loss = candidate_sl
-
-        elif self.direction == "short":
-            candidate_sl = current_price + trail_dist + offset
-            if candidate_sl < self.stop_loss:
-                self.stop_loss = candidate_sl
+            candidate = current_price - trail_dist - offset
+            if candidate > self.stop_loss:
+                self.stop_loss = candidate
+        else:  # short
+            candidate = current_price + trail_dist + offset
+            if candidate < self.stop_loss:
+                self.stop_loss = candidate
 
         return self.stop_loss
 
     def reset(self):
-        """Сброс после выхода из сделки"""
+        """Вызывай при закрытии позиции."""
         self.active = False
         self.entry_price = None
         self.stop_loss = None
         self.direction = None
+
+
+# --- Совместимость со старым импортом ---
+# В проекте используется: from trail_engine import TrailEngine
+# Делает новый движок полностью совместимым без правок других файлов.
+class TrailEngine(SmartTrailEngine):
+    pass
