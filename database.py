@@ -2,7 +2,7 @@
 import os
 import sqlite3
 import json
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Any
 from datetime import datetime, timedelta, timezone
 
 # ===================== Вспомогательные =====================
@@ -16,44 +16,40 @@ def _to_iso(ts) -> Optional[str]:
         if ts.tzinfo is not None:
             ts = ts.astimezone(timezone.utc).replace(tzinfo=None)
         return ts.isoformat(timespec="seconds")
-    return str(ts)
+    # если вдруг прилетел ms timestamp или строка
+    try:
+        if isinstance(ts, (int, float)):
+            dt = datetime.utcfromtimestamp(float(ts) / (1000 if float(ts) > 1e12 else 1))
+            return dt.replace(microsecond=0).isoformat()
+        return str(ts)
+    except Exception:
+        return str(ts)
 
-# ===========================================================
+# Совместимость для старого кода
+to_iso = _to_iso
 
 
 class Database:
     """Управление базой данных SQLite для торгового бота"""
 
-    def __init__(self, db_path: Optional[str] = None, memory: bool = False):
-        # Размещение БД: :memory: | ENV DB_PATH | локальный файл
-        if memory:
-            self.db_path = ":memory:"
-        else:
-            self.db_path = db_path or os.getenv("DB_PATH", "kwin_bot.db")
+    def __init__(self, db_path: str = "kwin_bot.db", memory: bool = False):
+        self.db_path = ":memory:" if memory else db_path
         self.init_database()
 
-    # ------------- базовый коннектор -------------
-    def _connect(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(
-            self.db_path,
-            check_same_thread=False,    # важно для Streamlit
-            detect_types=sqlite3.PARSE_DECLTYPES
-        )
-        # режим WAL для конкуренции чтение/запись
-        try:
-            conn.execute("PRAGMA journal_mode=WAL;")
-            conn.execute("PRAGMA synchronous=NORMAL;")
-        except Exception:
-            pass
-        return conn
+    # Единая точка подключения
+    def _connect(self):
+        return sqlite3.connect(self.db_path)
+
+    # ===================== Схема =====================
 
     def init_database(self):
-        """Инициализация базы данных (схема + индексы)"""
+        """Инициализация базы данных"""
         with self._connect() as conn:
             c = conn.cursor()
 
             # Таблица сделок
-            c.execute("""
+            c.execute(
+                """
                 CREATE TABLE IF NOT EXISTS trades (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     symbol TEXT NOT NULL,
@@ -65,48 +61,51 @@ class Database:
                     quantity REAL NOT NULL,
                     pnl REAL,
                     rr REAL,
-                    entry_time TEXT NOT NULL,   -- ISO-8601
-                    exit_time TEXT,             -- ISO-8601
+                    entry_time TEXT NOT NULL,
+                    exit_time TEXT,
                     exit_reason TEXT,
                     status TEXT NOT NULL DEFAULT 'open',
                     created_at TEXT DEFAULT (datetime('now'))
                 )
-            """)
-
-            # Индексы для быстрых выборок
-            c.execute("CREATE INDEX IF NOT EXISTS idx_trades_status ON trades(status)")
-            c.execute("CREATE INDEX IF NOT EXISTS idx_trades_entry_time ON trades(entry_time)")
-            c.execute("CREATE INDEX IF NOT EXISTS idx_trades_symbol ON trades(symbol)")
+                """
+            )
 
             # Таблица equity
-            c.execute("""
+            c.execute(
+                """
                 CREATE TABLE IF NOT EXISTS equity_history (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     equity REAL NOT NULL,
-                    timestamp TEXT DEFAULT (datetime('now')) -- ISO-8601
+                    timestamp TEXT DEFAULT (datetime('now'))
                 )
-            """)
+                """
+            )
 
             # Таблица состояния бота
-            c.execute("""
+            c.execute(
+                """
                 CREATE TABLE IF NOT EXISTS bot_state (
                     id INTEGER PRIMARY KEY,
                     state_data TEXT NOT NULL,
                     updated_at TEXT DEFAULT (datetime('now'))
                 )
-            """)
+                """
+            )
 
             # Таблица конфигурации
-            c.execute("""
+            c.execute(
+                """
                 CREATE TABLE IF NOT EXISTS config (
                     id INTEGER PRIMARY KEY,
                     config_data TEXT NOT NULL,
                     updated_at TEXT DEFAULT (datetime('now'))
                 )
-            """)
+                """
+            )
 
             # Таблица логов
-            c.execute("""
+            c.execute(
+                """
                 CREATE TABLE IF NOT EXISTS logs (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     level TEXT NOT NULL,
@@ -114,14 +113,15 @@ class Database:
                     module TEXT,
                     timestamp TEXT DEFAULT (datetime('now'))
                 )
-            """)
+                """
+            )
 
             conn.commit()
 
-    # -------------------- Trades --------------------
+    # ===================== Trades =====================
 
     def save_trade(self, trade_data: Dict) -> int:
-        """Сохранение новой сделки (возвращает id)."""
+        """Сохранение новой сделки. Возвращает id."""
         with self._connect() as conn:
             c = conn.cursor()
             c.execute(
@@ -138,26 +138,24 @@ class Database:
                     None if trade_data.get("stop_loss") is None else float(trade_data.get("stop_loss")),
                     None if trade_data.get("take_profit") is None else float(trade_data.get("take_profit")),
                     float(trade_data.get("quantity")),
-                    to_iso(trade_data.get("entry_time") or datetime.utcnow()),
+                    _to_iso(trade_data.get("entry_time") or datetime.utcnow()),
                     trade_data.get("status", "open"),
                 ),
             )
+            trade_id = c.lastrowid or 0
             conn.commit()
-            return c.lastrowid   # <-- возвращаем id
+            return int(trade_id)
 
     def add_trade(self, trade_data: Dict) -> int:
         """
         Backward-compat alias.
-        Старый код мог вызывать db.add_trade(...). Делаем совместимость,
-        проксируя в save_trade(...).
+        Старый код мог вызывать db.add_trade(...).
+        Проксируем в save_trade(...).
         """
         return self.save_trade(trade_data)
 
     def update_trade_exit(self, trade_data: Dict, fee_rate: float = 0.00055):
-        """
-        Обновление открытой сделки при выходе + расчёт PnL/RR (нетто, с двойной комиссией).
-        Если передан trade_id — обновляем его, иначе берём последнюю открытую.
-        """
+        """Обновление выхода: считает PnL/RR и закрывает последнюю открытую сделку (или по id)."""
         with self._connect() as conn:
             c = conn.cursor()
 
@@ -165,7 +163,6 @@ class Database:
             if trade_id:
                 c.execute("SELECT * FROM trades WHERE id = ? AND status = 'open'", (trade_id,))
             else:
-                # Самая последняя открытая по времени входа
                 c.execute("SELECT * FROM trades WHERE status = 'open' ORDER BY entry_time DESC LIMIT 1")
 
             row = c.fetchone()
@@ -177,124 +174,104 @@ class Database:
             tr = dict(zip(cols, row))
 
             entry_price = float(tr["entry_price"])
-            quantity = float(tr["quantity"])
-            direction = tr["direction"]
+            stop_loss = float(tr["stop_loss"]) if tr["stop_loss"] is not None else None
+            qty = float(tr["quantity"])
+            side = tr["direction"]
+            exit_price = float(trade_data.get("exit_price", 0.0))
 
-            exit_price = float(trade_data.get("exit_price"))
-            exit_time = _to_iso(trade_data.get("exit_time") or datetime.utcnow())
-            exit_reason = trade_data.get("exit_reason", "exit")
-            status = trade_data.get("status", "closed")
-
-            # PnL (нетто)
-            gross = (exit_price - entry_price) * quantity if direction == "long" else (entry_price - exit_price) * quantity
-            fees = (entry_price + exit_price) * quantity * float(fee_rate)
-            pnl_net = gross - fees
+            # Валовой PnL
+            gross = (exit_price - entry_price) * qty if side == "long" else (entry_price - exit_price) * qty
+            # Комиссии (вход+выход)
+            fee_in = entry_price * qty * fee_rate
+            fee_out = exit_price * qty * fee_rate
+            net_pnl = gross - (fee_in + fee_out)
 
             # RR
-            rr = None
-            if tr.get("stop_loss") is not None:
-                risk_per_unit = abs(entry_price - float(tr["stop_loss"]))
+            rr = 0.0
+            if stop_loss is not None:
+                risk_per_unit = abs(entry_price - stop_loss)
                 if risk_per_unit > 0:
-                    rr = abs(gross) / (risk_per_unit * quantity)
+                    rr = abs(exit_price - entry_price) / risk_per_unit
 
             c.execute(
                 """
                 UPDATE trades
-                   SET exit_price = ?,
-                       exit_time = ?,
-                       exit_reason = ?,
-                       pnl = ?,
-                       rr = ?,
-                       status = ?
-                 WHERE id = ?
+                SET exit_price = ?,
+                    exit_time = ?,
+                    exit_reason = ?,
+                    pnl = ?,
+                    rr = ?,
+                    status = ?
+                WHERE id = ?
                 """,
-                (exit_price, exit_time, exit_reason, float(pnl_net), None if rr is None else float(rr), status, int(tr["id"]))
+                (
+                    exit_price,
+                    _to_iso(trade_data.get("exit_time") or datetime.utcnow()),
+                    trade_data.get("exit_reason"),
+                    float(net_pnl),
+                    float(rr),
+                    trade_data.get("status", "closed"),
+                    tr["id"],
+                ),
             )
+
             conn.commit()
-            print(f"Trade updated: id={tr['id']} PnL={pnl_net:.2f} RR={(rr if rr is not None else 0):.2f}")
+            print(f"Trade updated: PnL={net_pnl:.2f}, RR={rr:.2f}")
 
     def get_recent_trades(self, limit: int = 50) -> List[Dict]:
         with self._connect() as conn:
             c = conn.cursor()
             c.execute(
                 "SELECT * FROM trades ORDER BY entry_time DESC LIMIT ?",
-                (int(limit),)
+                (int(limit),),
             )
-            cols = [d[0] for d in c.description]
-            return [dict(zip(cols, r)) for r in c.fetchall()]
-
-    def get_all_trades(self) -> List[Dict]:
-        with self._connect() as conn:
-            c = conn.cursor()
-            c.execute("SELECT * FROM trades ORDER BY entry_time DESC")
             cols = [d[0] for d in c.description]
             return [dict(zip(cols, r)) for r in c.fetchall()]
 
     def get_trades_by_period(self, days: int) -> List[Dict]:
-        """Сделки, у которых entry_time >= now - days."""
         with self._connect() as conn:
             c = conn.cursor()
-            start = (datetime.utcnow() - timedelta(days=int(days))).replace(tzinfo=None)
+            start = datetime.utcnow() - timedelta(days=int(days))
             c.execute(
-                """
-                SELECT * FROM trades
-                 WHERE entry_time >= ?
-                 ORDER BY entry_time DESC
-                """,
-                (_to_iso(start),)
+                "SELECT * FROM trades WHERE entry_time >= ? ORDER BY entry_time DESC",
+                (_to_iso(start),),
             )
             cols = [d[0] for d in c.description]
             return [dict(zip(cols, r)) for r in c.fetchall()]
 
-    # -------------------- Equity --------------------
+    # ===================== Equity =====================
 
-    def save_equity_snapshot(self, equity: float, ts: Optional[datetime] = None):
+    def save_equity_snapshot(self, equity: float):
         with self._connect() as conn:
             c = conn.cursor()
             c.execute(
                 "INSERT INTO equity_history (equity, timestamp) VALUES (?, ?)",
-                (float(equity), _to_iso(ts or datetime.utcnow()))
+                (float(equity), _to_iso(datetime.utcnow())),
             )
             conn.commit()
 
     def get_equity_history(self, days: int = 30) -> List[Dict]:
         with self._connect() as conn:
             c = conn.cursor()
-            start = (datetime.utcnow() - timedelta(days=int(days))).replace(tzinfo=None)
+            start = datetime.utcnow() - timedelta(days=int(days))
             c.execute(
-                """
-                SELECT equity, timestamp FROM equity_history
-                 WHERE timestamp >= ?
-                 ORDER BY timestamp ASC
-                """,
-                (_to_iso(start),)
+                "SELECT equity, timestamp FROM equity_history WHERE timestamp >= ? ORDER BY timestamp ASC",
+                (_to_iso(start),),
             )
-            rows = c.fetchall()
-            return [{"equity": float(r[0]), "timestamp": r[1]} for r in rows]
+            return [{"equity": row[0], "timestamp": row[1]} for row in c.fetchall()]
 
-    # Для бэктеста (если требуется списком)
-    def get_equity_snapshots(self, days: int = 30) -> List[Dict]:
-        with self._connect() as conn:
-            c = conn.cursor()
-            start = (datetime.utcnow() - timedelta(days=int(days))).replace(tzinfo=None)
-            c.execute(
-                "SELECT timestamp as time, equity FROM equity_history WHERE timestamp >= ? ORDER BY timestamp ASC",
-                (_to_iso(start),)
-            )
-            cols = [d[0] for d in c.description]
-            return [dict(zip(cols, r)) for r in c.fetchall()]
-
-    # -------------------- State / Config --------------------
+    # ===================== Bot state / Config =====================
 
     def save_bot_state(self, state: Dict):
         with self._connect() as conn:
             c = conn.cursor()
+            state_json = json.dumps(state)
             c.execute(
                 """
                 INSERT OR REPLACE INTO bot_state (id, state_data, updated_at)
                 VALUES (1, ?, ?)
                 """,
-                (json.dumps(state, ensure_ascii=False), _to_iso(datetime.utcnow()))
+                (state_json, _to_iso(datetime.utcnow())),
             )
             conn.commit()
 
@@ -303,14 +280,14 @@ class Database:
             c = conn.cursor()
             c.execute("SELECT state_data FROM bot_state WHERE id = 1")
             row = c.fetchone()
-            return json.loads(row[0]) if row and row[0] else None
+            return json.loads(row[0]) if row else None
 
-    # -------------------- Stats / Logs --------------------
+    # ===================== Stats / Reports =====================
 
-    def get_performance_stats(self, days: int = 30) -> Dict:
+    def get_performance_stats(self, days: int = 30) -> Dict[str, Any]:
         with self._connect() as conn:
             c = conn.cursor()
-            start = (datetime.utcnow() - timedelta(days=int(days))).replace(tzinfo=None)
+            start = datetime.utcnow() - timedelta(days=int(days))
             c.execute(
                 """
                 SELECT 
@@ -321,24 +298,25 @@ class Database:
                     AVG(rr) as avg_rr,
                     MAX(pnl) as max_win,
                     MIN(pnl) as max_loss,
-                    AVG(CASE 
-                        WHEN exit_time IS NOT NULL AND entry_time IS NOT NULL 
-                        THEN (julianday(exit_time) - julianday(entry_time)) * 24 
-                    END) as avg_hold_hours
+                    AVG(
+                        CASE 
+                          WHEN exit_time IS NOT NULL AND entry_time IS NOT NULL 
+                          THEN (julianday(exit_time) - julianday(entry_time)) * 24 
+                        END
+                    ) as avg_hold_hours
                 FROM trades 
                 WHERE entry_time >= ? AND status = 'closed'
                 """,
-                (_to_iso(start),)
+                (_to_iso(start),),
             )
-            row = c.fetchone() or (0,)*8
-
-            total_trades = int(row[0] or 0)
-            winning_trades = int(row[1] or 0)
-            stats = {
-                "total_trades": total_trades,
-                "winning_trades": winning_trades,
-                "losing_trades": max(total_trades - winning_trades, 0),
-                "win_rate": (winning_trades / total_trades) * 100 if total_trades > 0 else 0.0,
+            row = c.fetchone() or (0,) * 8
+            total = row[0] or 0
+            wins = row[1] or 0
+            return {
+                "total_trades": int(total),
+                "winning_trades": int(wins),
+                "losing_trades": int(total - wins),
+                "win_rate": (wins / total * 100.0) if total else 0.0,
                 "avg_pnl": float(row[2] or 0.0),
                 "total_pnl": float(row[3] or 0.0),
                 "avg_rr": float(row[4] or 0.0),
@@ -346,30 +324,32 @@ class Database:
                 "max_loss": float(row[6] or 0.0),
                 "avg_hold_time": float(row[7] or 0.0),
             }
-            return stats
 
     def get_trades_count_today(self) -> int:
-        """Количество сделок, открытых сегодня (UTC)."""
         with self._connect() as conn:
             c = conn.cursor()
-            c.execute("SELECT COUNT(*) FROM trades WHERE DATE(entry_time) = DATE('now')")
+            today = datetime.utcnow().date().isoformat()
+            c.execute("SELECT COUNT(*) FROM trades WHERE DATE(entry_time) = ?", (today,))
             return int((c.fetchone() or (0,))[0])
 
     def get_pnl_today(self) -> float:
-        """Суммарный PnL закрытых сделок за сегодня (UTC)."""
         with self._connect() as conn:
             c = conn.cursor()
+            today = datetime.utcnow().date().isoformat()
             c.execute(
-                "SELECT COALESCE(SUM(pnl), 0) FROM trades WHERE DATE(exit_time) = DATE('now') AND status = 'closed'"
+                "SELECT COALESCE(SUM(pnl), 0) FROM trades WHERE DATE(entry_time) = ? AND status = 'closed'",
+                (today,),
             )
             return float((c.fetchone() or (0.0,))[0])
+
+    # ===================== Logs =====================
 
     def save_log(self, level: str, message: str, module: str = None):
         with self._connect() as conn:
             c = conn.cursor()
             c.execute(
                 "INSERT INTO logs (level, message, module, timestamp) VALUES (?, ?, ?, ?)",
-                (level, message, module, _to_iso(datetime.utcnow()))
+                (level, message, module, _to_iso(datetime.utcnow())),
             )
             conn.commit()
 
@@ -378,21 +358,18 @@ class Database:
             c = conn.cursor()
             c.execute(
                 "SELECT level, message, module, timestamp FROM logs ORDER BY timestamp DESC LIMIT ?",
-                (int(limit),)
+                (int(limit),),
             )
             cols = ["level", "message", "module", "timestamp"]
             return [dict(zip(cols, r)) for r in c.fetchall()]
 
-    # -------------------- Housekeeping --------------------
+    # ===================== Cleanup =====================
 
     def cleanup_old_data(self, days_to_keep: int = 90):
         with self._connect() as conn:
             c = conn.cursor()
-            cutoff = (datetime.utcnow() - timedelta(days=int(days_to_keep))).replace(tzinfo=None)
+            cutoff = datetime.utcnow() - timedelta(days=int(days_to_keep))
             cutoff_iso = _to_iso(cutoff)
-
-            # Логи
             c.execute("DELETE FROM logs WHERE timestamp < ?", (cutoff_iso,))
-            # История equity
             c.execute("DELETE FROM equity_history WHERE timestamp < ?", (cutoff_iso,))
             conn.commit()
