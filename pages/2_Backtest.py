@@ -80,22 +80,27 @@ def _normalize_klines(raw: List[Dict]) -> List[Dict]:
 # ====================== Загрузчики OHLC (якорные окна) ======================
 
 @st.cache_data(show_spinner=False)
-def load_klines_bybit_window(api, symbol: str, interval: str, days: int) -> List[Dict]:
+def load_klines_bybit_window(_api, symbol: str, interval: str, days: int) -> List[Dict]:
     """
-    Получаем ровно последние N дней (UTC): [now - N, now].
-    Т.к. обвязка get_klines(limit) — берём с запасом и фильтруем по времени.
+    Загружает ровно последние N дней (UTC): [now - N, now] с Bybit.
+    ВАЖНО: параметр _api начинается с подчёркивания, чтобы Streamlit
+    не пытался его хэшировать в cache_data.
     """
-    if api is None:
+    if _api is None:
         return []
+
     start_ms, end_ms = _window_ms(days)
-    # Для 15m: ~4 бара/час => 96/день. Чуть больше запас.
+
+    # Для 15m: ~96 баров в день. Берём небольшой запас и потом фильтруем окном.
     need = int(days * 96 * 1.2) + 50
+
     try:
-        raw = api.get_klines(symbol, interval, need) or []
+        raw = _api.get_klines(symbol, interval, need) or []
     except Exception:
         return []
+
     kl = _normalize_klines(raw)
-    # фильтруем строго по окну
+    # Строго обрезаем по якорному окну
     kl = [b for b in kl if start_ms <= b["timestamp"] <= end_ms]
     return kl
 
