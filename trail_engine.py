@@ -1,6 +1,6 @@
 import math
 from typing import Dict, Optional
-from datetime import datetime
+from datetime import datetime, timezone
 
 from config import Config
 from state_manager import StateManager
@@ -9,264 +9,325 @@ from analytics import TrailingLogger
 
 class TrailEngine:
     """Движок Smart Trailing для управления стоп-лоссами"""
-    
+
     def __init__(self, config: Config, state_manager: StateManager, bybit_api):
         self.config = config
         self.state = state_manager
         self.api = bybit_api
-        
-        # 4️⃣ Логгер трейлинга
+
+        # Логгер трейлинга (используется на странице аналитики)
         self.trail_logger = TrailingLogger()
-        
-        # Состояние трейлинга
-        self.last_trail_price_long = None
-        self.last_trail_price_short = None
-        
+
+        # Служебные поля (могут пригодиться для сглаживания)
+        self.last_trail_price_long: Optional[float] = None
+        self.last_trail_price_short: Optional[float] = None
+
+    # ============== Публичная точка входа ==============
+
     def process_trailing(self, position: Dict, current_price: float):
         """Основная логика обработки трейлинга"""
         if not position or not current_price:
             return
-        
-        direction = position.get('direction')
-        
-        if direction == 'long':
+
+        direction = position.get("direction")
+        if direction == "long":
             self._process_long_trailing(position, current_price)
-        elif direction == 'short':
+        elif direction == "short":
             self._process_short_trailing(position, current_price)
-    
+
+    # ============== ЛОНГ ==============
+
     def _process_long_trailing(self, position: Dict, current_price: float):
         """Обработка трейлинга для лонг позиции"""
         try:
-            entry_price = position.get('entry_price')
-            current_sl = position.get('stop_loss')
-            armed = position.get('armed', False)
-            
-            if not entry_price or not current_sl:
+            entry_price = float(position.get("entry_price") or 0)
+            current_sl = float(position.get("stop_loss") or 0)
+            armed = bool(position.get("armed", False))
+            if entry_price <= 0 or current_sl <= 0:
                 return
-            
-            # Проверяем арминг после достижения RR
+
+            # 1) Арм по RR (как в стратегии)
             if self.config.use_arm_after_rr and not armed:
                 moved = current_price - entry_price
-                need = (entry_price - current_sl) * self.config.arm_rr
-                
+                need = (entry_price - current_sl) * float(getattr(self.config, "arm_rr", 0.5))
                 if moved >= need:
-                    position['armed'] = True
+                    position["armed"] = True
                     armed = True
-                    self.state.update_position_armed(True)
-                    print(f"Long position armed at RR: {moved / (entry_price - current_sl):.2f}")
-            
+                    # обновим в state (если есть такой метод)
+                    if hasattr(self.state, "update_position_armed"):
+                        self.state.update_position_armed(True)
+                    print(f"Long position armed at RR: {moved / max(entry_price - current_sl, 1e-9):.2f}")
+
             if not armed:
                 return
-            
+
             new_sl = current_sl
-            
-            # Bar Trail логика
+
+            # 2) Баровый трейл (по закрытым барам)
             if self.config.use_bar_trail:
                 new_sl = self._calculate_bar_trail_long(current_sl)
-            
-            # Offset Trail логика
-            if self.config.trailing_offset > 0:
-                offset_sl = self._calculate_offset_trail_long(current_price, entry_price, current_sl)
-                new_sl = max(new_sl, offset_sl)
-            
-            # Обновляем стоп-лосс если он изменился
+
+            # 3) Процент+offset трейл
+            per = float(getattr(self.config, "trailing_perc", 0.0)) / 100.0
+            off = float(getattr(self.config, "trailing_offset_perc", 0.0)) / 100.0
+            if per > 0.0:
+                cand = self._calc_pct_offset_long(entry_price=entry_price,
+                                                  current_price=current_price,
+                                                  current_sl=current_sl,
+                                                  pct=per, offset=off)
+                new_sl = max(new_sl, cand)
+
+            # 4) Применяем только улучшение SL
             if new_sl > current_sl:
-                # 4️⃣ Логируем движение трейла
-                self.trail_logger.log_trail_movement(
-                    position, current_sl, new_sl, current_price, 
-                    "Long Trail Update", 
-                    lookback_value=self.config.trail_lookback if self.config.use_bar_trail else 0,
-                    buffer_ticks=self.config.trail_buf_ticks
-                )
+                self._log_trail(position, current_sl, new_sl, current_price, trigger="Long Trail Update")
                 self._update_stop_loss(position, new_sl)
-        
+
         except Exception as e:
             print(f"Error in long trailing: {e}")
-    
+
+    # ============== ШОРТ ==============
+
     def _process_short_trailing(self, position: Dict, current_price: float):
         """Обработка трейлинга для шорт позиции"""
         try:
-            entry_price = position.get('entry_price')
-            current_sl = position.get('stop_loss')
-            armed = position.get('armed', False)
-            
-            if not entry_price or not current_sl:
+            entry_price = float(position.get("entry_price") or 0)
+            current_sl = float(position.get("stop_loss") or 0)
+            armed = bool(position.get("armed", False))
+            if entry_price <= 0 or current_sl <= 0:
                 return
-            
-            # Проверяем арминг после достижения RR
+
+            # 1) Арм по RR
             if self.config.use_arm_after_rr and not armed:
                 moved = entry_price - current_price
-                need = (current_sl - entry_price) * self.config.arm_rr
-                
+                need = (current_sl - entry_price) * float(getattr(self.config, "arm_rr", 0.5))
                 if moved >= need:
-                    position['armed'] = True
+                    position["armed"] = True
                     armed = True
-                    self.state.update_position_armed(True)
-                    print(f"Short position armed at RR: {moved / (current_sl - entry_price):.2f}")
-            
+                    if hasattr(self.state, "update_position_armed"):
+                        self.state.update_position_armed(True)
+                    print(f"Short position armed at RR: {moved / max(current_sl - entry_price, 1e-9):.2f}")
+
             if not armed:
                 return
-            
+
             new_sl = current_sl
-            
-            # Bar Trail логика
+
+            # 2) Баровый трейл
             if self.config.use_bar_trail:
                 new_sl = self._calculate_bar_trail_short(current_sl)
-            
-            # Offset Trail логика
-            if self.config.trailing_offset > 0:
-                offset_sl = self._calculate_offset_trail_short(current_price, entry_price, current_sl)
-                new_sl = min(new_sl, offset_sl)
-            
-            # Обновляем стоп-лосс если он изменился
+
+            # 3) Процент+offset трейл
+            per = float(getattr(self.config, "trailing_perc", 0.0)) / 100.0
+            off = float(getattr(self.config, "trailing_offset_perc", 0.0)) / 100.0
+            if per > 0.0:
+                cand = self._calc_pct_offset_short(entry_price=entry_price,
+                                                   current_price=current_price,
+                                                   current_sl=current_sl,
+                                                   pct=per, offset=off)
+                new_sl = min(new_sl, cand)
+
+            # 4) Применяем только улучшение SL
             if new_sl < current_sl:
-                # 4️⃣ Логируем движение трейла
-                self.trail_logger.log_trail_movement(
-                    position, current_sl, new_sl, current_price, 
-                    "Short Trail Update",
-                    lookback_value=self.config.trail_lookback if self.config.use_bar_trail else 0,
-                    buffer_ticks=self.config.trail_buf_ticks
-                )
+                self._log_trail(position, current_sl, new_sl, current_price, trigger="Short Trail Update")
                 self._update_stop_loss(position, new_sl)
-        
+
         except Exception as e:
             print(f"Error in short trailing: {e}")
-    
+
+    # ============== Баровый трейл (15m, закрытые бары) ==============
+
     def _calculate_bar_trail_long(self, current_sl: float) -> float:
-        """BarTrail по "закрытым" барам: lowest(low, N)[1] - не включай текущий бар"""
+        """BarTrail по закрытым барам: lowest(low, N)[1] − buffer"""
         try:
-            symbol = self.config.symbol
-            klines = self.api.get_klines(symbol, "15", self.config.trail_lookback + 2)  # +2 для исключения текущего
-            if not klines or len(klines) < self.config.trail_lookback + 1:
+            lookback = int(getattr(self.config, "trail_lookback", 50) or 50)
+            if lookback <= 0 or not self.api:
                 return current_sl
-            
-            # BarTrail по "закрытым" барам: используем свечи klines[1:N+1] (исключаем текущий [0])
-            lookback_lows = [candle['low'] for candle in klines[1:self.config.trail_lookback + 1]]
-            min_low = min(lookback_lows) if lookback_lows else current_sl
-            
-            # Добавляем буфер с тик-сайзом из состояния/биржи (единый источник)
-            tick_size = getattr(self.state, 'tick_size', 0.01)  # Единый источник истины
-            buffer = self.config.trail_buf_ticks * tick_size
-            bar_trail_sl = min_low - buffer
-            
-            # Стоп не может двигаться вниз
+
+            # +2 берём чтобы исключить текущий бар [0] и считать по [1..lookback]
+            klines = self.api.get_klines(self.config.symbol, "15", lookback + 2) or []
+            if len(klines) < lookback + 1:
+                return current_sl
+
+            lows = [float(c["low"]) for c in klines[1:lookback + 1]]
+            lb_low = min(lows) if lows else current_sl
+
+            tick = self._tick_size()
+            buf = float(getattr(self.config, "trail_buf_ticks", 0)) * tick
+            bar_trail_sl = lb_low - buf
+
             return max(bar_trail_sl, current_sl)
-        
         except Exception as e:
             print(f"Error calculating bar trail long: {e}")
             return current_sl
-    
+
     def _calculate_bar_trail_short(self, current_sl: float) -> float:
-        """BarTrail по "закрытым" барам: highest(high, N)[1] - не включай текущий бар"""
+        """BarTrail по закрытым барам: highest(high, N)[1] + buffer"""
         try:
-            symbol = self.config.symbol
-            klines = self.api.get_klines(symbol, "15", self.config.trail_lookback + 2)  # +2 для исключения текущего
-            if not klines or len(klines) < self.config.trail_lookback + 1:
+            lookback = int(getattr(self.config, "trail_lookback", 50) or 50)
+            if lookback <= 0 or not self.api:
                 return current_sl
-            
-            # BarTrail по "закрытым" барам: используем свечи klines[1:N+1] (исключаем текущий [0])
-            lookback_highs = [candle['high'] for candle in klines[1:self.config.trail_lookback + 1]]
-            max_high = max(lookback_highs) if lookback_highs else current_sl
-            
-            # Добавляем буфер с тик-сайзом из состояния/биржи (единый источник)
-            tick_size = getattr(self.state, 'tick_size', 0.01)  # Единый источник истины
-            buffer = self.config.trail_buf_ticks * tick_size
-            bar_trail_sl = max_high + buffer
-            
-            # Стоп не может двигаться вверх
+
+            klines = self.api.get_klines(self.config.symbol, "15", lookback + 2) or []
+            if len(klines) < lookback + 1:
+                return current_sl
+
+            highs = [float(c["high"]) for c in klines[1:lookback + 1]]
+            lb_high = max(highs) if highs else current_sl
+
+            tick = self._tick_size()
+            buf = float(getattr(self.config, "trail_buf_ticks", 0)) * tick
+            bar_trail_sl = lb_high + buf
+
             return min(bar_trail_sl, current_sl)
-        
         except Exception as e:
             print(f"Error calculating bar trail short: {e}")
             return current_sl
-    
-    def _calculate_offset_trail_long(self, current_price: float, entry_price: float, current_sl: float) -> float:
-        """Расчет Offset Trail для лонг позиции"""
+
+    # ============== Процент + offset (в терминах Pine) ==============
+
+    def _calc_pct_offset_long(self, entry_price: float, current_price: float,
+                              current_sl: float, pct: float, offset: float) -> float:
+        """
+        Эмуляция strategy.exit(trail_points=entry*pct, trail_offset=entry*offset) для лонга.
+        Используем «пик» со входа из state, если он есть.
+        """
         try:
-            # Расчет трейлинга по проценту
-            trailing_distance = entry_price * (self.config.trailing_offset / 100)
-            offset_sl = current_price - trailing_distance
-            
-            # Стоп не может двигаться вниз
-            return max(offset_sl, current_sl)
-        
-        except Exception as e:
-            print(f"Error calculating offset trail long: {e}")
+            peak = float(self.state.get_current_position().get("peak", entry_price)) if self.state.get_current_position() else entry_price
+            trail_points = entry_price * pct
+            offset_pts = entry_price * offset
+            cand = peak - trail_points
+            # не ближе к цене, чем offset
+            cand = min(cand, current_price - offset_pts)
+            return max(cand, current_sl)
+        except Exception:
             return current_sl
-    
-    def _calculate_offset_trail_short(self, current_price: float, entry_price: float, current_sl: float) -> float:
-        """Расчет Offset Trail для шорт позиции"""
+
+    def _calc_pct_offset_short(self, entry_price: float, current_price: float,
+                               current_sl: float, pct: float, offset: float) -> float:
+        """Эмуляция для шорта (используем «дно» со входа)."""
         try:
-            # Расчет трейлинга по проценту
-            trailing_distance = entry_price * (self.config.trailing_offset / 100)
-            offset_sl = current_price + trailing_distance
-            
-            # Стоп не может двигаться вверх
-            return min(offset_sl, current_sl)
-        
-        except Exception as e:
-            print(f"Error calculating offset trail short: {e}")
+            trough = float(self.state.get_current_position().get("trough", entry_price)) if self.state.get_current_position() else entry_price
+            trail_points = entry_price * pct
+            offset_pts = entry_price * offset
+            cand = trough + trail_points
+            cand = max(cand, current_price + offset_pts)
+            return min(cand, current_sl)
+        except Exception:
             return current_sl
-    
+
+    # ============== Обновление стоп-лосса на бирже/эмуляция ==============
+
     def _update_stop_loss(self, position: Dict, new_sl: float):
-        """Правильный апдейт стопа (derivatives) согласно техническим требованиям"""
+        """Правильный апдейт стопа: округляем по тик-сайзу и пытаемся обновить позицию/ордер."""
         try:
-            from utils import price_round
-            import time
-            
-            # Получаем символ и тик-сайз из состояния/биржи (единый источник)
-            symbol = position.get('symbol', self.config.symbol)
-            tick_size = getattr(self.state, 'tick_size', 0.01)  # Единый источник
-            
-            # Округляем цену правильным тик-сайзом
-            new_sl = price_round(new_sl, tick_size)
-            
-            # Правильное обновление SL для деривативов - POST /v5/position/trading-stop
-            if hasattr(self.api, 'market_type') and self.api.market_type == 'linear':
-                result = self.api.update_position_stop_loss(symbol, new_sl)
-            else:
-                # Для спота создаем условный STOP-ордер с reduceOnly=true
-                direction = position.get('direction')
-                size = position.get('size')
-                
-                side = 'sell' if direction == 'long' else 'buy'
-                
-                result = self.api.place_order(
-                    symbol=symbol,
-                    side=side,
-                    order_type="stop",
-                    qty=size,
-                    price=new_sl,
-                    reduce_only=True,
-                    order_link_id=f"trail_{int(time.time())}"
-                )
-            
+            symbol = position.get("symbol", self.config.symbol)
+            tick = self._tick_size()
+            new_sl_rounded = price_round(float(new_sl), tick)
+
+            result = None
+
+            # 1) Универсальный маршрут — если есть modify_order у API обвязки
+            if hasattr(self.api, "modify_order"):
+                result = self.api.modify_order(symbol=symbol, stop_loss=new_sl_rounded)
+
+            # 2) Деривативный маршрут
+            if not result and hasattr(self.api, "update_position_stop_loss"):
+                result = self.api.update_position_stop_loss(symbol, new_sl_rounded)
+
+            # 3) Фолбэк — условный стоп-ордер reduce-only
+            if not result and hasattr(self.api, "place_order"):
+                direction = position.get("direction")
+                size = float(position.get("size") or 0)
+                side = "sell" if direction == "long" else "buy"
+                try:
+                    result = self.api.place_order(
+                        symbol=symbol,
+                        side=side,
+                        order_type="stop",
+                        qty=size,
+                        price=new_sl_rounded,
+                        reduce_only=True
+                    )
+                except TypeError:
+                    # на случай другой сигнатуры
+                    result = self.api.place_order(
+                        symbol=symbol,
+                        side=side,
+                        order_type="stop",
+                        qty=size,
+                        stop_loss=new_sl_rounded
+                    )
+
             if result:
                 # Обновляем состояние
-                position['stop_loss'] = new_sl
-                self.state.update_position_stop_loss(new_sl)
-                
-                print(f"[TRAIL] Stop loss updated to: {new_sl}")
-                
-                # Логируем изменение
-                self._log_trailing_update(position, new_sl)
-        
+                old_sl = float(position.get("stop_loss") or 0)
+                position["stop_loss"] = new_sl_rounded
+                if hasattr(self.state, "update_position_stop_loss"):
+                    self.state.update_position_stop_loss(new_sl_rounded)
+                else:
+                    self.state.set_position(position)
+
+                print(f"[TRAIL] Stop loss updated to: {new_sl_rounded:.4f}")
+                # Доп. лог (кроме детального — ниже)
+                self._log_trailing_update(position, old_sl, new_sl_rounded)
+
         except Exception as e:
             print(f"Error updating stop loss: {e}")
-    
-    def _log_trailing_update(self, position: Dict, new_sl: float):
-        """Логирование обновления трейлинга"""
+
+    # ============== Логирование ==============
+
+    def _log_trail(self, position: Dict, old_sl: float, new_sl: float, current_price: float, trigger: str):
+        """Лог движения трейла для страницы аналитики (единообразные поля)."""
         try:
-            log_data = {
-                'timestamp': datetime.now(),
-                'symbol': position.get('symbol'),
-                'direction': position.get('direction'),
-                'old_sl': position.get('stop_loss'),
-                'new_sl': new_sl,
-                'action': 'trailing_update'
+            direction = position.get("direction")
+            entry_price = float(position.get("entry_price") or 0)
+            qty = float(position.get("size") or 0)
+            unrealized = 0.0
+            if direction == "long":
+                unrealized = (current_price - entry_price) * qty
+            elif direction == "short":
+                unrealized = (entry_price - current_price) * qty
+
+            trail_distance = abs(new_sl - old_sl)
+            self.trail_logger.log_trail_movement(
+                position=position,
+                old_sl=float(old_sl),
+                new_sl=float(new_sl),
+                current_price=float(current_price),
+                trigger_type=trigger,
+                lookback_value=int(getattr(self.config, "trail_lookback", 0) or 0),
+                buffer_ticks=int(getattr(self.config, "trail_buf_ticks", 0) or 0),
+                trail_distance=float(trail_distance),
+                unrealized_pnl=float(unrealized),
+                arm_status=bool(position.get("armed", False)),
+                timestamp=datetime.now(timezone.utc)
+            )
+        except Exception as e:
+            print(f"Error logging trail movement: {e}")
+
+    def _log_trailing_update(self, position: Dict, old_sl: float, new_sl: float):
+        """Короткий вспомогательный лог для отладки."""
+        try:
+            data = {
+                "ts": datetime.now(timezone.utc).isoformat(),
+                "symbol": position.get("symbol"),
+                "direction": position.get("direction"),
+                "old_sl": float(old_sl),
+                "new_sl": float(new_sl),
+                "action": "trailing_update_applied"
             }
-            # Здесь можно добавить сохранение в базу данных или файл лога
-            print(f"Trailing log: {log_data}")
-        
+            print(f"Trailing log: {data}")
         except Exception as e:
             print(f"Error logging trailing update: {e}")
+
+    # ============== Вспомогательное ==============
+
+    def _tick_size(self) -> float:
+        """Единый источник тик-сайза: config → state → дефолт."""
+        tick = getattr(self.config, "tick_size", None)
+        if tick and tick > 0:
+            return float(tick)
+        tick = getattr(self.state, "tick_size", None)
+        if tick and tick > 0:
+            return float(tick)
+        return 0.01
