@@ -16,7 +16,7 @@ from config import Config
 from state_manager import StateManager
 from database import Database
 
-# стратегия (с последними патчами)
+# стратегия
 from kwin_strategy import KWINStrategy
 
 # Bybit API: пробуем несколько вариантов клиента
@@ -48,7 +48,6 @@ def _ensure_ms(ts):
         return int(ts if ts > 1e11 else ts * 1000)
     if isinstance(ts, str):
         try:
-            # ISO / pandas parse
             dt = pd.to_datetime(ts, utc=True)
             return int(dt.value // 10**6)
         except Exception:
@@ -70,10 +69,9 @@ def _normalize_klines(raw: List[Dict]) -> List[Dict]:
             "high":  float(k.get("high",  k.get("h", 0.0))),
             "low":   float(k.get("low",   k.get("l", 0.0))),
             "close": float(k.get("close", k.get("c", 0.0))),
-            "volume": float(k.get("volume", k.get("v", 0.0)))
+            "volume": float(k.get("volume", k.get("v", 0.0))),
         })
-    # от старых к новым для «прохода вперёд»
-    out.sort(key=lambda x: x["timestamp"])
+    out.sort(key=lambda x: x["timestamp"])  # от старых к новым
     return out
 
 
@@ -82,7 +80,7 @@ def _normalize_klines(raw: List[Dict]) -> List[Dict]:
 @st.cache_data(show_spinner=False)
 def load_klines_bybit_window(_api, symbol: str, interval: str, days: int) -> List[Dict]:
     """
-    Загружает ровно последние N дней (UTC): [now - N, now] с Bybit.
+    Загружает строго последние N дней (UTC): [now - N, now] с Bybit.
     ВАЖНО: параметр _api начинается с подчёркивания, чтобы Streamlit
     не пытался его хэшировать в cache_data.
     """
@@ -90,8 +88,7 @@ def load_klines_bybit_window(_api, symbol: str, interval: str, days: int) -> Lis
         return []
 
     start_ms, end_ms = _window_ms(days)
-
-    # Для 15m: ~96 баров в день. Берём небольшой запас и потом фильтруем окном.
+    # 15m ≈ 96 баров/день. Берём запас и режем по окну.
     need = int(days * 96 * 1.2) + 50
 
     try:
@@ -113,9 +110,7 @@ def load_klines_from_csv(file_bytes: bytes, tz_aware: bool = True) -> List[Dict]
     if not file_bytes:
         return []
     df = pd.read_csv(io.BytesIO(file_bytes))
-    # нормализуем timestamp -> ms
     if "timestamp" not in df.columns:
-        # иногда ts поле называется 'time'/'t'
         for cand in ("time", "t", "open_time"):
             if cand in df.columns:
                 df.rename(columns={cand: "timestamp"}, inplace=True)
@@ -125,17 +120,12 @@ def load_klines_from_csv(file_bytes: bytes, tz_aware: bool = True) -> List[Dict]
 
     df["timestamp"] = df["timestamp"].apply(_ensure_ms)
     df = df.dropna(subset=["timestamp"])
-    # ожидаемые ценовые поля
     for col in ("open", "high", "low", "close"):
         if col not in df.columns:
             raise ValueError(f"CSV missing required column: {col}")
 
     out = df[["timestamp", "open", "high", "low", "close"]].copy()
-    if "volume" in df.columns:
-        out["volume"] = df["volume"].astype(float)
-    else:
-        out["volume"] = 0.0
-    # сортировка по времени (asc)
+    out["volume"] = df["volume"].astype(float) if "volume" in df.columns else 0.0
     out = out.sort_values("timestamp")
     return out.to_dict(orient="records")
 
@@ -146,24 +136,22 @@ def load_klines_synthetic(symbol: str, days: int, seed: int = 42, base_price: Op
     """
     np.random.seed(seed)
     start_ms, end_ms = _window_ms(days)
-    # 15m фрейм
     freq = "15T"
     start_dt = pd.to_datetime(start_ms, unit="ms", utc=True)
     end_dt   = pd.to_datetime(end_ms, unit="ms", utc=True)
     idx = pd.date_range(start=start_dt, end=end_dt, freq=freq, inclusive="left")
     if base_price is None:
         base_price = 4500.0 if symbol.upper().startswith("ETH") else 68000.0
-    # геометр. броун. движение с малой волатильностью
+
     steps = len(idx)
     ret = np.random.randn(steps) * 0.002
     price = base_price * np.exp(np.cumsum(ret))
     out = []
     prev_close = price[0]
     for t, p in zip(idx, price):
-        # простая свеча вокруг p
         vol = abs(np.random.randn()) * 0.001
         high = p * (1 + vol)
-        low = p * (1 - vol)
+        low  = p * (1 - vol)
         o = prev_close
         c = p
         out.append({
@@ -172,7 +160,7 @@ def load_klines_synthetic(symbol: str, days: int, seed: int = 42, base_price: Op
             "high": float(high),
             "low": float(low),
             "close": float(c),
-            "volume": float(np.random.uniform(100, 10000))
+            "volume": float(np.random.uniform(100, 10000)),
         })
         prev_close = c
     return out
@@ -195,6 +183,10 @@ def _close_open_position(state: StateManager,
                          cfg: Config,
                          exit_price: float,
                          exit_time):
+    """
+    Принудительное закрытие открытой позиции (срабатывание SL/TP внутри бара).
+    Сохраняет закрытую сделку и снапшот equity в БД.
+    """
     pos = state.get_current_position()
     if not pos or pos.get("status") != "open":
         return
@@ -221,7 +213,8 @@ def _close_open_position(state: StateManager,
         "pnl":         pnl_net,
         "rr":          None,
         "entry_time":  pos.get("entry_time"),
-        "exit_time":   datetime.fromtimestamp(int(exit_time)/1000, tz=timezone.utc) if isinstance(exit_time, (int,float)) else exit_time,
+        "exit_time":   datetime.fromtimestamp(int(exit_time)/1000, tz=timezone.utc) if isinstance(exit_time, (int, float)) else exit_time,
+        "exit_reason": "TP/SL(auto)",
         "status":      "closed",
     }
     try:
@@ -268,7 +261,7 @@ def run_backtest_ohlc(period_days: int,
                       candles_override: Optional[List[Dict]] = None) -> Dict[str, pd.DataFrame]:
     """
     Если candles_override передан — используем его (строгое окно),
-    иначе загрузим по-старому.
+    иначе грузим последние N дней с Bybit.
     """
     # In-memory DB
     try:
@@ -302,7 +295,6 @@ def run_backtest_ohlc(period_days: int,
     if candles_override is not None:
         candles = candles_override
     else:
-        # прошлый вариант (приближённый)
         candles = load_klines_bybit_window(api, symbol, "15", period_days)
 
     if not candles:
@@ -331,6 +323,7 @@ def run_backtest_ohlc(period_days: int,
                     if pos["direction"] == "short" and bar_low <= tp:
                         _close_open_position(state, db, config, exit_price=tp, exit_time=cur_time)
 
+        # обработка логики стратегии на закрытии бара
         strat.on_bar_close_15m(bar)
 
     # Достаём сделки из БД
@@ -338,9 +331,9 @@ def run_backtest_ohlc(period_days: int,
         trades = db.get_trades_by_period(period_days)
     except Exception:
         trades = db.get_recent_trades(10_000)
-
     trades_df = pd.DataFrame(trades) if trades else pd.DataFrame()
 
+    # Эквити из снапшотов; если нет — восстановим из сделок
     capital = float(initial_capital)
     eq_times, eq_values = [], []
 
@@ -429,9 +422,6 @@ def run_backtest_ohlc(period_days: int,
         "profit_factor": profit_factor,
         "avg_trade_pnl": round(avg_trade_pnl, 2),
     }
-    # привели equity_df к ожидаемому виду
-    if not equity_df.empty and "time" in equity_df.columns:
-        equity_df = equity_df.rename(columns={"time": "time"})
     return {"trades": trades_df, "equity": equity_df, "stats": stats}
 
 
@@ -536,8 +526,7 @@ def main():
             st.info("Загрузите CSV, чтобы запустить бэктест.")
         else:
             candles_for_run = load_klines_from_csv(csv_file)
-            # отрежем окно последних N дней (якорно от «сейчас»)
-            start_ms, end_ms = _window_ms(period_days)
+            start_ms, end_ms = _window_ms(period_days)  # якорь от "сейчас"
             candles_for_run = [b for b in candles_for_run if start_ms <= b["timestamp"] <= end_ms]
     else:  # Synthetic
         candles_for_run = load_klines_synthetic(symbol, period_days, seed=syn_seed)
@@ -581,7 +570,6 @@ def main():
         st.subheader("Equity Curve")
         if not equity_df.empty:
             fig, ax = plt.subplots()
-            # совместимость: поле может называться time
             x = equity_df["time"] if "time" in equity_df.columns else equity_df.iloc[:, 0]
             ax.plot(pd.to_datetime(x), equity_df["equity"])
             ax.set_xlabel("Time")
