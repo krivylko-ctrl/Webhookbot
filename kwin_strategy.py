@@ -278,7 +278,7 @@ class KWINStrategy:
             pivot = self.candles_15m[i]    # Pivot бар
             
             # Bear SFP: open/close ниже предыдущего пивота, но high пробил вверх
-         prev_pivot_high = self.candles_15m[i - 1]['high']
+            prev_pivot_high = self.candles_15m[i - 1]['high']
             
             bear_condition = (
                 current['open'] < prev_pivot_high and
