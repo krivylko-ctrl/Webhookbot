@@ -68,7 +68,7 @@ def _normalize_klines(raw: List[Dict]) -> List[Dict]:
     out.sort(key=lambda x: x["timestamp"])  # от старых к новым
     return out
 
-@st.cache_data(show_spinner=False)
+#@st.cache_data(show_spinner=False)
 def load_klines_bybit_window(symbol: str, days: int) -> List[Dict]:
     _api = BybitAPI(api_key=os.getenv("BYBIT_API_KEY"),
                     api_secret=os.getenv("BYBIT_API_SECRET"))
