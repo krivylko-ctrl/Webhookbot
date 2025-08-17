@@ -115,9 +115,9 @@ def main():
 
         st.markdown("### 🧠 Smart Trailing")
         st.write(f"Включен: {'✅' if config.enable_smart_trail else '❌'}")
-        st.write(f"Процент трейла: {getattr(config, 'trailing_perc', 0.5)}%")
-        st.write(f"Offset трейла: {getattr(config, 'trailing_offset_perc', 0.4)}%")
-        st.write(f"Баровый lookback: {getattr(config, 'trail_lookback', 50)}")
+        st.write(f"Percent trailing: {getattr(config, 'trailing_perc', 0.5)}%")
+        st.write(f"Offset trailing: {getattr(config, 'trailing_offset_perc', 0.4)}%")
+        st.write(f"Bar lookback: {getattr(config, 'trail_lookback', 50)}")
         st.write(f"Buffer (ticks): {getattr(config, 'trail_buf_ticks', 0)}")
         st.write(f"ARM RR: {getattr(config, 'arm_rr', 0.5)} | after RR: {'✅' if getattr(config, 'use_arm_after_rr', True) else '❌'}")
 
@@ -170,7 +170,7 @@ def show_dashboard(db: Database, state_manager: StateManager, strategy: KWINStra
     with c3:
         st.metric("⏱️ Avg Hold Time", f"{float(stats.get('avg_hold_time', 0) or 0):.1f}h")
 
-def show_chart(bybit_api: BybitAPI, db: Database, strategy: KWINStrategy):
+def show_chart(bybit_api, db: Database, strategy: KWINStrategy):
     symbol = getattr(strategy, "symbol", "ETHUSDT")
     st.markdown(f"### 📈 График {symbol} (15m)")
 
@@ -188,7 +188,6 @@ def show_chart(bybit_api: BybitAPI, db: Database, strategy: KWINStrategy):
         elif "t" in df.columns:
             df["timestamp"] = pd.to_datetime(df["t"], unit="ms", utc=True).dt.tz_convert(None)
         else:
-            # запасной вариант — ничего не рисуем
             st.warning("Нет поля timestamp в данных свечей")
             return
 
@@ -209,26 +208,33 @@ def show_chart(bybit_api: BybitAPI, db: Database, strategy: KWINStrategy):
             exits_x, exits_y, exits_color, exits_symbol, exits_text = [], [], [], [], []
 
             for tr in trades:
-                # entry
-                if tr.get("entry_time") and tr.get("entry_price"):
-                    et = pd.to_datetime(tr["entry_time"])
-                    entries_x.append(et)
-                    entries_y.append(float(tr["entry_price"]))
-                    entries_color.append("green" if tr["direction"] == "long" else "red")
-                    entries_symbol.append("triangle-up" if tr["direction"] == "long" else "triangle-down")
-                    entries_text.append(f"Entry {tr['direction']}<br>qty={tr.get('quantity', 0):.4f}")
+                # Entry
+                if tr.get("entry_time") and tr.get("entry_price") is not None:
+                    et = pd.to_datetime(tr["entry_time"], errors="coerce")
+                    if pd.notna(et):
+                        entries_x.append(et)
+                        entries_y.append(float(tr["entry_price"]))
+                        entries_color.append("green" if tr.get("direction") == "long" else "red")
+                        entries_symbol.append("triangle-up" if tr.get("direction") == "long" else "triangle-down")
+                        qty = tr.get("quantity") or 0.0
+                        entries_text.append(f"Entry {tr.get('direction', '-')}"
+                                            f"<br>qty={float(qty):.4f}")
 
-                # exit
-                if tr.get("exit_time") and tr.get("exit_price"):
-                    xt = pd.to_datetime(tr["exit_time"])
-                    exits_x.append(xt)
-                    exits_y.append(float(tr["exit_price"]))
-                    c = "green" if (tr.get("pnl") or 0) >= 0 else "red"
-                    exits_color.append(c)
-                    exits_symbol.append("x")
-                    rr = tr.get("rr")
-                    pnl = tr.get("pnl")
-                    exits_text.append(f"Exit ({tr.get('exit_reason','-')})<br>PNL={pnl:.2f} | RR={rr:.2f}")
+                # Exit
+                if tr.get("exit_time") and tr.get("exit_price") is not None:
+                    xt = pd.to_datetime(tr["exit_time"], errors="coerce")
+                    if pd.notna(xt):
+                        exits_x.append(xt)
+                        exits_y.append(float(tr["exit_price"]))
+                        pnl = tr.get("pnl")
+                        rr = tr.get("rr")
+                        c = "green" if (pnl or 0) >= 0 else "red"
+                        exits_color.append(c)
+                        exits_symbol.append("x")
+                        pnl_s = f"{float(pnl):.2f}" if pnl is not None else "—"
+                        rr_s = f"{float(rr):.2f}" if rr is not None else "—"
+                        exits_text.append(f"Exit ({tr.get('exit_reason','-')})"
+                                          f"<br>PNL={pnl_s} | RR={rr_s}")
 
             if entries_x:
                 fig.add_trace(go.Scatter(
