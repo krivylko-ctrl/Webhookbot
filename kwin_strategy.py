@@ -230,7 +230,7 @@ class KWINStrategy:
             pivot = self.candles_15m[i]    # Pivot бар
             
             # Bull SFP: open/close выше предыдущего пивота, но low пробил вниз
-        prev_pivot_low = self.candles_15m[i - 1]['low']
+            prev_pivot_low = self.candles_15m[i - 1]['low']
             
             bull_condition = (
                 current['open'] > prev_pivot_low and
