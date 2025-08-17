@@ -118,57 +118,52 @@ class Database:
 
             conn.commit()
 
-    # ===================== Trades =====================
+# ===================== Trades =====================
 
-    def save_trade(self, trade_data: Dict) -> int:
-        """Сохранение новой сделки. Возвращает id."""
-        with self._connect() as conn:
-            c = conn.cursor()
-            c.execute(
-                """
-                INSERT INTO trades (
-                    symbol, direction, entry_price, stop_loss, take_profit,
-                    quantity, entry_time, status
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    trade_data.get("symbol"),
-                    trade_data.get("direction"),
-                    float(trade_data.get("entry_price")),
-                    None if trade_data.get("stop_loss") is None else float(trade_data.get("stop_loss")),
-                    None if trade_data.get("take_profit") is None else float(trade_data.get("take_profit")),
-                    float(trade_data.get("quantity")),
-                    _to_iso(trade_data.get("entry_time") or datetime.utcnow()),
-                    trade_data.get("status", "open"),
-                ),
-            )
-            trade_id = c.lastrowid or 0
-            conn.commit()
-            return int(trade_id)
+def save_trade(self, trade_data: Dict) -> int:
+    """Сохранение сделки (умеет как 'open', так и сразу 'closed'). Возвращает id."""
+    with self._connect() as conn:
+        c = conn.cursor()
+        c.execute(
+            """
+            INSERT INTO trades (
+                symbol, direction, entry_price, exit_price, stop_loss, take_profit,
+                quantity, pnl, rr, entry_time, exit_time, exit_reason, status
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                trade_data.get("symbol"),
+                trade_data.get("direction"),
+                float(trade_data.get("entry_price")),
+                None if trade_data.get("exit_price") is None else float(trade_data.get("exit_price")),
+                None if trade_data.get("stop_loss") is None else float(trade_data.get("stop_loss")),
+                None if trade_data.get("take_profit") is None else float(trade_data.get("take_profit")),
+                float(trade_data.get("quantity")),
+                None if trade_data.get("pnl") is None else float(trade_data.get("pnl")),
+                None if trade_data.get("rr") is None else float(trade_data.get("rr")),
+                _to_iso(trade_data.get("entry_time") or datetime.utcnow()),
+                _to_iso(trade_data.get("exit_time")),
+                trade_data.get("exit_reason"),
+                trade_data.get("status", "open"),
+            ),
+        )
+        trade_id = c.lastrowid or 0
+        conn.commit()
+        return int(trade_id)
 
-    def add_trade(self, trade_data: Dict) -> int:
-        """
-        Backward-compat alias.
-        Старый код мог вызывать db.add_trade(...).
-        Проксируем в save_trade(...).
-        """
-        return self.save_trade(trade_data)
+def add_trade(self, trade_data: Dict) -> int:
+    """
+    Backward-compat alias (старый код мог вызывать db.add_trade(...)).
+    """
+    return self.save_trade(trade_data)
 
-    def update_trade_exit(self, trade_data: Dict, fee_rate: float = 0.00055):
-        """Обновление выхода: считает PnL/RR и закрывает последнюю открытую сделку (или по id)."""
-        with self._connect() as conn:
-            c = conn.cursor()
-
-            trade_id = trade_data.get("trade_id")
-            if trade_id:
-                c.execute("SELECT * FROM trades WHERE id = ? AND status = 'open'", (trade_id,))
-            else:
-                c.execute("SELECT * FROM trades WHERE status = 'open' ORDER BY entry_time DESC LIMIT 1")
-
-            row = c.fetchone()
-            if not row:
-                print("No open trade found to update")
-                return
+def get_all_trades(self) -> List[Dict]:
+    """Все сделки (по умолчанию по времени входа, от старых к новым)."""
+    with self._connect() as conn:
+        c = conn.cursor()
+        c.execute("SELECT * FROM trades ORDER BY entry_time ASC")
+        cols = [d[0] for d in c.description]
+        return [dict(zip(cols, r)) for r in c.fetchall()]
 
             cols = [d[0] for d in c.description]
             tr = dict(zip(cols, row))
