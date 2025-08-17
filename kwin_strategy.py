@@ -49,22 +49,17 @@ class KWINStrategy:
         elif self.config.close_back_pct < 0.0:
             self.config.close_back_pct = 0.0
 
-        # === Drawdown / Risk Halt ===
-        self.peak_equity: Optional[float] = None
-        self.halted: bool = False  # при True — не входим
-        # defaults при отсутствии в Config
-        self.max_dd_pct = float(getattr(self.config, "max_dd_pct", 0.0))      # 0 — выключено
-        self.max_dd_usd = float(getattr(self.config, "max_dd_usd", 0.0))      # 0 — выключено
-        self.halt_on_dd = bool(getattr(self.config, "halt_on_dd", True))
-        self.flat_on_halt = bool(getattr(self.config, "flat_on_halt", False))
-
         # Версионирование
-        self.strategy_version = "2.3.0-A(Pine-like+DD)"
+        self.strategy_version = "2.2.0-A(Pine-like)"
 
     # ==================== Pine-like helpers ====================
 
     @staticmethod
     def _ta_pivotlow(series_newest_first: List[float], left: int, right: int) -> bool:
+        """
+        Эмуляция ta.pivotlow(left,right) на баре [1] для массивов newest-first.
+        Для right=1 сравниваем бар[1] с баром[0] (право) и с left барами слева: [2..2+left-1].
+        """
         if len(series_newest_first) < left + right + 2:
             return False
         x = series_newest_first
@@ -76,6 +71,7 @@ class KWINStrategy:
 
     @staticmethod
     def _ta_pivothigh(series_newest_first: List[float], left: int, right: int) -> bool:
+        """Эмуляция ta.pivothigh(left,right) на баре [1] (newest-first)."""
         if len(series_newest_first) < left + right + 2:
             return False
         x = series_newest_first
@@ -86,6 +82,11 @@ class KWINStrategy:
         return right_ok and left_ok
 
     def _series(self, field: str, tf: str) -> List[float]:
+        """
+        Pine-like series accessor: request.security(syminfo.tickerid, tf, <field>)
+        Возвращает массив newest-first.
+        tf: "1" | "15" | "60"
+        """
         if tf in ("15", "15m"):
             src = self.candles_15m
         elif tf in ("60", "60m", "1h"):
@@ -97,6 +98,7 @@ class KWINStrategy:
         return [float(b[field]) for b in src if field in b]
 
     def _normalize_klines(self, raw):
+        """Приводим свечи к единому виду; newest-first."""
         if not raw:
             return []
         out = []
@@ -199,45 +201,6 @@ class KWINStrategy:
         except Exception as e:
             print(f"Error updating candles: {e}")
 
-    # -------------------- DD/risk контроль --------------------
-
-    def _refresh_equity_and_dd(self):
-        """Обновляем equity, ведём peak и проверяем DD-лимиты."""
-        self._update_equity()
-        eq = float(self.state.get_equity() or 0.0)
-        if eq <= 0:
-            return
-        if self.peak_equity is None:
-            self.peak_equity = eq
-        else:
-            self.peak_equity = max(self.peak_equity, eq)
-
-        # абсолютный и процентный DD от пика
-        dd_usd = self.peak_equity - eq
-        dd_pct = (dd_usd / self.peak_equity) * 100.0 if self.peak_equity > 0 else 0.0
-
-        dd_hit_pct = (self.max_dd_pct > 0) and (dd_pct >= self.max_dd_pct)
-        dd_hit_usd = (self.max_dd_usd > 0) and (dd_usd >= self.max_dd_usd)
-        if self.halt_on_dd and (dd_hit_pct or dd_hit_usd):
-            if not self.halted:
-                print(f"[HALT] Max DD hit: dd_pct={dd_pct:.2f}% dd_usd={dd_usd:.2f} "
-                      f"(limits pct={self.max_dd_pct}, usd={self.max_dd_usd})")
-            self.halted = True
-            if self.flat_on_halt:
-                pos = self.state.get_current_position()
-                if pos and pos.get("status") == "open" and self.api:
-                    # закрываем по рынку
-                    side = "sell" if pos.get("direction") == "long" else "buy"
-                    qty = float(pos.get("size") or 0.0)
-                    if qty > 0:
-                        try:
-                            self.api.place_order(symbol=self.symbol, side=side, order_type="market", qty=qty)
-                            pos["status"] = "closed"
-                            self.state.set_position(pos)
-                            print("[HALT] Position force-closed due to DD limit.")
-                        except Exception as e:
-                            print(f"Error force closing on HALT: {e}")
-
     # -------------------- Основной цикл --------------------
 
     def run_cycle(self):
@@ -245,16 +208,12 @@ class KWINStrategy:
             if not self.candles_15m:
                 return
 
-            # обновляем equity и проверяем DD-лимиты на каждом цикле
-            self._refresh_equity_and_dd()
-
             position = self.state.get_current_position()
             if position and position.get("status") == "open":
+                # 1) сначала обновляем трейл на закрывшемся баре
                 self._update_smart_trailing(position)
-                return
-
-            # если стратегия остановлена из-за DD — не открываем новые сделки
-            if self.halted:
+                # 2) затем проверяем срабатывание SL (или трейл-SL) на этом баре
+                self._check_and_close_position(position)
                 return
 
             self.on_bar_close()
@@ -286,15 +245,20 @@ class KWINStrategy:
         lows15 = self._series("low", "15")
         if len(lows15) < sfpLen + 2:
             return False
+
+        # pivotlow(sfpLen,1) на баре [1]
         if not self._ta_pivotlow(lows15, sfpLen, 1):
             return False
+
         prev_ref_low = lows15[sfpLen]
         cur_open = self.candles_15m[0]["open"]
         cur_close = self.candles_15m[0]["close"]
         cur_low = self.candles_15m[0]["low"]
+
         cond = (cur_low < prev_ref_low) and (cur_open > prev_ref_low) and (cur_close > prev_ref_low)
         if not cond:
             return False
+
         if getattr(self.config, "use_sfp_quality", True):
             return self._check_bull_sfp_quality_new(self.candles_15m[0], prev_ref_low)
         return True
@@ -304,15 +268,20 @@ class KWINStrategy:
         highs15 = self._series("high", "15")
         if len(highs15) < sfpLen + 2:
             return False
+
+        # pivothigh(sfpLen,1) на баре [1]
         if not self._ta_pivothigh(highs15, sfpLen, 1):
             return False
+
         prev_ref_high = highs15[sfpLen]
         cur_open = self.candles_15m[0]["open"]
         cur_close = self.candles_15m[0]["close"]
         cur_high = self.candles_15m[0]["high"]
+
         cond = (cur_high > prev_ref_high) and (cur_open < prev_ref_high) and (cur_close < prev_ref_high)
         if not cond:
             return False
+
         if getattr(self.config, "use_sfp_quality", True):
             return self._check_bear_sfp_quality_new(self.candles_15m[0], prev_ref_high)
         return True
@@ -339,16 +308,17 @@ class KWINStrategy:
 
     def _process_long_entry(self):
         try:
-            if self.entered_this_bar or self.halted:
+            if self.entered_this_bar:
                 return
 
             entry_price = self._get_current_price()
             if entry_price is None or len(self.candles_15m) < 2:
                 return
 
-            prev = self.candles_15m[1]
-            stop_loss = float(prev["low"])
+            prev = self.candles_15m[1]              # предыдущая 15m свеча
+            stop_loss = float(prev["low"])          # SL за LOW предыдущей (Pine)
 
+            # Гварды — опционально (по умолчанию выключены, как в Pine)
             if bool(getattr(self.config, "use_stop_guards", False)):
                 max_stop_pct = float(getattr(self.config, "max_stop_pct", 0.08))
                 stop_size = entry_price - stop_loss
@@ -393,8 +363,11 @@ class KWINStrategy:
                     "entry_time": entry_dt,
                     "status": "open",
                 }
-                self.db.save_trade(trade)
+                trade_id = self.db.save_trade(trade)  # фиксируем в БД и сохраняем id
+
+                # сохраняем экстремум со входа для percent+offset трейла
                 self.state.set_position({
+                    "trade_id": trade_id,
                     "symbol": self.symbol,
                     "direction": "long",
                     "size": quantity,
@@ -402,10 +375,11 @@ class KWINStrategy:
                     "stop_loss": stop_loss,
                     "take_profit": take_profit,
                     "armed": (not getattr(self.config, "use_arm_after_rr", True)),
-                    "peak": entry_price,
+                    "peak": entry_price,   # максимум со входа
                     "trough": None,
                     "status": "open",
                 })
+                # анти-спам на баре
                 self.can_enter_long = False
                 self.can_enter_short = False
                 self.entered_this_bar = True
@@ -416,7 +390,7 @@ class KWINStrategy:
 
     def _process_short_entry(self):
         try:
-            if self.entered_this_bar or self.halted:
+            if self.entered_this_bar:
                 return
 
             entry_price = self._get_current_price()
@@ -424,7 +398,7 @@ class KWINStrategy:
                 return
 
             prev = self.candles_15m[1]
-            stop_loss = float(prev["high"])
+            stop_loss = float(prev["high"])         # SL за HIGH предыдущей (Pine)
 
             if bool(getattr(self.config, "use_stop_guards", False)):
                 max_stop_pct = float(getattr(self.config, "max_stop_pct", 0.08))
@@ -470,8 +444,10 @@ class KWINStrategy:
                     "entry_time": entry_dt,
                     "status": "open",
                 }
-                self.db.save_trade(trade)
+                trade_id = self.db.save_trade(trade)
+
                 self.state.set_position({
+                    "trade_id": trade_id,
                     "symbol": self.symbol,
                     "direction": "short",
                     "size": quantity,
@@ -480,9 +456,10 @@ class KWINStrategy:
                     "take_profit": take_profit,
                     "armed": (not getattr(self.config, "use_arm_after_rr", True)),
                     "peak": None,
-                    "trough": entry_price,
+                    "trough": entry_price,  # минимум со входа
                     "status": "open",
                 })
+                # анти-спам на баре
                 self.can_enter_short = False
                 self.can_enter_long = False
                 self.entered_this_bar = True
@@ -494,6 +471,10 @@ class KWINStrategy:
     # -------------------- Подсистемы --------------------
 
     def _get_current_price(self) -> Optional[float]:
+        """
+        В бэктесте используем close последнего закрытого 15m-бара,
+        в онлайне — last_price с биржи.
+        """
         try:
             if self._bt_last_bar:
                 return float(self._bt_last_bar["close"])
@@ -515,7 +496,7 @@ class KWINStrategy:
             if stop_size <= 0:
                 return None
 
-            qty = risk_amount / stop_size
+            qty = risk_amount / stop_size                 # qty в ETH (как в Pine)
             qty = qty_round(qty, self.qty_step)
 
             if getattr(self.config, "limit_qty_enabled", True):
@@ -534,6 +515,7 @@ class KWINStrategy:
             if quantity < float(getattr(self.config, "min_order_qty", self.min_order_qty)):
                 return False
 
+            # В Pine нет проверки «минимум 5 тиков». Оставим её опциональной.
             if bool(getattr(self.config, "use_stop_guards", False)):
                 stop_size = abs(entry_price - stop_loss)
                 min_stop_size = float(self.tick_size) * 5.0
@@ -551,6 +533,7 @@ class KWINStrategy:
             return False
 
     def _is_in_backtest_window_utc(self, current_timestamp_ms: int) -> bool:
+        """Совпадение с Pine: от полуночи UTC минус N дней."""
         utc_now = datetime.utcnow().replace(tzinfo=timezone.utc)
         utc_midnight = utc_now.replace(hour=0, minute=0, second=0, microsecond=0)
         start_dt = utc_midnight - timedelta(days=int(getattr(self.config, "days_back", 60)))
@@ -574,7 +557,7 @@ class KWINStrategy:
             if current_price is None:
                 return
 
-            # === 1) Экстремумы со входа (для percent+offset трейла) — всегда ===
+            # === 1) Обновляем экстремумы со входа (для percent+offset трейла) — всегда ===
             if direction == "long":
                 peak = float(position.get("peak") or entry_price)
                 if self.candles_15m:
@@ -587,10 +570,12 @@ class KWINStrategy:
                 position["trough"] = trough
             self.state.set_position(position)
 
-            # === 2) ПРОЦЕНТНЫЙ ТРЕЙЛ (с offset) — до ARM, как в Pine ===
+            # === 2) ПРОЦЕНТНЫЙ ТРЕЙЛ (с offset) — ПРИМЕНЯЕМ ДО ARM, как в Pine ===
             percent_sl = self._calculate_percentage_trailing_stop(
                 direction, current_price, current_sl, position
             )
+
+            # Улучшаем SL процентным кандидатом
             new_sl_after_percent = current_sl
             if percent_sl is not None:
                 if direction == "long":
@@ -614,9 +599,10 @@ class KWINStrategy:
                     position["armed"] = True
                     self.state.set_position(position)
 
+            # Базовый кандидат после шага 2
             candidate_sl = new_sl_after_percent
 
-            # === 4) БАРОВЫЙ — после ARM; берём «жёстче» ===
+            # === 4) БАРОВЫЙ ТРЕЙЛ — ТОЛЬКО ПОСЛЕ ARM; переопределяет, если «жёстче» ===
             if armed and getattr(self.config, "use_bar_trail", True):
                 bar_sl = self._calculate_bar_trailing_stop(direction, current_sl=candidate_sl)
                 if bar_sl is not None:
@@ -625,7 +611,7 @@ class KWINStrategy:
                     else:
                         candidate_sl = min(candidate_sl, bar_sl)
 
-            # === 5) Применяем, если улучшили ===
+            # === 5) Применяем, только если улучшили ===
             if (direction == "long" and candidate_sl > current_sl) or (direction == "short" and candidate_sl < current_sl):
                 self._update_stop_loss(position, price_round(candidate_sl, self.tick_size))
 
@@ -650,14 +636,14 @@ class KWINStrategy:
                 return min(lb_high + buf, current_sl)
         except Exception as e:
             print(f"Error calculating bar trailing stop: {e}")
-        return current_sl
+            return current_sl
 
     def _calculate_percentage_trailing_stop(self, direction: str, current_price: float, current_sl: float, position: Dict) -> Optional[float]:
         """Эмуляция strategy.exit(..., trail_points=entry*perc, trail_offset=entry*offset) с учётом пика/дна."""
         try:
             entry_price = float(position.get("entry_price", 0) or 0)
             trail_pct  = float(getattr(self.config, "trailing_perc", 0.5)) / 100.0
-            offset_pct = float(getattr(self.config, "trailing_offset_perc", 0.4)) / 100.0
+            offset_pct = float(getattr(self.config, "trailing_offset_perc", 0.4)) / 100.0  # новое поле в Config
             if trail_pct <= 0 or entry_price <= 0:
                 return current_sl
 
@@ -690,6 +676,66 @@ class KWINStrategy:
                 print(f"[TRAIL] SL → {new_sl}")
         except Exception as e:
             print(f"Error updating stop loss: {e}")
+
+    def _check_and_close_position(self, position: Dict):
+        """
+        Баровое определение выхода: если текущий закрытый бар пробил SL (включая трейл-SL),
+        то фиксируем выход и заносим в БД. (TP не используем — в Pine выход по трейлу)
+        """
+        try:
+            if not self.candles_15m:
+                return
+
+            last_bar = self.candles_15m[0]
+            bar_high = float(last_bar["high"])
+            bar_low  = float(last_bar["low"])
+            exit_time = datetime.fromtimestamp(last_bar["timestamp"] / 1000, tz=timezone.utc)
+
+            direction = position.get("direction")
+            sl = float(position.get("stop_loss") or 0)
+            if sl <= 0:
+                return
+
+            # Проверяем касание SL/трейл-SL на закрывшемся баре
+            hit = False
+            if direction == "long":
+                if bar_low <= sl:
+                    hit = True
+            elif direction == "short":
+                if bar_high >= sl:
+                    hit = True
+
+            if not hit:
+                return
+
+            # Фиксируем выход по цене SL
+            exit_price = sl
+            reason = "stop_loss"  # (в т.ч. трейл-SL)
+
+            fee_rate = float(getattr(self.config, "taker_fee_rate", 0.00055))
+
+            self.db.update_trade_exit({
+                "symbol": self.symbol,
+                "direction": direction,
+                "exit_price": exit_price,
+                "exit_time": exit_time,
+                "exit_reason": reason,
+                "status": "closed"
+            }, fee_rate=fee_rate)
+
+            # Обновляем состояние
+            position["status"] = "closed"
+            position["close_price"] = exit_price
+            position["close_time"] = exit_time
+            self.state.set_position(position)
+
+            # Снапшот equity (если в онлайне — подтянется с биржи)
+            self._update_equity()
+
+            print(f"[{self.symbol}] EXIT {direction} @ {exit_price:.2f} by {reason}")
+
+        except Exception as e:
+            print(f"Error in _check_and_close_position: {e}")
 
     # -------------------- Equity (Bybit: UNIFIED / CONTRACT) --------------------
 
