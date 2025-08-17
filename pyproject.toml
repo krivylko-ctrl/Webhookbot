@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "kwin-bot"
+version = "0.1.0"
+description = "Kwin SFP Strategy Autotrader (Bybit v5) with Streamlit UI"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "streamlit==1.27.2",
+  "flask==2.3.3",
+  "gunicorn==21.2.0",
+  "requests==2.31.0",
+  "websocket-client==1.6.1",
+  "python-dateutil==2.8.2",
+  "pandas==2.0.3",
+  "numpy==1.24.4",
+  "SQLAlchemy==2.0.19",
+  "python-dotenv==1.0.0",
+  "plotly==5.17.0",
+  "websocket>=0.2.1",
+  "websockets>=15.0.1",
+]
+
+[tool.setuptools]
+packages = []
