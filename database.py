@@ -29,6 +29,7 @@ class Database:
                     quantity REAL NOT NULL,
                     pnl REAL,
                     rr REAL,
+                    initial_risk REAL,
                     entry_time TIMESTAMP NOT NULL,
                     exit_time TIMESTAMP,
                     exit_reason TEXT,
@@ -78,54 +79,86 @@ class Database:
             conn.commit()
     
     def save_trade(self, trade_data: Dict) -> int:
-        """Сохранение новой сделки"""
+        """Сохранение новой сделки с фиксацией риска"""
         with sqlite3.connect(self.db_path) as conn:
             cursor = conn.cursor()
+
+            entry_price = trade_data.get('entry_price')
+            stop_loss = trade_data.get('stop_loss')
+            quantity = trade_data.get('quantity')
+            
+            # Расчет initial risk ($)
+            if entry_price and stop_loss and quantity:
+                initial_risk = abs(entry_price - stop_loss) * quantity
+            else:
+                initial_risk = None
             
             cursor.execute('''
                 INSERT INTO trades (
                     symbol, direction, entry_price, stop_loss, take_profit,
-                    quantity, entry_time, status
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    quantity, entry_time, status, initial_risk
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             ''', (
                 trade_data.get('symbol'),
                 trade_data.get('direction'),
-                trade_data.get('entry_price'),
-                trade_data.get('stop_loss'),
+                entry_price,
+                stop_loss,
                 trade_data.get('take_profit'),
-                trade_data.get('quantity'),
+                quantity,
                 trade_data.get('entry_time'),
-                trade_data.get('status', 'open')
+                trade_data.get('status', 'open'),
+                initial_risk
             ))
             
             trade_id = cursor.lastrowid
             conn.commit()
             return trade_id
     
-    def update_trade_exit(self, trade_data: Dict):
-        """Обновление данных выхода из сделки"""
+    def update_trade_exit(self, trade_data: Dict, fee_rate: float = 0.0006):
+        """Обновление данных выхода из сделки + расчет PnL и RR"""
         with sqlite3.connect(self.db_path) as conn:
             cursor = conn.cursor()
-            
-            # Находим последнюю открытую сделку
+
+            # Получаем последнюю открытую сделку
             cursor.execute('''
-                UPDATE trades 
-                SET exit_price = ?, exit_time = ?, exit_reason = ?, 
-                    pnl = ?, rr = ?, status = ?
+                SELECT id, entry_price, stop_loss, quantity, direction 
+                FROM trades
                 WHERE status = 'open' AND symbol = ? AND direction = ?
                 ORDER BY entry_time DESC
                 LIMIT 1
+            ''', (trade_data.get('symbol'), trade_data.get('direction')))
+            
+            row = cursor.fetchone()
+            if not row:
+                return  # сделки нет
+
+            trade_id, entry_price, stop_loss, quantity, direction = row
+            exit_price = trade_data.get('exit_price')
+
+            # === Расчет PnL ===
+            raw_pnl = (exit_price - entry_price) * quantity * (1 if direction == "long" else -1)
+            fees = (entry_price * quantity * fee_rate) + (exit_price * quantity * fee_rate)
+            pnl = raw_pnl - fees
+
+            # === Расчет RR ===
+            risk = abs(entry_price - stop_loss) * quantity
+            rr = pnl / risk if risk and risk > 0 else None
+
+            # === Обновляем запись ===
+            cursor.execute('''
+                UPDATE trades 
+                SET exit_price = ?, exit_time = ?, exit_reason = ?, 
+                    pnl = ?, rr = ?, status = 'closed'
+                WHERE id = ?
             ''', (
-                trade_data.get('exit_price'),
+                exit_price,
                 trade_data.get('exit_time'),
                 trade_data.get('exit_reason'),
-                trade_data.get('pnl'),
-                trade_data.get('rr'),
-                trade_data.get('status', 'closed'),
-                trade_data.get('symbol'),
-                trade_data.get('direction')
+                pnl,
+                rr,
+                trade_id
             ))
-            
+
             conn.commit()
     
     def get_recent_trades(self, limit: int = 50) -> List[Dict]:
@@ -343,7 +376,7 @@ class Database:
             # Удаляем старые логи
             cursor.execute('DELETE FROM logs WHERE timestamp < ?', (cutoff_date,))
             
-            # Удаляем старую историю equity (оставляем только closed сделки)
+            # Удаляем старую историю equity
             cursor.execute('DELETE FROM equity_history WHERE timestamp < ?', (cutoff_date,))
             
             conn.commit()
