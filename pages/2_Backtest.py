@@ -338,14 +338,14 @@ def display_backtest_results(results, data_source_label: str):
     initial_equity = results["initial_equity"]
 
     # --- НОРМАЛИЗАЦИЯ ВРЕМЕНИ ДЛЯ ГРАФИКОВ/МЕТРИК ---
-if not equity_df.empty and "timestamp" in equity_df.columns:
+    if not equity_df.empty and "timestamp" in equity_df.columns:
     equity_df["timestamp"] = (
         pd.to_datetime(equity_df["timestamp"], utc=True, errors="coerce")
           .dt.tz_localize(None)
     )
     equity_df = equity_df.sort_values("timestamp")
 
-if not trades_df.empty:
+    if not trades_df.empty:
     for col in ("entry_time", "exit_time"):
         if col in trades_df.columns:
             trades_df[col] = (
