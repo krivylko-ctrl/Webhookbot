@@ -236,9 +236,9 @@ def main():
                      strategy.min_order_qty  = 0.001
 
 # синхронизируем в config – часть проверок читает оттуда
-               config.tick_size = strategy.tick_size
-               config.qty_step = strategy.qty_step
-               config.min_order_qty = strategy.min_order_qty
+                 config.tick_size = strategy.tick_size
+                 config.qty_step = strategy.qty_step
+                 config.min_order_qty = strategy.min_order_qty
 
                 # ===== Выбор источника =====
                 if data_src.startswith("Bybit"):
