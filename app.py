@@ -31,7 +31,7 @@ try:
 except Exception as e:
     st.error(f"⛔ Настройки не заданы: {e}")
     st.info("Добавьте переменные окружения: BYBIT_API_KEY, BYBIT_API_SECRET")
-    st.stop()
+    st.stop()  # Не идём дальше — вместо «белого экрана» получишь понятное сообщение
 
 # Инициализация компонентов
 @st.cache_resource
@@ -40,60 +40,36 @@ def init_components():
     db = Database()
     state_manager = StateManager(db)
 
-    # ====== COMPAT: shims for save_bot_state / get_bot_state ======
-    # (стратегия их вызывает; в твоём Database может не быть этих методов)
-    if not hasattr(db, "save_bot_state"):
-        def _save_bot_state(state: dict):
-            try:
-                # если есть какие-то KV/мета методы — используем
-                if hasattr(db, "set_meta"):
-                    db.set_meta("bot_state", state)
-                elif hasattr(db, "save_kv"):
-                    db.save_kv("bot_state", state)
-                else:
-                    # тихий no-op, чтобы не спамить ошибками
-                    pass
-            except Exception:
-                # никакого падения — просто не сохраняем
-                pass
-        db.save_bot_state = _save_bot_state
-
-    if not hasattr(db, "get_bot_state"):
-        def _get_bot_state():
-            try:
-                if hasattr(db, "get_meta"):
-                    return db.get_meta("bot_state") or {}
-                elif hasattr(db, "get_kv"):
-                    return db.get_kv("bot_state") or {}
-            except Exception:
-                pass
-            return {}
-        db.get_bot_state = _get_bot_state
-    # =============================================================
-
-    # ====== Точечно: прокидываем настройки Smart Trailing / ARM ======
+    # ====== ТОЧЕЧНО: прокидываем трейлинг-настройки и ARM в config из cfg/env ======
+    # Безопасные дефолты, если в cfg нет полей
     config.enable_smart_trail      = bool(getattr(cfg, "ENABLE_SMART_TRAIL", True))
-    config.trailing_perc           = float(getattr(cfg, "TRAILING_PERC", 0.5))
-    config.trailing_offset_perc    = float(getattr(cfg, "TRAILING_OFFSET_PERC", 0.4))
-    config.trailing_offset         = float(getattr(cfg, "TRAILING_OFFSET_PERC", 0.4))  # совместимость
+    config.trailing_perc           = float(getattr(cfg, "TRAILING_PERC", 0.5))           # в %
+    config.trailing_offset_perc    = float(getattr(cfg, "TRAILING_OFFSET_PERC", 0.4))    # в %
+    # совместимость со старым именем (если где-то внутри стратегии используется)
+    config.trailing_offset         = float(getattr(cfg, "TRAILING_OFFSET_PERC", 0.4))
 
+    # ARM-логика (активация трейла после достижения R-множителя)
     config.use_arm_after_rr        = bool(getattr(cfg, "USE_ARM_AFTER_RR", True))
     config.arm_rr                  = float(getattr(cfg, "ARM_RR", 0.5))
 
-    # Базовые риски/символ (оставляю как есть, с безопасными дефолтами)
+    # Базовые параметры риска (на случай отсутствия явной инициализации в другом месте)
     config.risk_pct                = float(getattr(cfg, "RISK_PCT", getattr(config, "risk_pct", 3.0)))
     config.risk_reward             = float(getattr(cfg, "RISK_REWARD", getattr(config, "risk_reward", 1.3)))
+    # Символ/таймфреймы (если стратегия на них опирается из config)
     if hasattr(cfg, "SYMBOL"):
         config.symbol = cfg.SYMBOL
-    # ==================================================================
+    # ==============================================================================
 
     # Используем API ключи из конфига
     if getattr(cfg, "BYBIT_API_KEY", None) and getattr(cfg, "BYBIT_API_SECRET", None):
+        # Пробуем подключиться к Bybit
         bybit_api = BybitAPI(cfg.BYBIT_API_KEY, cfg.BYBIT_API_SECRET, testnet=False)
+
+        # Проверяем доступность API
         try:
             server_time = bybit_api.get_server_time()
             if not server_time:
-                st.warning("⚠️ Bybit API недоступен из-за гео-ограничений. Включен демо-режим.")
+                st.warning("⚠️ Bybit API недоступен из-за географических ограничений. Включен демо-режим.")
                 from demo_mode import create_demo_api
                 bybit_api = create_demo_api()
         except:
@@ -101,24 +77,30 @@ def init_components():
             from demo_mode import create_demo_api
             bybit_api = create_demo_api()
     else:
+        # Если нет API ключей, используем демо
         from demo_mode import create_demo_api
         bybit_api = create_demo_api()
         st.info("ℹ️ API ключи не настроены. Работаем в демо-режиме.")
 
     strategy = KWINStrategy(config, bybit_api, state_manager, db)
+
     return config, db, state_manager, bybit_api, strategy
 
 def main():
+
+    # Инициализация компонентов
     config, db, state_manager, bybit_api, strategy = init_components()
 
+    # Проверка подключения к API
     if bybit_api is None:
-        st.error("⚠️ API ключи Bybit не настроены. Добавьте BYBIT_API_KEY и BYBIT_API_SECRET.")
+        st.error("⚠️ API ключи Bybit не настроены. Добавьте BYBIT_API_KEY и BYBIT_API_SECRET в переменные окружения.")
         st.stop()
 
-    # Боковая панель
+    # Боковая панель с основной информацией
     with st.sidebar:
         st.header("🎛️ Управление ботом")
 
+        # Статус бота
         if 'bot_running' not in st.session_state:
             st.session_state.bot_running = False
 
@@ -128,21 +110,30 @@ def main():
                 if not st.session_state.bot_running:
                     st.session_state.bot_running = True
                     st.success("Бот запущен!")
+
         with col2:
             if st.button("⏹️ Стоп", use_container_width=True):
                 if st.session_state.bot_running:
                     st.session_state.bot_running = False
                     st.error("Бот остановлен!")
 
+        # Статус подключения
         st.markdown("### 📡 Статус подключения")
         try:
+            # Проверяем тип API (демо или реальный)
             if hasattr(bybit_api, 'current_price'):  # Демо API
                 st.warning("🎮 Демо-режим активен")
                 st.caption("⚠️ Bybit API заблокирован географически. Используются тестовые данные.")
                 if st.button("ℹ️ Подробнее о проблеме"):
                     st.info("""
-                    **Проблема:** Сервер находится в регионе, заблокированном Bybit.
-                    **Решения:** локальный запуск, VPS в разрешённом регионе, прокси/VPN.
+                    **Проблема:** Сервер Replit находится в регионе, заблокированном Bybit.
+
+                    **Решения:**
+                    1. 🏠 Запустите бота локально на своем компьютере
+                    2. 🌐 Используйте VPS в разрешенном регионе  
+                    3. 🔧 Настройте прокси/VPN для обхода блокировки
+
+                    **Текущий статус:** Демо-режим позволяет протестировать интерфейс и логику бота.
                     """)
             else:
                 server_time = bybit_api.get_server_time()
@@ -153,46 +144,61 @@ def main():
         except Exception as e:
             st.error(f"❌ Ошибка API: {e}")
 
+        # Текущие настройки
         st.markdown("### ⚙️ Текущие настройки")
         st.write(f"**Риск:** {config.risk_pct}%")
         st.write(f"**RR:** {config.risk_reward}")
         st.write(f"**Макс. позиция:** {getattr(config, 'max_qty_manual', 0)} ETH")
         st.write(f"**Трейлинг активен:** {'✅' if config.enable_smart_trail else '❌'}")
 
+        # ====== ТОЧЕЧНО: блок с трейлинг-настройками/ARM для наглядности ======
         with st.expander("🔧 Smart Trailing / ARM (текущие)"):
-            st.write(f"**Trailing % (от entry):** {config.trailing_perc}%")
+            st.write(f"**Trailing % (от цены входа):** {config.trailing_perc}%")
             st.write(f"**Trailing Offset %:** {config.trailing_offset_perc}%")
             st.write(f"**Arm after RR:** {'Да' if config.use_arm_after_rr else 'Нет'}")
             st.write(f"**ARM RR (R):** {config.arm_rr}")
+        # ======================================================================
 
+    # Основная область
     tab1, tab2, tab3, tab4 = st.tabs(["📊 Дашборд", "📈 График", "💰 Equity", "📋 Сделки"])
 
     with tab1:
         show_dashboard(db, state_manager, strategy)
+
     with tab2:
         show_chart(bybit_api, db, strategy)
+
     with tab3:
         show_equity_curve(db)
+
     with tab4:
         show_trades_table(db)
 
 def show_dashboard(db, state_manager, strategy):
+    """Показать основную информацию дашборда"""
     col1, col2, col3, col4 = st.columns(4)
+
     with col1:
         st.metric("💰 Equity", f"${state_manager.get_equity():.2f}")
+
     with col2:
         current_pos = state_manager.get_current_position()
         pos_text = f"{current_pos.get('size', 0):.4f} ETH" if current_pos else "0 ETH"
         st.metric("📍 Позиция", pos_text)
+
     with col3:
         trades_today = db.get_trades_count_today()
         st.metric("📊 Сделки сегодня", trades_today)
+
     with col4:
         pnl_today = db.get_pnl_today()
         st.metric("💵 PnL сегодня", f"${pnl_today:.2f}")
 
+    # Статистика за последние 30 дней
     st.markdown("### 📈 Статистика за 30 дней")
+
     stats = db.get_performance_stats(days=30)
+
     col1, col2, col3 = st.columns(3)
     with col1:
         st.metric("🎯 Win Rate", f"{stats.get('win_rate', 0):.1f}%")
@@ -202,13 +208,18 @@ def show_dashboard(db, state_manager, strategy):
         st.metric("⏱️ Avg Hold Time", f"{stats.get('avg_hold_time', 0):.1f}h")
 
 def show_chart(bybit_api, db, strategy):
+    """Показать график с сделками"""
     st.markdown("### 📈 График ETH/USDT")
+
+    # Получаем данные свечей
     if bybit_api:
         try:
             klines = bybit_api.get_klines("ETHUSDT", "15", 100)
             if klines:
                 df = pd.DataFrame(klines)
                 df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+
+                # Создаем график свечей
                 fig = go.Figure(data=[go.Candlestick(
                     x=df['timestamp'],
                     open=df['open'],
@@ -217,5 +228,89 @@ def show_chart(bybit_api, db, strategy):
                     close=df['close'],
                     name="ETH/USDT"
                 )])
+
+                # Добавляем сделки
                 trades = db.get_recent_trades(50)
-                for trade
+                for trade in trades:
+                    if trade['entry_time']:
+                        entry_time = pd.to_datetime(trade['entry_time'])
+                        fig.add_trace(go.Scatter(
+                            x=[entry_time],
+                            y=[trade['entry_price']],
+                            mode='markers',
+                            marker=dict(
+                                symbol='triangle-up' if trade['direction'] == 'long' else 'triangle-down',
+                                size=10,
+                                color='green' if trade['direction'] == 'long' else 'red'
+                            ),
+                            name=f"Entry {trade['direction']}"
+                        ))
+
+                fig.update_layout(
+                    title="ETH/USDT 15m с входами",
+                    xaxis_title="Время",
+                    yaxis_title="Цена",
+                    height=600
+                )
+
+                st.plotly_chart(fig, use_container_width=True)
+            else:
+                st.warning("Не удалось получить данные свечей")
+        except Exception as e:
+            st.error(f"Ошибка загрузки графика: {e}")
+
+def show_equity_curve(db):
+    """Показать кривую equity"""
+    st.markdown("### 💰 Кривая Equity")
+
+    equity_data = db.get_equity_history(days=30)
+
+    if equity_data:
+        df = pd.DataFrame(equity_data)
+        df['timestamp'] = pd.to_datetime(df['timestamp'])
+
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(
+            x=df['timestamp'],
+            y=df['equity'],
+            mode='lines',
+            name='Equity',
+            line=dict(color='blue', width=2)
+        ))
+
+        fig.update_layout(
+            title="Изменение Equity за последние 30 дней",
+            xaxis_title="Дата",
+            yaxis_title="Equity ($)",
+            height=400
+        )
+
+        st.plotly_chart(fig, use_container_width=True)
+    else:
+        st.info("Нет данных для отображения кривой equity")
+
+def show_trades_table(db):
+    """Показать таблицу сделок"""
+    st.markdown("### 📋 История сделок")
+
+    trades = db.get_recent_trades(100)
+
+    if trades:
+        df = pd.DataFrame(trades)
+
+        # Форматируем данные для отображения
+        df['entry_time'] = pd.to_datetime(df['entry_time'])
+        df['exit_time'] = pd.to_datetime(df['exit_time'])
+        df['pnl'] = df['pnl'].round(2)
+        df['rr'] = df['rr'].round(2)
+
+        # Отображаем таблицу
+        st.dataframe(
+            df[['entry_time', 'direction', 'entry_price', 'exit_price', 'quantity', 'pnl', 'rr', 'status']],
+            use_container_width=True
+        )
+    else:
+        st.info("Нет сделок для отображения")
+
+if __name__ == "__main__":
+    main()
