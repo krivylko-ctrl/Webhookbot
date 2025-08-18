@@ -612,21 +612,17 @@ class KWINStrategy:
             return current_sl
 
     def _update_stop_loss(self, position: Dict, new_sl: float):
-        """Обновление стоп-лосса"""
         try:
             if not self.api or not hasattr(self.api, "modify_order"):
-                print("API not available for updating stop loss")
-                return
-            result = self.api.modify_order(
-                symbol=position['symbol'],
-                stop_loss=new_sl
-            )
-            if result:
-                position['stop_loss'] = new_sl
-                self.state.set_position(position)
-                print(f"Trailing SL updated: {new_sl:.4f}")
+                return False
+            res = self.api.modify_order(symbol=position['symbol'], stop_loss=new_sl)
+            position['stop_loss'] = new_sl
+            self.state.set_position(position)
+            print(f"[TRAIL] SL -> {new_sl:.4f}")
+            return True
         except Exception as e:
             print(f"Error updating stop loss: {e}")
+            return False
 
     def process_trailing(self):
         """LEGACY метод для обратной совместимости"""
