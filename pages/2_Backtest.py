@@ -4,7 +4,9 @@ import numpy as np
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from datetime import datetime, timedelta, timezone
-import requests   # ← ДОБАВЛЕНО: нужен для прямого запроса v5
+import requests   # ← нужен для прямого запроса v5
+import time       # ← анти-рейткэп в загрузчике
+from pandas.api.types import is_numeric_dtype, is_datetime64_any_dtype  # ← для стабильной нормализации времени
 import sys
 import os
 
@@ -23,9 +25,7 @@ api = None
 db = Database(memory=True)            # или Database("kwin_bot.db") — если хочешь файл
 state = StateManager(db)
 
-# ===================== ДОБАВЛЕНО: прямой загрузчик Bybit v5 =====================
-BYBIT_V5_URL = "https://api.bybit.com/v5/market/kline"
-
+# ===================== прямой загрузчик Bybit v5 =====================
 BYBIT_V5_URL = "https://api.bybit.com/v5/market/kline"
 
 def fetch_bybit_v5_window(symbol: str, days: int, interval: str = "15", category: str = "linear") -> list[dict]:
@@ -59,18 +59,27 @@ def fetch_bybit_v5_window(symbol: str, days: int, interval: str = "15", category
         }
 
         # диагностическая подпись текущего чанка
-        st.caption(f"▸ Bybit v5 запрос #{request_id}: {datetime.utcfromtimestamp(params['start']/1000):%Y-%m-%d %H:%M} → "
-                   f"{datetime.utcfromtimestamp(params['end']/1000):%Y-%m-%d %H:%M} UTC")
+        st.caption(
+            f"▸ Bybit v5 запрос #{request_id}: "
+            f"{datetime.utcfromtimestamp(params['start']/1000):%Y-%m-%d %H:%M} → "
+            f"{datetime.utcfromtimestamp(params['end']/1000):%Y-%m-%d %H:%M} UTC"
+        )
 
         try:
             r = requests.get(BYBIT_V5_URL, params=params, timeout=20)
-            status = r.status_code
         except Exception as net_err:
             st.error(f"Сетевой сбой при обращении к Bybit v5: {net_err}")
             break
 
-        if status != 200:
-            st.error(f"HTTP {status} от Bybit v5 (chunk #{request_id}). Тело: {r.text[:300]}")
+        # анти-рейткэп: если 403 — подождём и продолжим следующий кусок
+        if r.status_code == 403:
+            st.error("HTTP 403 от Bybit v5: Access too frequent. Делаю паузу и продолжаю…")
+            time.sleep(1.2)
+            cursor_start = cursor_end + 1
+            continue
+
+        if r.status_code != 200:
+            st.error(f"HTTP {r.status_code} от Bybit v5 (chunk #{request_id}). Тело: {r.text[:300]}")
             break
 
         try:
@@ -91,6 +100,7 @@ def fetch_bybit_v5_window(symbol: str, days: int, interval: str = "15", category
         if not rows:
             # Пусто в этом сегменте — сдвигаем курсор вперёд, чтобы не зациклиться
             cursor_start = cursor_end + 1
+            time.sleep(0.25)  # маленькая пауза
             continue
 
         # v5: [start, open, high, low, close, volume, turnover]
@@ -108,6 +118,7 @@ def fetch_bybit_v5_window(symbol: str, days: int, interval: str = "15", category
 
         # следующий кусок
         cursor_start = int(rows[-1][0]) + 1
+        time.sleep(0.25)  # смягчаем Rate Limit
 
     # дедуп и сортировка
     out = sorted({b["timestamp"]: b for b in out}.values(), key=lambda x: x["timestamp"])
@@ -115,14 +126,16 @@ def fetch_bybit_v5_window(symbol: str, days: int, interval: str = "15", category
     if out:
         first_dt = datetime.utcfromtimestamp(out[0]["timestamp"]/1000)
         last_dt  = datetime.utcfromtimestamp(out[-1]["timestamp"]/1000)
-        st.success(f"✅ Свечи Bybit v5 загружены: {len(out)} шт • "
-                   f"{first_dt:%Y-%m-%d %H:%M} — {last_dt:%Y-%m-%d %H:%M} UTC")
+        st.success(
+            f"✅ Свечи Bybit v5 загружены: {len(out)} шт • "
+            f"{first_dt:%Y-%m-%d %H:%M} — {last_dt:%Y-%m-%d %H:%M} UTC"
+        )
     else:
         st.warning("Bybit v5 вернул пустой набор за выбранный период.")
 
     return out
 
-# ===================== ДОБАВЛЕНО: paper-API для стратегии =====================
+# ===================== paper-API для стратегии =====================
 class PaperBybitAPI:
     """Мини-эмулятор методов, которые читает стратегия (без реальных ордеров)."""
     def __init__(self):
@@ -145,7 +158,7 @@ def main():
     st.title("📊 KWIN Strategy Backtest")
     st.markdown("Тестирование стратегии на исторических данных.")
 
-    # ↓↓↓ ДОБАВЛЕНО: выбор источника свечей
+    # выбор источника свечей
     data_src = st.radio(
         "Источник данных",
         ["Bybit v5 (реальные 15m)", "Синтетика (демо)"],
@@ -311,7 +324,7 @@ def run_backtest(strategy: KWINStrategy, period_days: int, start_capital: float)
         "initial_equity": start_capital,
     }
 
-# ===================== ДОБАВЛЕНО: реальный прогон через стратегию =====================
+# ===================== реальный прогон через стратегию =====================
 def run_backtest_real(strategy: KWINStrategy, candles: list[dict], start_capital: float):
     """
     Прогон реальных 15m свечей через KWINStrategy (paper).
@@ -382,7 +395,7 @@ def run_backtest_real(strategy: KWINStrategy, candles: list[dict], start_capital
             tp = pos.get("take_profit")
             if pos["direction"] == "long":
                 if sl > 0 and l <= sl:
-                    close_position(sl, ts_ms); 
+                    close_position(sl, ts_ms)
                 elif tp is not None and h >= float(tp):
                     close_position(float(tp), ts_ms)
             else:  # short
@@ -401,9 +414,11 @@ def run_backtest_real(strategy: KWINStrategy, candles: list[dict], start_capital
             after_pos["entry_time_ts"] = ts_ms
             state.set_position(after_pos)
 
-        # снимем equity на конец бара
-        equity_points.append({"timestamp": pd.to_datetime(ts_ms, unit="ms", utc=True), 
-                              "equity": float(state.get_equity() or start_capital)})
+        # снимем equity на конец бара (КЛАДЁМ МИЛЛИСЕКУНДЫ!)
+        equity_points.append({
+            "timestamp": int(ts_ms),
+            "equity": float(state.get_equity() or start_capital)
+        })
 
     # если к концу окна позиция открыта — закроем по последнему close
     if state.get_current_position() and state.get_current_position().get("status") == "open":
@@ -444,10 +459,17 @@ def display_backtest_results(results):
 
         if not equity_df.empty and len(equity_df) > 1:
             eq = equity_df.copy()
-            # нормализуем время оси, если передали мс
-            if np.issubdtype(eq["timestamp"].dtype, np.number):
-                eq["timestamp"] = pd.to_datetime(eq["timestamp"], unit="ms", utc=True)
-            eq["timestamp"] = pd.to_datetime(eq["timestamp"], utc=True).dt.tz_localize(None)
+
+            # устойчиво нормализуем время
+            if "timestamp" in eq.columns:
+                if is_numeric_dtype(eq["timestamp"]):
+                    ts = pd.to_datetime(eq["timestamp"], unit="ms", utc=True)
+                elif is_datetime64_any_dtype(eq["timestamp"]):
+                    ts = pd.to_datetime(eq["timestamp"], utc=True, errors="coerce")
+                else:
+                    ts = pd.to_datetime(eq["timestamp"], utc=True, errors="coerce")
+                eq["timestamp"] = ts.dt.tz_localize(None)
+
             eq["cummax"]  = eq["equity"].cummax()
             eq["drawdown"] = (eq["equity"] - eq["cummax"]) / eq["cummax"] * 100.0
             max_dd = float(eq["drawdown"].min())
@@ -473,9 +495,12 @@ def display_backtest_results(results):
     if not equity_df.empty and len(equity_df) > 1:
         st.subheader("📊 Кривая Equity")
         eq = equity_df.copy()
-        if np.issubdtype(eq["timestamp"].dtype, np.number):
-            eq["timestamp"] = pd.to_datetime(eq["timestamp"], unit="ms", utc=True)
-        eq["timestamp"] = pd.to_datetime(eq["timestamp"], utc=True).dt.tz_localize(None)
+        if "timestamp" in eq.columns:
+            if is_numeric_dtype(eq["timestamp"]):
+                ts = pd.to_datetime(eq["timestamp"], unit="ms", utc=True)
+            else:
+                ts = pd.to_datetime(eq["timestamp"], utc=True, errors="coerce")
+            eq["timestamp"] = ts.dt.tz_localize(None)
 
         fig = make_subplots(rows=2, cols=1, row_heights=[0.7, 0.3],
                             subplot_titles=("Equity", "Drawdown"),
