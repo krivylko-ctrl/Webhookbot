@@ -3,7 +3,7 @@ import sqlite3
 import json
 from typing import Dict, List, Optional, Any
 from datetime import datetime, timedelta, timezone
-import threading  # ← добавил для потокобезопасности
+import threading  # ← для потокобезопасности
 
 
 # ========================= Вспомогательные =========================
@@ -35,6 +35,22 @@ def _f(x, default=None):
         return default
 
 
+def _normalize_json(obj: Any) -> Any:
+    """
+    Рекурсивно нормализует объект для json.dumps:
+    - datetime -> ISO-строка
+    - dict/list -> обход внутрь
+    - остальное без изменений
+    """
+    if isinstance(obj, datetime):
+        return _to_iso(obj)
+    if isinstance(obj, dict):
+        return {k: _normalize_json(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_normalize_json(v) for v in obj]
+    return obj
+
+
 # =============================== DB ===============================
 
 class Database:
@@ -45,13 +61,15 @@ class Database:
       - get_recent_trades/get_all_trades/get_trades_by_period
       - save_equity_snapshot/get_equity_history
       - get_performance_stats/get_trades_count_today/get_pnl_today
+      - save_bot_state/get_bot_state
+      - save_config/get_config
     """
 
     def __init__(self, db_path: str = "kwin_bot.db", memory: bool = False):
         self.db_path = ":memory:" if memory else db_path
         self.conn = sqlite3.connect(self.db_path, check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
-        self._lock = threading.RLock()  # ← добавил лок
+        self._lock = threading.RLock()
         self._init_schema()
 
     # -------------------------- Схема --------------------------
@@ -59,7 +77,7 @@ class Database:
     def _init_schema(self) -> None:
         c = self.conn.cursor()
 
-        # Таблица сделок (расширенная схема — подходит и для live, и для backtest)
+        # Таблица сделок
         c.execute("""
             CREATE TABLE IF NOT EXISTS trades (
                 id           INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -90,7 +108,7 @@ class Database:
             )
         """)
 
-        # Состояние бота
+        # Состояние бота (единственная строка id=1)
         c.execute("""
             CREATE TABLE IF NOT EXISTS bot_state (
                 id         INTEGER PRIMARY KEY,
@@ -99,7 +117,7 @@ class Database:
             )
         """)
 
-        # Конфигурация
+        # Конфигурация (единственная строка id=1)
         c.execute("""
             CREATE TABLE IF NOT EXISTS config (
                 id          INTEGER PRIMARY KEY,
@@ -337,10 +355,11 @@ class Database:
 
     def save_bot_state(self, state: Dict) -> None:
         """
-        Официальный метод сохранения состояния бота.
-        Хранит произвольный словарь в единственной строке с id=1.
+        Сохранение состояния бота (dict в единственной строке с id=1).
+        Автоматически конвертирует datetime -> ISO, чтобы json.dumps не падал.
         """
-        payload = json.dumps(dict(state or {}), ensure_ascii=False)
+        safe_state = _normalize_json(state or {})
+        payload = json.dumps(safe_state, ensure_ascii=False)
         with self._lock:
             c = self.conn.cursor()
             c.execute("""
@@ -354,8 +373,7 @@ class Database:
 
     def get_bot_state(self) -> Dict:
         """
-        Официальный метод чтения состояния бота.
-        Возвращает dict (или пустой словарь).
+        Чтение состояния бота. Возвращает dict (или {}).
         """
         with self._lock:
             c = self.conn.cursor()
@@ -371,9 +389,11 @@ class Database:
 
     def save_config(self, cfg_data: Dict) -> None:
         """
-        Сохранение последней рабочей конфигурации (опционально).
+        Сохранение последней рабочей конфигурации.
+        Также нормализует datetime -> ISO.
         """
-        payload = json.dumps(dict(cfg_data or {}), ensure_ascii=False)
+        safe_cfg = _normalize_json(cfg_data or {})
+        payload = json.dumps(safe_cfg, ensure_ascii=False)
         with self._lock:
             c = self.conn.cursor()
             c.execute("""
@@ -387,7 +407,7 @@ class Database:
 
     def get_config(self) -> Dict:
         """
-        Получение сохранённой конфигурации (опционально).
+        Получение сохранённой конфигурации (dict или {}).
         """
         with self._lock:
             c = self.conn.cursor()
