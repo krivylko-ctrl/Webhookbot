@@ -11,10 +11,9 @@ from analytics import TradingAnalytics
 from utils import price_round, qty_round
 from database import Database
 
-
 class KWINStrategy:
     """Основная логика стратегии KWIN"""
-
+    
     def __init__(self, config: Config, bybit_api, state_manager: StateManager, db: Database):
         self.config = config
         self.api = bybit_api
@@ -22,37 +21,37 @@ class KWINStrategy:
         self.db = db
         self.trail_engine = TrailEngine(config, state_manager, bybit_api)
         self.analytics = TradingAnalytics()
-
+        
         # Внутренние данные (crash-safe state)
         self.candles_15m = []
         self.candles_1m = []
         self.candles_1h = []  # ← добавлено
         self.last_processed_time = None
         self.last_processed_bar_ts = 0  # Для восстановления после crash
-
+        
         # Trade state (зафиксированные значения для RR расчета)
         self.entry_price = None
         self.entry_sl = None
         self.trade_id = None
         self.armed = False  # ArmRR статус
-
+        
         # Версионирование стратегии
         self.strategy_version = "2.0.1"
-
+        
         # Состояние входов
         self.can_enter_long = True
         self.can_enter_short = True
         self.last_candle_close_15m = None
-
+        
         # Инструмент (используем из конфига)
         self.symbol = self.config.symbol
         self.tick_size = 0.01
         self.qty_step = 0.01
         self.min_order_qty = 0.01
-
+        
         # Получаем информацию об инструменте
         self._init_instrument_info()
-
+        
         # Критичный патч: нормализация close_back_pct к диапазону [0..1]
         if self.config.close_back_pct > 1.0:
             self.config.close_back_pct = self.config.close_back_pct / 100.0
@@ -68,10 +67,6 @@ class KWINStrategy:
         """Новейшая свеча первой (индекс 0)."""
         if self.candles_15m and self.candles_15m[0].get("timestamp") is not None:
             self.candles_15m.sort(key=lambda x: x.get("timestamp", 0), reverse=True)
-
-    def _current_bar_ts_ms(self) -> int:
-        """Штамп времени ТЕКУЩЕГО закрытого 15m бара (мс)."""
-        return int(self.last_processed_bar_ts or 0)
     # =======================================================
 
     def _init_instrument_info(self):
@@ -80,7 +75,7 @@ class KWINStrategy:
             if self.api:
                 if hasattr(self.api, 'set_market_type') and hasattr(self.config, 'market_type'):
                     self.api.set_market_type(self.config.market_type)
-
+                
                 if hasattr(self.api, 'get_instruments_info'):
                     info = self.api.get_instruments_info(self.symbol)
                     if info:
@@ -91,13 +86,13 @@ class KWINStrategy:
                             self.min_order_qty = float(info['lotSizeFilter']['minOrderQty'])
         except Exception as e:
             print(f"Error initializing instrument info: {e}")
-
+            
         # Если биржа дала фильтры - синхронизируем в конфиг
         if self.qty_step and self.qty_step > 0:
             self.config.qty_step = self.qty_step
         if self.min_order_qty and self.min_order_qty > 0:
             self.config.min_order_qty = self.min_order_qty
-
+        
         # Fallback
         if not self.tick_size or self.tick_size <= 0:
             self.tick_size = 0.01
@@ -105,7 +100,7 @@ class KWINStrategy:
             self.qty_step = 0.01
         if not self.min_order_qty or self.min_order_qty <= 0:
             self.min_order_qty = 0.01
-
+    
     def on_bar_close_15m(self, candle: Dict):
         """ТОЧНАЯ синхронизация с Pine Script: обработка только закрытых 15м баров"""
         try:
@@ -117,7 +112,7 @@ class KWINStrategy:
 
             # строгий порядок
             self._ensure_15m_desc()
-
+            
             # выровненная метка бара и реентранси-гард
             current_bar_time = candle.get('start') or candle.get('open_time') or candle.get('timestamp')
             if not current_bar_time:
@@ -135,11 +130,11 @@ class KWINStrategy:
                 print(f"[STRATEGY] New 15m bar: {float(candle['close']):.2f} at {aligned_ts}")
             except Exception:
                 pass
-
+            
             self.run_cycle()
         except Exception as e:
             print(f"Error in on_bar_close_15m: {e}")
-
+    
     def on_bar_close_60m(self, candle: Dict):
         """Обработка закрытых 1ч баров для дополнительного анализа"""
         try:
@@ -148,17 +143,17 @@ class KWINStrategy:
                 self.candles_1h = self.candles_1h[:100]
         except Exception as e:
             print(f"Error in on_bar_close_60m: {e}")
-
+    
     def on_bar_close_1m(self, candle: Dict):
         """Обработка 1м баров для дополнительного мониторинга"""
         pass
-
+    
     def update_candles(self):
         """Обновление свечей с биржи"""
         try:
             if not self.api:
                 return
-
+                
             # 15m
             klines_15m = self.api.get_klines(self.symbol, "15", 100)
             if klines_15m:
@@ -169,12 +164,12 @@ class KWINStrategy:
                 # строгий порядок
                 klines_15m.sort(key=lambda x: x.get("timestamp", 0), reverse=True)
                 self.candles_15m = klines_15m
-
+            
             # 1m
             klines_1m = self.api.get_klines(self.symbol, "1", 10)
             if klines_1m:
                 self.candles_1m = klines_1m
-
+            
             if self.candles_15m:
                 current_candle = self.candles_15m[0]
                 current_timestamp = int(current_candle.get('timestamp', 0))
@@ -192,28 +187,28 @@ class KWINStrategy:
                 self.on_bar_close()
         except Exception as e:
             print(f"Error updating candles: {str(e) if e else 'Unknown error'}")
-
+    
     def on_bar_close(self):
         """Обработка новой 15-минутной свечи"""
         if len(self.candles_15m) < self.config.sfp_len + 2:
             return
-
+        
         bull_sfp = self._detect_bull_sfp()
         bear_sfp = self._detect_bear_sfp()
-
+        
         current_ts = self.candles_15m[0]['timestamp']  # ms
         if not self._is_in_backtest_window_utc(current_ts):
             return
-
+        
         current_position = self.state.get_current_position()
         if current_position and current_position.get('status') == 'open':
             return
-
+        
         if bull_sfp and self.can_enter_long:
             self._process_long_entry()
         elif bear_sfp and self.can_enter_short:
             self._process_short_entry()
-
+    
     def _detect_bull_sfp(self) -> bool:
         sfpLen = 2
         if len(self.candles_15m) < sfpLen + 1 + 2:
@@ -242,7 +237,7 @@ class KWINStrategy:
                     return self._check_bull_sfp_quality_new(current, self.candles_15m[i])
                 return True
         return False
-
+    
     def _detect_bear_sfp(self) -> bool:
         sfpLen = 2
         if len(self.candles_15m) < sfpLen + 1 + 2:
@@ -271,7 +266,7 @@ class KWINStrategy:
                     return self._check_bear_sfp_quality_new(current, self.candles_15m[i])
                 return True
         return False
-
+    
     def _check_bull_sfp_quality_new(self, current: Dict, pivot: Dict) -> bool:
         prev_pivot_low = pivot['low']
         wick_depth = prev_pivot_low - current['low']
@@ -282,10 +277,10 @@ class KWINStrategy:
         close_back = current['close'] - current['low']
         required_close_back = wick_depth * self.config.close_back_pct
         return close_back >= required_close_back
-
+    
     def _check_bull_sfp_quality(self, current: Dict, pivot: Dict) -> bool:
         return self._check_bull_sfp_quality_new(current, pivot)
-
+    
     def _check_bear_sfp_quality_new(self, current: Dict, pivot: Dict) -> bool:
         prev_pivot_high = pivot['high']
         wick_depth = current['high'] - prev_pivot_high
@@ -296,10 +291,10 @@ class KWINStrategy:
         close_back = current['high'] - current['close']
         required_close_back = wick_depth * self.config.close_back_pct
         return close_back >= required_close_back
-
+    
     def _check_bear_sfp_quality(self, current: Dict, pivot: Dict) -> bool:
         return self._check_bear_sfp_quality_new(current, pivot)
-
+    
     # ---------- УНИФИЦИРОВАННЫЙ ВЫЗОВ MARKET-ОРДЕРА (совместимость клиентов) ----------
     def _place_market_order(self, direction: str, quantity: float, stop_loss: Optional[float] = None):
         if not self.api or not hasattr(self.api, 'place_order'):
@@ -326,7 +321,7 @@ class KWINStrategy:
                 qty=qty,
                 stop_loss=stop_loss
             )
-
+    
     def _process_long_entry(self):
         """Обработка входа в лонг"""
         try:
@@ -344,14 +339,11 @@ class KWINStrategy:
             take_profit = entry_price + stop_size * self.config.risk_reward
             if not self._validate_position_requirements(entry_price, stop_loss, take_profit, quantity):
                 return
-
+            
             order_result = self._place_market_order("long", quantity, stop_loss=stop_loss)
             if order_result is None:
                 return
-
-            # ===== ТОЧЕЧНАЯ ПРАВКА: время входа = время текущего закрытого бара =====
-            bar_ts_ms = self._current_bar_ts_ms()
-
+            
             trade_data = {
                 'symbol': self.symbol,
                 'direction': 'long',
@@ -359,11 +351,11 @@ class KWINStrategy:
                 'stop_loss': stop_loss,
                 'take_profit': take_profit,
                 'quantity': float(quantity),
-                'entry_time': datetime.utcfromtimestamp(bar_ts_ms / 1000) if bar_ts_ms else datetime.utcnow(),
+                'entry_time': datetime.utcnow(),
                 'status': 'open'
             }
             self.db.save_trade(trade_data)
-
+            
             self.state.set_position({
                 'symbol': self.symbol,
                 'direction': 'long',
@@ -372,8 +364,7 @@ class KWINStrategy:
                 'stop_loss': stop_loss,
                 'take_profit': take_profit,
                 'status': 'open',
-                'armed': not self.config.use_arm_after_rr,
-                'entry_time_ts': bar_ts_ms  # ← сохраняем штамп бара
+                'armed': not self.config.use_arm_after_rr
             })
             # важно: исключаем второй вход на том же баре
             self.can_enter_long = False
@@ -381,7 +372,7 @@ class KWINStrategy:
             print(f"Long entry: {quantity} @ {entry_price}, SL: {stop_loss}, TP: {take_profit}")
         except Exception as e:
             print(f"Error processing long entry: {str(e) if e else 'Unknown error'}")
-
+    
     def _process_short_entry(self):
         """Обработка входа в шорт"""
         try:
@@ -399,14 +390,11 @@ class KWINStrategy:
             take_profit = entry_price - stop_size * self.config.risk_reward
             if not self._validate_position_requirements(entry_price, stop_loss, take_profit, quantity):
                 return
-
+            
             order_result = self._place_market_order("short", quantity, stop_loss=stop_loss)
             if order_result is None:
                 return
-
-            # ===== ТОЧЕЧНАЯ ПРАВКА: время входа = время текущего закрытого бара =====
-            bar_ts_ms = self._current_bar_ts_ms()
-
+            
             trade_data = {
                 'symbol': self.symbol,
                 'direction': 'short',
@@ -414,11 +402,11 @@ class KWINStrategy:
                 'stop_loss': stop_loss,
                 'take_profit': take_profit,
                 'quantity': float(quantity),
-                'entry_time': datetime.utcfromtimestamp(bar_ts_ms / 1000) if bar_ts_ms else datetime.utcnow(),
+                'entry_time': datetime.utcnow(),
                 'status': 'open'
             }
             self.db.save_trade(trade_data)
-
+            
             self.state.set_position({
                 'symbol': self.symbol,
                 'direction': 'short',
@@ -427,8 +415,7 @@ class KWINStrategy:
                 'stop_loss': stop_loss,
                 'take_profit': take_profit,
                 'status': 'open',
-                'armed': not self.config.use_arm_after_rr,
-                'entry_time_ts': bar_ts_ms  # ← сохраняем штамп бара
+                'armed': not self.config.use_arm_after_rr
             })
             # важно: исключаем второй вход на том же баре
             self.can_enter_short = False
@@ -436,7 +423,7 @@ class KWINStrategy:
             print(f"Short entry: {quantity} @ {entry_price}, SL: {stop_loss}, TP: {take_profit}")
         except Exception as e:
             print(f"Error processing short entry: {str(e) if e else 'Unknown error'}")
-
+    
     def _get_current_price(self) -> Optional[float]:
         """Получить текущую цену"""
         try:
@@ -450,7 +437,7 @@ class KWINStrategy:
         except Exception as e:
             print(f"Error getting current price: {str(e) if e else 'Unknown error'}")
         return None
-
+    
     def _calculate_position_size(self, entry_price: float, stop_loss: float, direction: str) -> Optional[float]:
         """Расчет размера позиции (qty в базовом активе, напр. ETH)"""
         try:
@@ -471,9 +458,9 @@ class KWINStrategy:
         except Exception as e:
             print(f"Error calculating position size: {e}")
             return None
-
-    def _validate_position_requirements(self, entry_price: float, stop_loss: float,
-                                        take_profit: float, quantity: float) -> bool:
+    
+    def _validate_position_requirements(self, entry_price: float, stop_loss: float, 
+                                      take_profit: float, quantity: float) -> bool:
         """Комплексная проверка требований к позиции"""
         try:
             if quantity < self.config.min_order_qty:
@@ -496,12 +483,12 @@ class KWINStrategy:
         except Exception as e:
             print(f"Error validating position: {e}")
             return False
-
+    
     def _is_in_backtest_window(self, current_time: datetime) -> bool:
         print("WARNING: Используется устаревший метод _is_in_backtest_window, нужен UTC вариант")
         start_date = current_time - timedelta(days=self.config.days_back)
         return current_time >= start_date
-
+    
     def _is_in_backtest_window_utc(self, current_timestamp: int) -> bool:
         """UTC-полночь как в Pine Script"""
         utc_now = datetime.utcnow().replace(tzinfo=timezone.utc)
@@ -509,7 +496,7 @@ class KWINStrategy:
         start_date = utc_midnight - timedelta(days=self.config.days_back)
         current_time = datetime.utcfromtimestamp(current_timestamp / 1000)
         return current_time >= start_date.replace(tzinfo=None)
-
+    
     def _update_smart_trailing(self, position: Dict):
         """НОВЫЙ smart trailing с Bar High/Low и Arm механизмом"""
         try:
@@ -550,7 +537,7 @@ class KWINStrategy:
                     self._update_stop_loss(position, new_sl)
         except Exception as e:
             print(f"Error in smart trailing: {e}")
-
+    
     def _calculate_bar_trailing_stop(self, direction: str, current_sl: float) -> Optional[float]:
         try:
             lookback = getattr(self.config, 'trail_lookback', 50) or 50
@@ -567,7 +554,7 @@ class KWINStrategy:
         except Exception as e:
             print(f"Error calculating bar trailing stop: {e}")
             return current_sl
-
+    
     def _calculate_percentage_trailing_stop(self, direction: str, current_price: float, current_sl: float) -> Optional[float]:
         try:
             trail_pct = getattr(self.config, 'trailing_perc', 0.5) / 100.0
@@ -582,7 +569,7 @@ class KWINStrategy:
         except Exception as e:
             print(f"Error calculating percentage trailing stop: {e}")
             return current_sl
-
+    
     def _update_stop_loss(self, position: Dict, new_sl: float):
         """Обновление стоп-лосса"""
         try:
@@ -599,7 +586,7 @@ class KWINStrategy:
                 print(f"Trailing SL updated: {new_sl:.4f}")
         except Exception as e:
             print(f"Error updating stop loss: {e}")
-
+    
     def process_trailing(self):
         """LEGACY метод для обратной совместимости"""
         try:
@@ -608,7 +595,7 @@ class KWINStrategy:
                 self._update_smart_trailing(current_position)
         except Exception as e:
             print(f"Error processing trailing: {e}")
-
+    
     def run_cycle(self):
         """Основной цикл обработки с НОВОЙ Pine Script логикой"""
         try:
@@ -621,7 +608,7 @@ class KWINStrategy:
                 self.on_bar_close()
         except Exception as e:
             print(f"Error in run_cycle: {str(e) if e else 'Unknown error'}")
-
+    
     def _update_equity(self):
         """Обновление equity"""
         try:
