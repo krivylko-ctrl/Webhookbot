@@ -497,58 +497,67 @@ def run_backtest_real(strategy: KWINStrategy, candles: list[dict], start_capital
         pos["exit_time"]  = datetime.utcfromtimestamp(int(ts_ms)/1000)
         state.set_position(pos)
 
-    def apply_smart_trail(pos: dict, current_price: float) -> None:
+    # ----------- ВСТАВКА: Pine-подобный Smart Trailing с якорем экстремума -----------
+    def apply_smart_trail(pos: dict, bar_high: float, bar_low: float) -> None:
         """
-        PINE-подобный процентный трейл:
-        - активация по RR (если use_arm_after_rr)
-        - затем % от цены входа + offset
-        - обновляем SL только в сторону сокращения риска
+        Pine-эквивалент процентного трейла:
+        - якорь = экстремум с момента входа (high для long, low для short)
+        - активация по RR считается по барному high/low
+        - стоп двигаем только в сторону сокращения риска
         """
-        if not getattr(strategy.config, "enable_smart_trail", True):
+        cfg = strategy.config
+        if not getattr(cfg, "enable_smart_trail", True):
             return
         if not pos or pos.get("status") != "open":
             return
 
         entry = float(pos["entry_price"])
-        sl    = float(pos.get("stop_loss") or 0)
-        if sl <= 0 or entry <= 0:
+        sl    = float(pos.get("stop_loss") or 0.0)
+        if entry <= 0 or sl <= 0:
             return
 
-        # 1) ARM по RR (если включён)
-        armed = bool(pos.get("armed", not getattr(strategy.config, "use_arm_after_rr", True)))
-        if not armed and getattr(strategy.config, "use_arm_after_rr", True):
+        # 1) поддерживаем якорь
+        if pos["direction"] == "long":
+            anchor = float(pos.get("trail_anchor", entry))
+            anchor = max(anchor, float(bar_high))
+            pos["trail_anchor"] = anchor
+        else:
+            anchor = float(pos.get("trail_anchor", entry))
+            anchor = min(anchor, float(bar_low))
+            pos["trail_anchor"] = anchor
+        state.set_position(pos)
+
+        # 2) ARM по RR (если включено)
+        armed = bool(pos.get("armed", not getattr(cfg, "use_arm_after_rr", True)))
+        if not armed and getattr(cfg, "use_arm_after_rr", True):
             risk = abs(entry - sl)
             if risk > 0:
                 if pos["direction"] == "long":
-                    rr = (current_price - entry) / risk
+                    rr = (float(bar_high) - entry) / risk
                 else:
-                    rr = (entry - current_price) / risk
-                if rr >= float(getattr(strategy.config, "arm_rr", 0.5)):
+                    rr = (entry - float(bar_low)) / risk
+                if rr >= float(getattr(cfg, "arm_rr", 0.5)):
                     armed = True
                     pos["armed"] = True
                     state.set_position(pos)
-                    print(f"[TRAIL] Armed at {getattr(strategy.config,'arm_rr',0.5)}R (price={current_price:.4f})")
         if not armed:
             return
 
-        # 2) % трейл от цены входа
-        trail_pct   = float(getattr(strategy.config, "trailing_perc", 0.5)) / 100.0
-        offset_pct  = float(getattr(strategy.config, "trailing_offset_perc", 0.4)) / 100.0
-        trail_dist  = entry * trail_pct
-        offset_dist = entry * offset_pct
+        # 3) расчёт процентного стопа от цены входа
+        trail_dist  = entry * (float(getattr(cfg, "trailing_perc", 0.5)) / 100.0)
+        offset_dist = entry * (float(getattr(cfg, "trailing_offset_perc", 0.4)) / 100.0)
 
         if pos["direction"] == "long":
-            candidate = current_price - trail_dist - offset_dist
+            candidate = anchor - trail_dist - offset_dist
             if candidate > sl:
                 pos["stop_loss"] = candidate
                 state.set_position(pos)
-                print(f"[TRAIL] Long SL {sl:.4f} → {candidate:.4f}")
         else:
-            candidate = current_price + trail_dist + offset_dist
+            candidate = anchor + trail_dist + offset_dist
             if candidate < sl:
                 pos["stop_loss"] = candidate
                 state.set_position(pos)
-                print(f"[TRAIL] Short SL {sl:.4f} → {candidate:.4f}")
+    # ---------------------------------------------------------------------
 
     # --- цикл по барам ---
     for bar in candles:
@@ -559,7 +568,7 @@ def run_backtest_real(strategy: KWINStrategy, candles: list[dict], start_capital
         # ===== (A) Сначала применяем Smart Trailing на этом баре =====
         pos = state.get_current_position()
         if pos and pos.get("status") == "open":
-            apply_smart_trail(pos, c)
+            apply_smart_trail(pos, bar_high=h, bar_low=l)
 
         # ===== (B) Затем проверяем SL/TP по high/low этого бара =====
         pos = state.get_current_position()
@@ -568,17 +577,13 @@ def run_backtest_real(strategy: KWINStrategy, candles: list[dict], start_capital
             tp = pos.get("take_profit")
             if pos["direction"] == "long":
                 if sl > 0 and l <= sl:
-                    print(f"[SLHIT] Long SL hit @ {sl:.4f}")
                     close_position(sl, ts_ms, reason="SL")
                 elif tp is not None and h >= float(tp):
-                    print(f"[TPHIT] Long TP hit @ {float(tp):.4f}")
                     close_position(float(tp), ts_ms, reason="TP")
             else:
                 if sl > 0 and h >= sl:
-                    print(f"[SLHIT] Short SL hit @ {sl:.4f}")
                     close_position(sl, ts_ms, reason="SL")
                 elif tp is not None and l <= float(tp):
-                    print(f"[TPHIT] Short TP hit @ {float(tp):.4f}")
                     close_position(float(tp), ts_ms, reason="TP")
 
         # ===== (C) Теперь передаём закрытую 15m свечу в стратегию (возможен вход) =====
@@ -586,12 +591,12 @@ def run_backtest_real(strategy: KWINStrategy, candles: list[dict], start_capital
         strategy.on_bar_close_15m({"timestamp": ts_ms, "open": o, "high": h, "low": l, "close": c})
         after_pos = state.get_current_position()
 
-        # если позиция открылась — зафиксируем время входа и ARM по настройке
+        # если позиция открылась — зафиксируем время входа, ARM и trail_anchor от entry
         if after_pos and after_pos is not before_pos and after_pos.get("status") == "open":
             if "entry_time_ts" not in after_pos:
                 after_pos["entry_time_ts"] = ts_ms
-            # в Pine ты сразу ставишь armed = not useArmAfterRR
             after_pos["armed"] = not getattr(strategy.config, "use_arm_after_rr", True)
+            after_pos["trail_anchor"] = float(after_pos["entry_price"])
             state.set_position(after_pos)
 
         # equity-снимок
@@ -601,7 +606,6 @@ def run_backtest_real(strategy: KWINStrategy, candles: list[dict], start_capital
     pos = state.get_current_position()
     if pos and pos.get("status") == "open":
         last = candles[-1]
-        print("[CLOSE] Forced exit at last close")
         close_position(float(last["close"]), int(last["timestamp"]), reason="EOD")
 
     trades_df = pd.DataFrame(bt_trades)
