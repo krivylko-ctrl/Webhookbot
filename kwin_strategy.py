@@ -333,6 +333,7 @@ def _check_bear_sfp_quality_new(self, current: dict, pivot: dict) -> bool:
     close_back_pct = float(getattr(self.config, "close_back_pct", 1.0))
     required_close_back = wick_depth * close_back_pct
     return (high - close) >= required_close_back
+    
 # ======== /PINE-EXACT SFP DETECTION ========
     def _place_market_order(self, direction: str, quantity: float, stop_loss: Optional[float] = None):
         if not self.api or not hasattr(self.api, 'place_order'):
@@ -512,7 +513,6 @@ def _check_bear_sfp_quality_new(self, current: dict, pivot: dict) -> bool:
       okTrade = qty > 0
                 and qty >= minOrderQty
                 and expNetPnL >= minNetProfit
-                (фильтр качества SFP уже проверен ранее)
     """
     try:
         if quantity is None:
@@ -524,7 +524,6 @@ def _check_bear_sfp_quality_new(self, current: dict, pivot: dict) -> bool:
 
         min_order_qty = float(getattr(self.config, "min_order_qty", 0.01))
         if qty < min_order_qty:
-            # в Pine: qty >= minOrderQty
             return False
 
         taker = float(getattr(self.config, "taker_fee_rate", 0.00055))
@@ -537,7 +536,7 @@ def _check_bear_sfp_quality_new(self, current: dict, pivot: dict) -> bool:
     except Exception as e:
         print(f"Error validating position: {e}")
         return False
-
+        
     def _is_in_backtest_window(self, current_time: datetime) -> bool:
         print("WARNING: Используется устаревший метод _is_in_backtest_window, нужен UTC вариант")
         start_date = current_time - timedelta(days=self.config.days_back)
