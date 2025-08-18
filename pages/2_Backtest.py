@@ -342,36 +342,49 @@ def run_backtest(strategy: KWINStrategy, period_days: int, start_capital: float)
 
     # ===== 3) Прогон от старых к новым =====
     for bar in candles:
-        ts_ms = int(bar["timestamp"])
-        o = float(bar["open"]); h = float(bar["high"]); l = float(bar["low"]); c = float(bar["close"])
+    # гарантируем типы
+    ts_ms = int(bar["timestamp"])
+    o = float(bar["open"]); h = float(bar["high"]); l = float(bar["low"]); c = float(bar["close"])
 
-        paper.set_price(c)
+    # 1) сначала обновим "текущую цену" для стратегии
+    paper_api.set_price(c)
 
-        # Если позиция открыта — проверим SL/TP на этом баре
-        pos = state.get_current_position()
-        if pos and pos.get("status") == "open":
-            sl = float(pos.get("stop_loss") or 0)
-            tp = pos.get("take_profit")
-            if pos["direction"] == "long":
-                if sl > 0 and l <= sl: _close(sl, ts_ms)
-                elif tp is not None and h >= float(tp): _close(float(tp), ts_ms)
-            else:
-                if sl > 0 and h >= sl: _close(sl, ts_ms)
-                elif tp is not None and l <= float(tp): _close(float(tp), ts_ms)
+    # 2) ДАЙ СТРАТЕГИИ ШАНС ПОДВИНУТЬ СТОП ПРЯМО СЕЙЧАС
+    #    (до проверки SL/TP на этом баре)
+    try:
+        strategy.process_trailing()  # если позиция открыта — обновит SL (smart trailing)
+    except Exception as _e:
+        print(f"[BT] trailing update error: {_e}")
 
-        # Подадим закрытую 15m свечу в стратегию
-        before = state.get_current_position()
-        strategy.on_bar_close_15m({"timestamp": ts_ms, "open": o, "high": h, "low": l, "close": c})
-        after = state.get_current_position()
+    # 3) теперь проверяем SL/TP на текущем баре с уже обновлённым стопом
+    pos = state.get_current_position()
+    if pos and pos.get("status") == "open":
+        sl = float(pos.get("stop_loss") or 0)
+        tp = pos.get("take_profit")
+        if pos["direction"] == "long":
+            if sl > 0 and l <= sl:
+                close_position(sl, ts_ms)
+            elif tp is not None and h >= float(tp):
+                close_position(float(tp), ts_ms)
+        else:  # short
+            if sl > 0 and h >= sl:
+                close_position(sl, ts_ms)
+            elif tp is not None and l <= float(tp):
+                close_position(float(tp), ts_ms)
 
-        # Если на этом баре открылась позиция — проставим время входа ровно по бару
-        if after and after is not before and after.get("status") == "open" and "entry_time_ts" not in after:
-            after["entry_time_ts"] = ts_ms
-            state.set_position(after)
+    # 4) подаём закрытие 15m бара в стратегию (внутри может открыться новая позиция
+    #    и/или сработать внутренняя логика)
+    before_pos = state.get_current_position()
+    strategy.on_bar_close_15m({"timestamp": ts_ms, "open": o, "high": h, "low": l, "close": c})
+    after_pos = state.get_current_position()
 
-        # Снимем equity на конец бара
-        equity_points.append({"timestamp": ts_ms, "equity": float(state.get_equity() or start_capital)})
+    # если на этом баре открылась позиция — проставим время входа ровно по бару
+    if after_pos and after_pos is not before_pos and after_pos.get("status") == "open" and "entry_time_ts" not in after_pos:
+        after_pos["entry_time_ts"] = ts_ms
+        state.set_position(after_pos)
 
+    # 5) снимем equity на конец бара
+    equity_points.append({"timestamp": int(ts_ms), "equity": float(state.get_equity() or start_capital)})
     # Закроем хвост, если осталось открыто
     pos = state.get_current_position()
     if pos and pos.get("status") == "open":
