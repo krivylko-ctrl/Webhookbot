@@ -506,29 +506,37 @@ def _check_bear_sfp_quality_new(self, current: dict, pivot: dict) -> bool:
             return None
 
     def _validate_position_requirements(self, entry_price: float, stop_loss: float,
-                                        take_profit: float, quantity: float) -> bool:
-        """Комплексная проверка требований к позиции"""
-        try:
-            if quantity < self.config.min_order_qty:
-                print(f"Position too small: {quantity} < {self.config.min_order_qty}")
-                return False
-            stop_size = abs(entry_price - stop_loss)
-            min_stop_size = self.tick_size * 5
-            if stop_size < min_stop_size:
-                print(f"Stop too narrow: {stop_size} < {min_stop_size}")
-                return False
-            gross_pnl = abs(take_profit - entry_price) * quantity
-            entry_fee = entry_price * quantity * self.config.taker_fee_rate
-            exit_fee = take_profit * quantity * self.config.taker_fee_rate
-            total_fees = entry_fee + exit_fee
-            net_pnl = gross_pnl - total_fees
-            if net_pnl < self.config.min_net_profit:
-                print(f"Net profit too low: ${net_pnl:.2f} < ${self.config.min_net_profit}")
-                return False
-            return True
-        except Exception as e:
-            print(f"Error validating position: {e}")
+                                    take_profit: float, quantity: float) -> bool:
+    """
+    Pine-эквивалент okTrade:
+      okTrade = qty > 0
+                and qty >= minOrderQty
+                and expNetPnL >= minNetProfit
+                (фильтр качества SFP уже проверен ранее)
+    """
+    try:
+        if quantity is None:
             return False
+
+        qty = float(quantity)
+        if qty <= 0:
+            return False
+
+        min_order_qty = float(getattr(self.config, "min_order_qty", 0.01))
+        if qty < min_order_qty:
+            # в Pine: qty >= minOrderQty
+            return False
+
+        taker = float(getattr(self.config, "taker_fee_rate", 0.00055))
+        gross = abs(float(take_profit) - float(entry_price)) * qty
+        fees  = float(entry_price) * qty * taker * 2.0  # entry + exit
+        net   = gross - fees
+
+        min_net_profit = float(getattr(self.config, "min_net_profit", 1.2))
+        return net >= min_net_profit
+    except Exception as e:
+        print(f"Error validating position: {e}")
+        return False
 
     def _is_in_backtest_window(self, current_time: datetime) -> bool:
         print("WARNING: Используется устаревший метод _is_in_backtest_window, нужен UTC вариант")
