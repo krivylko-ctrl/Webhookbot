@@ -340,24 +340,26 @@ def run_backtest(strategy: KWINStrategy, period_days: int, start_capital: float)
         pos["exit_time"]  = datetime.utcfromtimestamp(int(ts_ms)/1000)
         state.set_position(pos)
 
-    # ===== 3) Прогон от старых к новым =====
+    # 3) Прогон от старых к новым =====
     for bar in candles:
-    # гарантируем типы
-    ts_ms = int(bar["timestamp"])
-    o = float(bar["open"]); h = float(bar["high"]); l = float(bar["low"]); c = float(bar["close"])
+        # гарантируем типы
+        ts_ms = int(bar["timestamp"])
+        o = float(bar["open"])
+        h = float(bar["high"])
+        l = float(bar["low"])
+        c = float(bar["close"])
 
-    # 1) сначала обновим "текущую цену" для стратегии
-    paper_api.set_price(c)
+        # 1) сначала обновим "текущую цену" для стратегии
+        paper_api.set_price(c)
 
-    # 2) ДАЙ СТРАТЕГИИ ШАНС ПОДВИНУТЬ СТОП ПРЯМО СЕЙЧАС
-    #    (до проверки SL/TP на этом баре)
-    try:
-        strategy.process_trailing()  # если позиция открыта — обновит SL (smart trailing)
-    except Exception as _e:
-        print(f"[BT] trailing update error: {_e}")
+        # 2) ДАЙ СТРАТЕГИИ ШАНС ПОДВИНУТЬ СТОП ПРЯМО СЕЙЧАС (до проверки SL/TP на этом баре)
+        try:
+            strategy.process_trailing()  # если позиция открыта - обновит SL (smart trailing)
+        except Exception as e:
+            print(f"[BT] trailing update error: {e}")
 
-    # 3) теперь проверяем SL/TP на текущем баре с уже обновлённым стопом
-    pos = state.get_current_position()
+     # 3) теперь проверяем SL/TP на текущем баре с уже обновлённым стопом
+        pos = state.get_current_position()
     if pos and pos.get("status") == "open":
         sl = float(pos.get("stop_loss") or 0)
         tp = pos.get("take_profit")
@@ -372,8 +374,8 @@ def run_backtest(strategy: KWINStrategy, period_days: int, start_capital: float)
             elif tp is not None and l <= float(tp):
                 close_position(float(tp), ts_ms)
 
-    # 4) подаём закрытие 15m бара в стратегию (внутри может открыться новая позиция
-    #    и/или сработать внутренняя логика)
+     # 4) подаём закрытие 15m бара в стратегию (внутри может открыться новая позиция
+     #    и/или сработать внутренняя логика)
     before_pos = state.get_current_position()
     strategy.on_bar_close_15m({"timestamp": ts_ms, "open": o, "high": h, "low": l, "close": c})
     after_pos = state.get_current_position()
