@@ -272,7 +272,7 @@ class KWINStrategy:
 
         cond_pivot = self._is_prev_pivot_high(sfpLen, right=1)
         cond_break = float(curr['high']) > ref_high
-        cond_close = float(curr['open']) < ref_high и float(curr['close']) < ref_high
+        cond_close = float(curr['open']) < ref_high and float(curr['close']) < ref_high
 
         if cond_pivot and cond_break and cond_close:
             if getattr(self.config, "use_sfp_quality", True):
