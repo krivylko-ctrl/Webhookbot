@@ -14,28 +14,6 @@ from database import Database
 
 class KWINStrategy:
     """Основная логика стратегии KWIN"""
-    def run_cycle(self, candle: dict):
-        """
-        Основной цикл стратегии — вызывается при закрытии 15m бара.
-        candle = {"open":..., "high":..., "low":..., "close":..., "volume":..., "timestamp":...}
-        """
-    try:
-        # 1. Обновляем текущие данные
-        self.last_candle = candle
-
-        # 2. Проверяем условия входа/выхода (твоя логика из PineScript)
-        signal = self.check_signals(candle)
-
-        # 3. Если сигнал есть → открываем или управляем позицией
-        if signal:
-            self.execute_signal(signal, candle)
-
-        # 4. Если позиция открыта → управляем стопами (Smart Trailing и т.д.)
-        if self.position:
-            self.update_trailing(candle)
-
-    except Exception as e:
-        print(f"[run_cycle ERROR] {e}")
 
     def __init__(self, config: Config, bybit_api, state_manager: StateManager, db: Database):
         self.config = config
@@ -81,7 +59,7 @@ class KWINStrategy:
         elif self.config.close_back_pct < 0.0:
             self.config.close_back_pct = 0.0
 
-    # ====== ДОБАВЛЕНО: утилиты выравнивания и порядка ======
+    # ====== утилиты выравнивания и порядка ======
     def _align_15m_ms(self, ts_ms: int) -> int:
         """Выравнивание метки времени к границе 15 минут (мс)."""
         return (int(ts_ms) // 900_000) * 900_000
@@ -94,7 +72,7 @@ class KWINStrategy:
     def _current_bar_ts_ms(self) -> int:
         """Штамп времени ТЕКУЩЕГО закрытого 15m бара (мс)."""
         return int(self.last_processed_bar_ts or 0)
-    # =======================================================
+    # ============================================
 
     def _init_instrument_info(self):
         """Инициализация информации об инструменте"""
@@ -102,7 +80,6 @@ class KWINStrategy:
             if self.api:
                 if hasattr(self.api, 'set_market_type') and hasattr(self.config, 'market_type'):
                     self.api.set_market_type(self.config.market_type)
-
                 if hasattr(self.api, 'get_instruments_info'):
                     info = self.api.get_instruments_info(self.symbol)
                     if info:
@@ -236,127 +213,116 @@ class KWINStrategy:
         elif bear_sfp and self.can_enter_short:
             self._process_short_entry()
 
-# ======== PINE-EXACT SFP DETECTION (pivotlow/pivothigh) ========
+    # ======== PINE-EXACT SFP DETECTION (pivotlow/pivothigh) ========
 
-def _is_prev_pivot_low(self, left: int, right: int = 1) -> bool:
-    """
-    Точная копия ta.pivotlow(left, right), оценённая на ТЕКУЩЕМ баре,
-    где сам pivot стоит на предыдущем баре (index=1 в self.candles_15m).
-    Требует окно [0 .. 1+left] (right=1 → включает текущий бар 0).
-    """
-    need = left + right + 1  # кол-во баров вокруг пивота (включительно)
-    # нам нужен ещё 1 бар, т.к. пивот на index=1 → всего need+1 баров (0..1+left)
-    if len(self.candles_15m) < (need + 1):
-        return False
-    # окно индексов: 0 .. (1+left) включительно
-    window_lows = [float(self.candles_15m[i]['low']) for i in range(0, 1 + left + 1)]
-    pivot_val = float(self.candles_15m[1]['low'])
-    return pivot_val == min(window_lows)
+    def _is_prev_pivot_low(self, left: int, right: int = 1) -> bool:
+        """
+        ta.pivotlow(left,right) на текущем баре, где сам pivot на предыдущем (index=1).
+        Требует окна [0 .. 1+left].
+        """
+        need = left + right + 1
+        if len(self.candles_15m) < (need + 1):
+            return False
+        window_lows = [float(self.candles_15m[i]['low']) for i in range(0, 1 + left + 1)]
+        pivot_val = float(self.candles_15m[1]['low'])
+        return pivot_val == min(window_lows)
 
-def _is_prev_pivot_high(self, left: int, right: int = 1) -> bool:
-    """Точная копия ta.pivothigh(left, right) для пивота на предыдущем баре (index=1)."""
-    need = left + right + 1
-    if len(self.candles_15m) < (need + 1):
-        return False
-    window_highs = [float(self.candles_15m[i]['high']) for i in range(0, 1 + left + 1)]
-    pivot_val = float(self.candles_15m[1]['high'])
-    return pivot_val == max(window_highs)
+    def _is_prev_pivot_high(self, left: int, right: int = 1) -> bool:
+        """ta.pivothigh(left,right) для pivot на предыдущем баре (index=1)."""
+        need = left + right + 1
+        if len(self.candles_15m) < (need + 1):
+            return False
+        window_highs = [float(self.candles_15m[i]['high']) for i in range(0, 1 + left + 1)]
+        pivot_val = float(self.candles_15m[1]['high'])
+        return pivot_val == max(window_highs)
 
-def _detect_bull_sfp(self) -> bool:
-    """
-    Pine эквивалент:
-    isBullSFP_15m = pivotlow(sfpLen, 1)
-                    and low < low[sfpLen] and open > low[sfpLen] and close > low[sfpLen]
-    """
-    sfpLen = int(getattr(self.config, "sfp_len", 2))
-    # нужно как минимум sfpLen-сдвиг + текущий + предыдущий → sfpLen+1+1 баров
-    if len(self.candles_15m) < (sfpLen + 2):
-        return False
+    def _detect_bull_sfp(self) -> bool:
+        """
+        isBullSFP_15m = pivotlow(sfpLen,1)
+                        и low < low[sfpLen] и open > low[sfpLen] и close > low[sfpLen]
+        """
+        sfpLen = int(getattr(self.config, "sfp_len", 2))
+        if len(self.candles_15m) < (sfpLen + 2):
+            return False
 
-    curr = self.candles_15m[0]
-    ref_low = float(self.candles_15m[sfpLen]['low'])  # low[sfpLen] в терминах Pine
+        curr = self.candles_15m[0]
+        ref_low = float(self.candles_15m[sfpLen]['low'])  # low[sfpLen]
 
-    cond_pivot = self._is_prev_pivot_low(sfpLen, right=1)
-    cond_break = float(curr['low'])   < ref_low
-    cond_close = float(curr['open'])  > ref_low and float(curr['close']) > ref_low
+        cond_pivot = self._is_prev_pivot_low(sfpLen, right=1)
+        cond_break = float(curr['low']) < ref_low
+        cond_close = float(curr['open']) > ref_low and float(curr['close']) > ref_low
 
-    if cond_pivot and cond_break and cond_close:
-        if getattr(self.config, "use_sfp_quality", True):
-            # качество — ровно как в Pine: тень в тиках и close-back
-            return self._check_bull_sfp_quality_new(curr, {"low": ref_low})
-        return True
-    return False
-
-def _detect_bear_sfp(self) -> bool:
-    """
-    Pine эквивалент:
-    isBearSFP_15m = pivothigh(sfpLen, 1)
-                    and high > high[sfpLen] and open < high[sfpLen] and close < high[sfpLen]
-    """
-    sfpLen = int(getattr(self.config, "sfp_len", 2))
-    if len(self.candles_15m) < (sfpLen + 2):
+        if cond_pivot and cond_break and cond_close:
+            if getattr(self.config, "use_sfp_quality", True):
+                return self._check_bull_sfp_quality_new(curr, {"low": ref_low})
+            return True
         return False
 
-    curr = self.candles_15m[0]
-    ref_high = float(self.candles_15m[sfpLen]['high'])  # high[sfpLen]
+    def _detect_bear_sfp(self) -> bool:
+        """
+        isBearSFP_15m = pivothigh(sfpLen,1)
+                        и high > high[sfpLen] и open < high[sfpLen] и close < high[sfpLen]
+        """
+        sfpLen = int(getattr(self.config, "sfp_len", 2))
+        if len(self.candles_15m) < (sfpLen + 2):
+            return False
 
-    cond_pivot = self._is_prev_pivot_high(sfpLen, right=1)
-    cond_break = float(curr['high']) > ref_high
-    cond_close = float(curr['open']) < ref_high and float(curr['close']) < ref_high
+        curr = self.candles_15m[0]
+        ref_high = float(self.candles_15m[sfpLen]['high'])  # high[sfpLen]
 
-    if cond_pivot and cond_break and cond_close:
-        if getattr(self.config, "use_sfp_quality", True):
-            return self._check_bear_sfp_quality_new(curr, {"high": ref_high})
-        return True
-    return False
+        cond_pivot = self._is_prev_pivot_high(sfpLen, right=1)
+        cond_break = float(curr['high']) > ref_high
+        cond_close = float(curr['open']) < ref_high and float(curr['close']) < ref_high
 
-def _check_bull_sfp_quality_new(self, current: dict, pivot: dict) -> bool:
-    """
-    Pine эквивалент quality-фильтра:
-    bullWickDepth   = (low < ref_low) ? (ref_low - low) : 0
-    bullCloseBackOK = bullWickDepth > 0 and (close - low) >= bullWickDepth * closeBackPct
-    плюс порог по тик-ам: wickMinTicks * mTick
-    """
-    ref_low = float(pivot['low'])
-    low     = float(current['low'])
-    close   = float(current['close'])
-
-    wick_depth = max(ref_low - low, 0.0)
-    m_tick = float(getattr(self, "tick_size", 0.01))
-    if m_tick <= 0:
-        m_tick = 0.01
-    wick_ticks = wick_depth / m_tick
-    if wick_ticks < float(getattr(self.config, "wick_min_ticks", 7)):
+        if cond_pivot and cond_break and cond_close:
+            if getattr(self.config, "use_sfp_quality", True):
+                return self._check_bear_sfp_quality_new(curr, {"high": ref_high})
+            return True
         return False
 
-    close_back_pct = float(getattr(self.config, "close_back_pct", 1.0))
-    required_close_back = wick_depth * close_back_pct
-    return (close - low) >= required_close_back
+    def _check_bull_sfp_quality_new(self, current: dict, pivot: dict) -> bool:
+        """
+        bullWickDepth   = max(ref_low - low, 0)
+        bullCloseBackOK = (close - low) >= bullWickDepth * closeBackPct
+        + порог по тикам: wickMinTicks * mTick
+        """
+        ref_low = float(pivot['low'])
+        low     = float(current['low'])
+        close   = float(current['close'])
 
-def _check_bear_sfp_quality_new(self, current: dict, pivot: dict) -> bool:
-    """
-    Pine эквивалент quality-фильтра для шорта:
-    bearWickDepth   = (high > ref_high) ? (high - ref_high) : 0
-    bearCloseBackOK = bearWickDepth > 0 and (high - close) >= bearWickDepth * closeBackPct
-    и порог по тик-ам.
-    """
-    ref_high = float(pivot['high'])
-    high     = float(current['high'])
-    close    = float(current['close'])
+        wick_depth = max(ref_low - low, 0.0)
+        m_tick = float(getattr(self, "tick_size", 0.01)) or 0.01
+        wick_ticks = wick_depth / m_tick
+        if wick_ticks < float(getattr(self.config, "wick_min_ticks", 7)):
+            return False
 
-    wick_depth = max(high - ref_high, 0.0)
-    m_tick = float(getattr(self, "tick_size", 0.01))
-    if m_tick <= 0:
-        m_tick = 0.01
-    wick_ticks = wick_depth / m_tick
-    if wick_ticks < float(getattr(self.config, "wick_min_ticks", 7)):
-        return False
+        close_back_pct = float(getattr(self.config, "close_back_pct", 1.0))
+        required_close_back = wick_depth * close_back_pct
+        return (close - low) >= required_close_back
 
-    close_back_pct = float(getattr(self.config, "close_back_pct", 1.0))
-    required_close_back = wick_depth * close_back_pct
-    return (high - close) >= required_close_back
-    
-# ======== /PINE-EXACT SFP DETECTION ========
+    def _check_bear_sfp_quality_new(self, current: dict, pivot: dict) -> bool:
+        """
+        bearWickDepth   = max(high - ref_high, 0)
+        bearCloseBackOK = (high - close) >= bearWickDepth * closeBackPct
+        + порог по тикам.
+        """
+        ref_high = float(pivot['high'])
+        high     = float(current['high'])
+        close    = float(current['close'])
+
+        wick_depth = max(high - ref_high, 0.0)
+        m_tick = float(getattr(self, "tick_size", 0.01)) or 0.01
+        wick_ticks = wick_depth / m_tick
+        if wick_ticks < float(getattr(self.config, "wick_min_ticks", 7)):
+            return False
+
+        close_back_pct = float(getattr(self.config, "close_back_pct", 1.0))
+        required_close_back = wick_depth * close_back_pct
+        return (high - close) >= required_close_back
+
+    # ======== /PINE-EXACT SFP DETECTION ========
+
+    # ---------- MARKET-ордер ----------
     def _place_market_order(self, direction: str, quantity: float, stop_loss: Optional[float] = None):
         if not self.api or not hasattr(self.api, 'place_order'):
             print("API not available for placing order")
@@ -405,7 +371,7 @@ def _check_bear_sfp_quality_new(self, current: dict, pivot: dict) -> bool:
             if order_result is None:
                 return
 
-            # ===== ТОЧЕЧНАЯ ПРАВКА: время входа = время текущего закрытого бара =====
+            # время входа = время текущего закрытого бара
             bar_ts_ms = self._current_bar_ts_ms()
 
             trade_data = {
@@ -429,9 +395,9 @@ def _check_bear_sfp_quality_new(self, current: dict, pivot: dict) -> bool:
                 'take_profit': take_profit,
                 'status': 'open',
                 'armed': not self.config.use_arm_after_rr,
-                'entry_time_ts': bar_ts_ms  # ← сохраняем штамп бара
+                'entry_time_ts': bar_ts_ms
             })
-            # важно: исключаем второй вход на том же баре
+            # исключаем второй вход на том же баре
             self.can_enter_long = False
             self.can_enter_short = False
             print(f"Long entry: {quantity} @ {entry_price}, SL: {stop_loss}, TP: {take_profit}")
@@ -460,7 +426,7 @@ def _check_bear_sfp_quality_new(self, current: dict, pivot: dict) -> bool:
             if order_result is None:
                 return
 
-            # ===== ТОЧЕЧНАЯ ПРАВКА: время входа = время текущего закрытого бара =====
+            # время входа = время текущего закрытого бара
             bar_ts_ms = self._current_bar_ts_ms()
 
             trade_data = {
@@ -484,9 +450,9 @@ def _check_bear_sfp_quality_new(self, current: dict, pivot: dict) -> bool:
                 'take_profit': take_profit,
                 'status': 'open',
                 'armed': not self.config.use_arm_after_rr,
-                'entry_time_ts': bar_ts_ms  # ← сохраняем штамп бара
+                'entry_time_ts': bar_ts_ms
             })
-            # важно: исключаем второй вход на том же баре
+            # исключаем второй вход на том же баре
             self.can_enter_short = False
             self.can_enter_long = False
             print(f"Short entry: {quantity} @ {entry_price}, SL: {stop_loss}, TP: {take_profit}")
@@ -499,7 +465,6 @@ def _check_bear_sfp_quality_new(self, current: dict, pivot: dict) -> bool:
             if not self.api:
                 return None
             ticker = self.api.get_ticker(self.symbol) or {}
-            # используем mark_price, если доступен, иначе last_price
             price = ticker.get('mark_price') or ticker.get('last_price')
             if price is not None:
                 return float(price)
@@ -517,7 +482,7 @@ def _check_bear_sfp_quality_new(self, current: dict, pivot: dict) -> bool:
             stop_size = (entry_price - stop_loss) if direction == "long" else (stop_loss - entry_price)
             if stop_size <= 0:
                 return None
-            quantity = risk_amount / stop_size  # ← qty в ETH
+            quantity = risk_amount / stop_size
             quantity = qty_round(quantity, self.qty_step)
             if self.config.limit_qty_enabled:
                 quantity = min(quantity, self.config.max_qty_manual)
@@ -529,36 +494,36 @@ def _check_bear_sfp_quality_new(self, current: dict, pivot: dict) -> bool:
             return None
 
     def _validate_position_requirements(self, entry_price: float, stop_loss: float,
-                                    take_profit: float, quantity: float) -> bool:
+                                        take_profit: float, quantity: float) -> bool:
         """
         Pine-эквивалент okTrade:
           okTrade = qty > 0
-                and qty >= minOrderQty
-                and expNetPnL >= minNetProfit
+                 and qty >= minOrderQty
+                 and expNetPnL >= minNetProfit
         """
-    try:
-        if quantity is None:
+        try:
+            if quantity is None:
+                return False
+
+            qty = float(quantity)
+            if qty <= 0:
+                return False
+
+            min_order_qty = float(getattr(self.config, "min_order_qty", 0.01))
+            if qty < min_order_qty:
+                return False
+
+            taker = float(getattr(self.config, "taker_fee_rate", 0.00055))
+            gross = abs(float(take_profit) - float(entry_price)) * qty
+            fees  = float(entry_price) * qty * taker * 2.0  # entry + exit
+            net   = gross - fees
+
+            min_net_profit = float(getattr(self.config, "min_net_profit", 1.2))
+            return net >= min_net_profit
+        except Exception as e:
+            print(f"Error validating position: {e}")
             return False
 
-        qty = float(quantity)
-        if qty <= 0:
-            return False
-
-        min_order_qty = float(getattr(self.config, "min_order_qty", 0.01))
-        if qty < min_order_qty:
-            return False
-
-        taker = float(getattr(self.config, "taker_fee_rate", 0.00055))
-        gross = abs(float(take_profit) - float(entry_price)) * qty
-        fees  = float(entry_price) * qty * taker * 2.0  # entry + exit
-        net   = gross - fees
-
-        min_net_profit = float(getattr(self.config, "min_net_profit", 1.2))
-        return net >= min_net_profit
-    except Exception as e:
-        print(f"Error validating position: {e}")
-        return False
-        
     def _is_in_backtest_window(self, current_time: datetime) -> bool:
         print("WARNING: Используется устаревший метод _is_in_backtest_window, нужен UTC вариант")
         start_date = current_time - timedelta(days=self.config.days_back)
@@ -573,7 +538,7 @@ def _check_bear_sfp_quality_new(self, current: dict, pivot: dict) -> bool:
         return current_time >= start_date.replace(tzinfo=None)
 
     def _update_smart_trailing(self, position: Dict):
-        """НОВЫЙ smart trailing с Bar High/Low и Arm механизмом"""
+        """Smart trailing + Arm RR ровно по настройкам"""
         try:
             if not self.config.enable_smart_trail:
                 return
@@ -601,6 +566,7 @@ def _check_bear_sfp_quality_new(self, current: dict, pivot: dict) -> bool:
                     print(f"Position ARMED at {self.config.arm_rr}R")
             if not armed:
                 return
+
             if getattr(self.config, 'use_bar_trail', False):
                 new_sl = self._calculate_bar_trailing_stop(str(direction), float(current_sl))
             else:
@@ -672,17 +638,34 @@ def _check_bear_sfp_quality_new(self, current: dict, pivot: dict) -> bool:
             print(f"Error processing trailing: {e}")
 
     def run_cycle(self):
-        """Основной цикл обработки с НОВОЙ Pine Script логикой"""
+        """
+        Основной цикл обработки (вызов из on_bar_close_15m).
+        Совпадает с Pine: если позиции нет — ищем SFP и входим; иначе обновляем трейлинг.
+        """
         try:
             if not self.candles_15m:
                 return
+
             current_position = self.state.get_current_position()
             if current_position and current_position.get('status') == 'open':
                 self._update_smart_trailing(current_position)
-            else:
-                self.on_bar_close()
+                return
+
+            # сигнал на текущем закрытом баре
+            if len(self.candles_15m) < int(getattr(self.config, "sfp_len", 2)) + 2:
+                return
+
+            current_ts = int(self.candles_15m[0]['timestamp'])
+            if not self._is_in_backtest_window_utc(current_ts):
+                return
+
+            if self._detect_bull_sfp() and self.can_enter_long:
+                self._process_long_entry()
+            elif self._detect_bear_sfp() and self.can_enter_short:
+                self._process_short_entry()
+
         except Exception as e:
-            print(f"Error in run_cycle: {str(e) if e else 'Unknown error'}")
+            print(f"[run_cycle ERROR] {e}")
 
     def _update_equity(self):
         """Обновление equity"""
