@@ -139,7 +139,7 @@ def fetch_bybit_v5_window(symbol: str, days: int, interval: str = "15", category
     if out:
         first_dt = datetime.utcfromtimestamp(out[0]["timestamp"]/1000)
         last_dt  = datetime.utcfromtimestamp(out[-1]["timestamp"]/1000)
-        st.success(f"✅ Свечи Bybit v5 загружены: {len(out)} шт • {first_dt:%Y-%m-%d %H:%M} — {last_dt:%Y-%m-%d %H:%M} UTC")
+        st.success(f"✅ Свечи Bybit v5 загружены: {len(out)} шт • {first_dt:%Y-%m-%d %H:%М} — {last_dt:%Y-%m-%d %H:%М} UTC")
     else:
         st.warning("Bybit v5 вернул пустой набор за выбранный период.")
 
@@ -196,6 +196,9 @@ def main():
         enable_smart_trail = st.checkbox("Smart Trailing", value=True)
         trailing_perc      = st.number_input("Trailing % (of entry)", min_value=0.0, max_value=5.0, value=0.5, step=0.1)
         trailing_offset    = st.number_input("Trailing Offset %",   min_value=0.0, max_value=2.0, value=0.4, step=0.1)
+        # +++ ДОБАВЛЕНО UI ДЛЯ ARM +++
+        arm_after_rr       = st.checkbox("Arm after RR", value=True)
+        arm_rr             = st.number_input("ARM RR (R)", min_value=0.1, max_value=5.0, value=0.5, step=0.1)
     with c3:
         use_sfp_quality = st.checkbox("SFP Quality Filter", value=True)
         wick_min_ticks  = st.number_input("Min Wick Ticks", min_value=1, max_value=20, value=7, step=1)
@@ -216,6 +219,10 @@ def main():
                 config.trailing_offset_perc = float(trailing_offset)
                 config.trailing_offset = float(trailing_offset)
 
+                # +++ ПРОКИНУЛИ ARM В CONFIG +++
+                config.use_arm_after_rr = bool(arm_after_rr)
+                config.arm_rr = float(arm_rr)
+
                 config.use_sfp_quality = bool(use_sfp_quality)
                 config.wick_min_ticks = int(wick_min_ticks)
                 config.close_back_pct = float(close_back_pct if close_back_pct <= 1 else close_back_pct / 100.0)
@@ -230,12 +237,12 @@ def main():
                     strategy.qty_step       = 0.001
                     strategy.min_order_qty  = 0.001
                 else:
-    # дефолт на всякий случай
-                     strategy.tick_size      = 0.01
-                     strategy.qty_step       = 0.001
-                     strategy.min_order_qty  = 0.001
+                    # дефолт на всякий случай
+                    strategy.tick_size      = 0.01
+                    strategy.qty_step       = 0.001
+                    strategy.min_order_qty  = 0.001
 
-# синхронизируем в config – часть проверок читает оттуда
+                # синхронизируем в config – часть проверок читает оттуда
                 config.tick_size = strategy.tick_size
                 config.qty_step = strategy.qty_step
                 config.min_order_qty = strategy.min_order_qty
@@ -340,6 +347,61 @@ def run_backtest(strategy: KWINStrategy, period_days: int, start_capital: float)
         pos["exit_time"]  = datetime.utcfromtimestamp(int(ts_ms)/1000)
         state.set_position(pos)
 
+    # ===== 2.5) Pine-подобный Smart Trailing для синтетики (как в real) =====
+    def apply_smart_trail(pos: dict, bar_high: float, bar_low: float) -> None:
+        cfg = strategy.config
+        if not getattr(cfg, "enable_smart_trail", True):
+            return
+        if not pos or pos.get("status") != "open":
+            return
+
+        entry = float(pos["entry_price"])
+        sl    = float(pos.get("stop_loss") or 0.0)
+        if entry <= 0 or sl <= 0:
+            return
+
+        # anchor экстремум с момента входа
+        if pos["direction"] == "long":
+            anchor = float(pos.get("trail_anchor", entry))
+            anchor = max(anchor, float(bar_high))
+            pos["trail_anchor"] = anchor
+        else:
+            anchor = float(pos.get("trail_anchor", entry))
+            anchor = min(anchor, float(bar_low))
+            pos["trail_anchor"] = anchor
+        state.set_position(pos)
+
+        # ARM по RR
+        armed = bool(pos.get("armed", not getattr(cfg, "use_arm_after_rr", True)))
+        if not armed and getattr(cfg, "use_arm_after_rr", True):
+            risk = abs(entry - sl)
+            if risk > 0:
+                if pos["direction"] == "long":
+                    rr = (float(bar_high) - entry) / risk
+                else:
+                    rr = (entry - float(bar_low)) / risk
+                if rr >= float(getattr(cfg, "arm_rr", 0.5)):
+                    armed = True
+                    pos["armed"] = True
+                    state.set_position(pos)
+        if not armed:
+            return
+
+        # процентный стоп от entry с отступом
+        trail_dist  = entry * (float(getattr(cfg, "trailing_perc", 0.5)) / 100.0)
+        offset_dist = entry * (float(getattr(cfg, "trailing_offset_perc", 0.4)) / 100.0)
+
+        if pos["direction"] == "long":
+            candidate = anchor - trail_dist - offset_dist
+            if candidate > sl:
+                pos["stop_loss"] = candidate
+                state.set_position(pos)
+        else:
+            candidate = anchor + trail_dist + offset_dist
+            if candidate < sl:
+                pos["stop_loss"] = candidate
+                state.set_position(pos)
+
     # 3) Прогон от старых к новым =====
     for bar in candles:
         # гарантируем типы
@@ -350,43 +412,45 @@ def run_backtest(strategy: KWINStrategy, period_days: int, start_capital: float)
         c = float(bar["close"])
 
         # 1) сначала обновим "текущую цену" для стратегии
-        paper_api.set_price(c)
+        paper.set_price(c)  # <-- БЫЛО paper_api.set_price(c)
 
-        # 2) ДАЙ СТРАТЕГИИ ШАНС ПОДВИНУТЬ СТОП ПРЯМО СЕЙЧАС (до проверки SL/TP на этом баре)
-        try:
-            strategy.process_trailing()  # если позиция открыта - обновит SL (smart trailing)
-        except Exception as e:
-            print(f"[BT] trailing update error: {e}")
-
-     # 3) теперь проверяем SL/TP на текущем баре с уже обновлённым стопом
+        # 2) СНАЧАЛА даём Pine-трейлу подвигать SL на этом баре
         pos = state.get_current_position()
-    if pos and pos.get("status") == "open":
-        sl = float(pos.get("stop_loss") or 0)
-        tp = pos.get("take_profit")
-        if pos["direction"] == "long":
-            if sl > 0 and l <= sl:
-                close_position(sl, ts_ms)
-            elif tp is not None and h >= float(tp):
-                close_position(float(tp), ts_ms)
-        else:  # short
-            if sl > 0 and h >= sl:
-                close_position(sl, ts_ms)
-            elif tp is not None and l <= float(tp):
-                close_position(float(tp), ts_ms)
+        if pos and pos.get("status") == "open":
+            apply_smart_trail(pos, bar_high=h, bar_low=l)
 
-     # 4) подаём закрытие 15m бара в стратегию (внутри может открыться новая позиция
-     #    и/или сработать внутренняя логика)
-    before_pos = state.get_current_position()
-    strategy.on_bar_close_15m({"timestamp": ts_ms, "open": o, "high": h, "low": l, "close": c})
-    after_pos = state.get_current_position()
+        # 3) теперь проверяем SL/TP на текущем баре с уже обновлённым стопом
+        pos = state.get_current_position()
+        if pos and pos.get("status") == "open":
+            sl = float(pos.get("stop_loss") or 0)
+            tp = pos.get("take_profit")
+            if pos["direction"] == "long":
+                if sl > 0 and l <= sl:
+                    _close(sl, ts_ms)  # <-- БЫЛО close_position
+                elif tp is not None and h >= float(tp):
+                    _close(float(tp), ts_ms)
+            else:  # short
+                if sl > 0 and h >= sl:
+                    _close(sl, ts_ms)
+                elif tp is not None and l <= float(tp):
+                    _close(float(tp), ts_ms)
 
-    # если на этом баре открылась позиция — проставим время входа ровно по бару
-    if after_pos and after_pos is not before_pos and after_pos.get("status") == "open" and "entry_time_ts" not in after_pos:
-        after_pos["entry_time_ts"] = ts_ms
-        state.set_position(after_pos)
+        # 4) подаём закрытие 15m бара в стратегию (возможен вход)
+        before_pos = state.get_current_position()
+        strategy.on_bar_close_15m({"timestamp": ts_ms, "open": o, "high": h, "low": l, "close": c})
+        after_pos = state.get_current_position()
 
-    # 5) снимем equity на конец бара
-    equity_points.append({"timestamp": int(ts_ms), "equity": float(state.get_equity() or start_capital)})
+        # если на этом баре открылась позиция — проставим время входа, ARM и trail_anchor от entry
+        if after_pos and after_pos is not before_pos and after_pos.get("status") == "open":
+            if "entry_time_ts" not in after_pos:
+                after_pos["entry_time_ts"] = ts_ms
+            after_pos["armed"] = not getattr(strategy.config, "use_arm_after_rr", True)
+            after_pos["trail_anchor"] = float(after_pos["entry_price"])
+            state.set_position(after_pos)
+
+        # 5) снимем equity на конец бара
+        equity_points.append({"timestamp": int(ts_ms), "equity": float(state.get_equity() or start_capital)})
+
     # Закроем хвост, если осталось открыто
     pos = state.get_current_position()
     if pos and pos.get("status") == "open":
@@ -402,6 +466,7 @@ def run_backtest(strategy: KWINStrategy, period_days: int, start_capital: float)
         "final_equity": float(state.get_equity() or start_capital),
         "initial_equity": float(start_capital),
     }
+
 # ===================== реальный прогон через стратегию =====================
 def run_backtest_real(strategy: KWINStrategy, candles: list[dict], start_capital: float):
     """
@@ -497,7 +562,7 @@ def run_backtest_real(strategy: KWINStrategy, candles: list[dict], start_capital
         pos["exit_time"]  = datetime.utcfromtimestamp(int(ts_ms)/1000)
         state.set_position(pos)
 
-    # ----------- ВСТАВКА: Pine-подобный Smart Trailing с якорем экстремума -----------
+    # ----------- Pine-подобный Smart Trailing с якорем экстремума -----------
     def apply_smart_trail(pos: dict, bar_high: float, bar_low: float) -> None:
         """
         Pine-эквивалент процентного трейла:
@@ -616,6 +681,7 @@ def run_backtest_real(strategy: KWINStrategy, candles: list[dict], start_capital
         "final_equity": float(state.get_equity() or start_capital),
         "initial_equity": float(start_capital),
     }
+
 # ========================================================================
 def display_backtest_results(results):
     trades_df = results["trades_df"]
