@@ -24,36 +24,36 @@ class KWINStrategy:
         self.analytics = TradingAnalytics()
 
         # Внутренние данные (crash-safe state)
-        self.candles_15m = []
-        self.candles_1m = []
-        self.candles_1h = []  # ← добавлено
+        self.candles_15m: List[Dict] = []
+        self.candles_1m: List[Dict] = []
+        self.candles_1h: List[Dict] = []
         self.last_processed_time = None
         self.last_processed_bar_ts = 0  # Для восстановления после crash
 
         # Trade state (зафиксированные значения для RR расчета)
-        self.entry_price = None
-        self.entry_sl = None
-        self.trade_id = None
-        self.armed = False  # ArmRR статус
+        self.entry_price: Optional[float] = None
+        self.entry_sl: Optional[float] = None
+        self.trade_id: Optional[int] = None
+        self.armed: bool = False  # ArmRR статус
 
-        # Версионирование стратегии
+        # Версия стратегии
         self.strategy_version = "2.0.1"
 
         # Состояние входов
         self.can_enter_long = True
         self.can_enter_short = True
-        self.last_candle_close_15m = None
+        self.last_candle_close_15m: Optional[int] = None
 
-        # Инструмент (используем из конфига)
+        # Инструмент (из конфига)
         self.symbol = self.config.symbol
         self.tick_size = 0.01
         self.qty_step = 0.01
         self.min_order_qty = 0.01
 
-        # Получаем информацию об инструменте
+        # Информация об инструменте
         self._init_instrument_info()
 
-        # Критичный патч: нормализация close_back_pct к диапазону [0..1]
+        # Нормализация close_back_pct к [0..1]
         if self.config.close_back_pct > 1.0:
             self.config.close_back_pct = self.config.close_back_pct / 100.0
         elif self.config.close_back_pct < 0.0:
@@ -91,7 +91,7 @@ class KWINStrategy:
         except Exception as e:
             print(f"Error initializing instrument info: {e}")
 
-        # Если биржа дала фильтры - синхронизируем в конфиг
+        # Синхронизируем в конфиг
         if self.qty_step and self.qty_step > 0:
             self.config.qty_step = self.qty_step
         if self.min_order_qty and self.min_order_qty > 0:
@@ -104,6 +104,8 @@ class KWINStrategy:
             self.qty_step = 0.01
         if not self.min_order_qty or self.min_order_qty <= 0:
             self.min_order_qty = 0.01
+
+    # ==================== Приём закрытых баров ====================
 
     def on_bar_close_15m(self, candle: Dict):
         """ТОЧНАЯ синхронизация с Pine Script: обработка только закрытых 15м баров"""
@@ -152,6 +154,8 @@ class KWINStrategy:
         """Обработка 1м баров для дополнительного мониторинга"""
         pass
 
+    # ==================== Пуллинг свечей с биржи ====================
+
     def update_candles(self):
         """Обновление свечей с биржи"""
         try:
@@ -191,6 +195,8 @@ class KWINStrategy:
                 self.on_bar_close()
         except Exception as e:
             print(f"Error updating candles: {str(e) if e else 'Unknown error'}")
+
+    # ==================== Логика входов ====================
 
     def on_bar_close(self):
         """Обработка новой 15-минутной свечи"""
@@ -250,7 +256,7 @@ class KWINStrategy:
 
         cond_pivot = self._is_prev_pivot_low(sfpLen, right=1)
         cond_break = float(curr['low']) < ref_low
-        cond_close = float(curr['open']) > ref_low and float(curr['close']) > ref_low
+        cond_close = float(curr['open']) > ref_low and float(curr['close']) > ref_low  # <-- только 'and'
 
         if cond_pivot and cond_break and cond_close:
             if getattr(self.config, "use_sfp_quality", True):
@@ -272,7 +278,7 @@ class KWINStrategy:
 
         cond_pivot = self._is_prev_pivot_high(sfpLen, right=1)
         cond_break = float(curr['high']) > ref_high
-        cond_close = float(curr['open']) < ref_high and float(curr['close']) < ref_high
+        cond_close = float(curr['open']) < ref_high and float(curr['close']) < ref_high  # <-- только 'and'
 
         if cond_pivot and cond_break and cond_close:
             if getattr(self.config, "use_sfp_quality", True):
@@ -320,9 +326,8 @@ class KWINStrategy:
         required_close_back = wick_depth * close_back_pct
         return (high - close) >= required_close_back
 
-    # ======== /PINE-EXACT SFP DETECTION ========
+    # ==================== Ордеры / вход ====================
 
-    # ---------- MARKET-ордер ----------
     def _place_market_order(self, direction: str, quantity: float, stop_loss: Optional[float] = None):
         if not self.api or not hasattr(self.api, 'place_order'):
             print("API not available for placing order")
@@ -330,8 +335,8 @@ class KWINStrategy:
         side_up = "Buy" if direction == "long" else "Sell"
         side_lo = "buy" if direction == "long" else "sell"
         qty = float(quantity)
-        # пробуем стиль v5: orderType
         try:
+            # стиль v5
             return self.api.place_order(
                 symbol=self.symbol,
                 side=side_up,
@@ -339,4 +344,379 @@ class KWINStrategy:
                 qty=qty,
                 stop_loss=stop_loss
             )
-    ...
+        except TypeError:
+            # snake_case стиль
+            return self.api.place_order(
+                symbol=self.symbol,
+                side=side_lo,
+                order_type="market",
+                qty=qty,
+                stop_loss=stop_loss
+            )
+
+    def _process_long_entry(self):
+        """Обработка входа в лонг"""
+        try:
+            current_price = self._get_current_price()
+            if not current_price:
+                return
+            if len(self.candles_15m) < 2:
+                return
+            stop_loss = float(self.candles_15m[1]['low'])
+            entry_price = float(current_price)
+            quantity = self._calculate_position_size(entry_price, stop_loss, "long")
+            if not quantity:
+                return
+            stop_size = entry_price - stop_loss
+            take_profit = entry_price + stop_size * self.config.risk_reward
+            if not self._validate_position_requirements(entry_price, stop_loss, take_profit, quantity):
+                return
+
+            order_result = self._place_market_order("long", quantity, stop_loss=stop_loss)
+            if order_result is None:
+                return
+
+            bar_ts_ms = self._current_bar_ts_ms()
+
+            trade_data = {
+                'symbol': self.symbol,
+                'direction': 'long',
+                'entry_price': entry_price,
+                'stop_loss': stop_loss,
+                'take_profit': take_profit,
+                'quantity': float(quantity),
+                'entry_time': datetime.utcfromtimestamp(bar_ts_ms / 1000) if bar_ts_ms else datetime.utcnow(),
+                'status': 'open'
+            }
+            self.db.save_trade(trade_data)
+
+            self.state.set_position({
+                'symbol': self.symbol,
+                'direction': 'long',
+                'size': float(quantity),
+                'entry_price': entry_price,
+                'stop_loss': stop_loss,
+                'take_profit': take_profit,
+                'status': 'open',
+                'armed': not self.config.use_arm_after_rr,
+                'entry_time_ts': bar_ts_ms
+            })
+            self.can_enter_long = False
+            self.can_enter_short = False
+            print(f"Long entry: {quantity} @ {entry_price}, SL: {stop_loss}, TP: {take_profit}")
+        except Exception as e:
+            print(f"Error processing long entry: {str(e) if e else 'Unknown error'}")
+
+    def _process_short_entry(self):
+        """Обработка входа в шорт"""
+        try:
+            current_price = self._get_current_price()
+            if not current_price:
+                return
+            if len(self.candles_15m) < 2:
+                return
+            stop_loss = float(self.candles_15m[1]['high'])
+            entry_price = float(current_price)
+            quantity = self._calculate_position_size(entry_price, stop_loss, "short")
+            if not quantity:
+                return
+            stop_size = stop_loss - entry_price
+            take_profit = entry_price - stop_size * self.config.risk_reward
+            if not self._validate_position_requirements(entry_price, stop_loss, take_profit, quantity):
+                return
+
+            order_result = self._place_market_order("short", quantity, stop_loss=stop_loss)
+            if order_result is None:
+                return
+
+            bar_ts_ms = self._current_bar_ts_ms()
+
+            trade_data = {
+                'symbol': self.symbol,
+                'direction': 'short',
+                'entry_price': entry_price,
+                'stop_loss': stop_loss,
+                'take_profit': take_profit,
+                'quantity': float(quantity),
+                'entry_time': datetime.utcfromtimestamp(bar_ts_ms / 1000) if bar_ts_ms else datetime.utcnow(),
+                'status': 'open'
+            }
+            self.db.save_trade(trade_data)
+
+            self.state.set_position({
+                'symbol': self.symbol,
+                'direction': 'short',
+                'size': float(quantity),
+                'entry_price': entry_price,
+                'stop_loss': stop_loss,
+                'take_profit': take_profit,
+                'status': 'open',
+                'armed': not self.config.use_arm_after_rr,
+                'entry_time_ts': bar_ts_ms
+            })
+            self.can_enter_short = False
+            self.can_enter_long = False
+            print(f"Short entry: {quantity} @ {entry_price}, SL: {stop_loss}, TP: {take_profit}")
+        except Exception as e:
+            print(f"Error processing short entry: {str(e) if e else 'Unknown error'}")
+
+    # ==================== Поддержка позиции / трейлинг ====================
+
+    def _get_current_price(self) -> Optional[float]:
+        """Получить текущую цену"""
+        try:
+            if not self.api:
+                return None
+            ticker = self.api.get_ticker(self.symbol) or {}
+            price = ticker.get('mark_price') or ticker.get('last_price')
+            if price is not None:
+                return float(price)
+        except Exception as e:
+            print(f"Error getting current price: {str(e) if e else 'Unknown error'}")
+        return None
+
+    def _calculate_position_size(self, entry_price: float, stop_loss: float, direction: str) -> Optional[float]:
+        """Расчет размера позиции (qty в базовом активе, напр. ETH)"""
+        try:
+            equity = self.state.get_equity()
+            if equity is None or equity <= 0:
+                return None
+            risk_amount = equity * (self.config.risk_pct / 100.0)
+            stop_size = (entry_price - stop_loss) if direction == "long" else (stop_loss - entry_price)
+            if stop_size <= 0:
+                return None
+            quantity = risk_amount / stop_size
+            quantity = qty_round(quantity, self.qty_step)
+            if self.config.limit_qty_enabled:
+                quantity = min(quantity, self.config.max_qty_manual)
+            if quantity < self.min_order_qty:
+                return None
+            return float(quantity)
+        except Exception as e:
+            print(f"Error calculating position size: {e}")
+            return None
+
+    def _validate_position_requirements(self, entry_price: float, stop_loss: float,
+                                        take_profit: float, quantity: float) -> bool:
+        """
+        Pine-эквивалент okTrade:
+          okTrade = qty > 0
+                 and qty >= minOrderQty
+                 and expNetPnL >= minNetProfit
+        """
+        try:
+            if quantity is None:
+                return False
+
+            qty = float(quantity)
+            if qty <= 0:
+                return False
+
+            min_order_qty = float(getattr(self.config, "min_order_qty", 0.01))
+            if qty < min_order_qty:
+                return False
+
+            taker = float(getattr(self.config, "taker_fee_rate", 0.00055))
+            gross = abs(float(take_profit) - float(entry_price)) * qty
+            fees  = float(entry_price) * qty * taker * 2.0  # entry + exit
+            net   = gross - fees
+
+            min_net_profit = float(getattr(self.config, "min_net_profit", 1.2))
+            return net >= min_net_profit
+        except Exception as e:
+            print(f"Error validating position: {e}")
+            return False
+
+    def _is_in_backtest_window(self, current_time: datetime) -> bool:
+        print("WARNING: Используется устаревший метод _is_in_backtest_window, нужен UTC вариант")
+        start_date = current_time - timedelta(days=self.config.days_back)
+        return current_time >= start_date
+
+    def _is_in_backtest_window_utc(self, current_timestamp: int) -> bool:
+        """UTC-полночь как в Pine Script"""
+        utc_now = datetime.utcnow().replace(tzinfo=timezone.utc)
+        utc_midnight = utc_now.replace(hour=0, minute=0, second=0, microsecond=0)
+        start_date = utc_midnight - timedelta(days=self.config.days_back)
+        current_time = datetime.utcfromtimestamp(current_timestamp / 1000)
+        return current_time >= start_date.replace(tzinfo=None)
+
+    def _update_smart_trailing(self, position: Dict):
+        """
+        Pine-эквивалент Smart Trailing:
+        - anchor = экстремум с момента входа (high для long, low для short)
+        - ARM по RR (от текущей цены; при арминге сохраняем флаг)
+        - стоп = anchor ± (entry * trailing_perc% + entry * offset_perc%)
+        - стоп двигаем только в сторону сокращения риска (монотонно)
+        """
+        try:
+            if not self.config.enable_smart_trail:
+                return
+
+            direction = position.get('direction')
+            entry = float(position.get('entry_price') or 0)
+            sl = float(position.get('stop_loss') or 0)
+            if not direction or entry <= 0 or sl <= 0:
+                return
+
+            # 1) Текущая цена для ARM
+            price = self._get_current_price()
+            if price is None:
+                return
+            price = float(price)
+
+            # 2) ARM по RR (если включено)
+            armed = bool(position.get('armed', not getattr(self.config, 'use_arm_after_rr', True)))
+            if not armed and getattr(self.config, 'use_arm_after_rr', True):
+                risk = abs(entry - sl)
+                if risk > 0:
+                    if direction == 'long':
+                        rr = (price - entry) / risk
+                    else:
+                        rr = (entry - price) / risk
+                    if rr >= float(getattr(self.config, 'arm_rr', 0.5)):
+                        armed = True
+                        position['armed'] = True
+                        self.state.set_position(position)
+                        print(f"Position ARMED at {self.config.arm_rr}R")
+            if not armed:
+                return
+
+            # 3) Поддерживаем якорь экстремума с момента входа
+            anchor = float(position.get('trail_anchor') or entry)
+            try:
+                last_bar = self.candles_15m[0] if self.candles_15m else None
+                bar_high = float(last_bar['high']) if last_bar else price
+                bar_low  = float(last_bar['low'])  if last_bar else price
+            except Exception:
+                bar_high, bar_low = price, price
+
+            if direction == 'long':
+                anchor = max(anchor, bar_high)
+            else:
+                anchor = min(anchor, bar_low)
+
+            if anchor != position.get('trail_anchor'):
+                position['trail_anchor'] = anchor
+                self.state.set_position(position)
+
+            # 4) Расчёт процентного трейла от entry + offset (в процентах от entry)
+            trail_perc  = float(getattr(self.config, 'trailing_perc', 0.5)) / 100.0
+            offset_perc = float(getattr(self.config, 'trailing_offset_perc', 0.4)) / 100.0
+            trail_dist  = entry * trail_perc
+            offset_dist = entry * offset_perc
+
+            if direction == 'long':
+                candidate = anchor - trail_dist - offset_dist
+                if candidate > sl:  # только ужесточаем
+                    self._update_stop_loss(position, candidate)
+            else:
+                candidate = anchor + trail_dist + offset_dist
+                if candidate < sl:  # только ужесточаем
+                    self._update_stop_loss(position, candidate)
+
+        except Exception as e:
+            print(f"Error in smart trailing: {e}")
+
+    def _calculate_bar_trailing_stop(self, direction: str, current_sl: float) -> Optional[float]:
+        try:
+            lookback = getattr(self.config, 'trail_lookback', 50) or 50
+            if len(self.candles_15m) < lookback:
+                return current_sl
+            history_bars = self.candles_15m[1:lookback + 1]
+            if direction == 'long':
+                min_low = min(bar['low'] for bar in history_bars)
+                new_sl = max(min_low, current_sl)
+            else:
+                max_high = max(bar['high'] for bar in history_bars)
+                new_sl = min(max_high, current_sl)
+            return new_sl
+        except Exception as e:
+            print(f"Error calculating bar trailing stop: {e}")
+            return current_sl
+
+    def _calculate_percentage_trailing_stop(self, direction: str, current_price: float, current_sl: float) -> Optional[float]:
+        try:
+            trail_pct = getattr(self.config, 'trailing_perc', 0.5) / 100.0
+            if direction == 'long':
+                trail_distance = current_price * trail_pct
+                new_sl = current_price - trail_distance
+                return max(new_sl, current_sl)
+            else:
+                trail_distance = current_price * trail_pct
+                new_sl = current_price + trail_distance
+                return min(new_sl, current_sl)
+        except Exception as e:
+            print(f"Error calculating percentage trailing stop: {e}")
+            return current_sl
+
+    def _update_stop_loss(self, position: Dict, new_sl: float):
+        try:
+            if not self.api or not hasattr(self.api, "modify_order"):
+                return False
+            _ = self.api.modify_order(symbol=position['symbol'], stop_loss=new_sl)
+            position['stop_loss'] = new_sl
+            self.state.set_position(position)
+            print(f"[TRAIL] SL -> {new_sl:.4f}")
+            return True
+        except Exception as e:
+            print(f"Error updating stop loss: {e}")
+            return False
+
+    def process_trailing(self):
+        """LEGACY метод для обратной совместимости"""
+        try:
+            current_position = self.state.get_current_position()
+            if current_position and current_position.get('status') == 'open':
+                self._update_smart_trailing(current_position)
+        except Exception as e:
+            print(f"Error processing trailing: {e}")
+
+    def run_cycle(self):
+        """
+        Основной цикл обработки (вызов из on_bar_close_15m).
+        Совпадает с Pine: если позиции нет — ищем SFP и входим; иначе обновляем трейлинг.
+        """
+        try:
+            if not self.candles_15m:
+                return
+
+            current_position = self.state.get_current_position()
+            if current_position and current_position.get('status') == 'open':
+                self._update_smart_trailing(current_position)
+                return
+
+            # сигнал на текущем закрытом баре
+            if len(self.candles_15m) < int(getattr(self.config, "sfp_len", 2)) + 2:
+                return
+
+            current_ts = int(self.candles_15m[0]['timestamp'])
+            if not self._is_in_backtest_window_utc(current_ts):
+                return
+
+            if self._detect_bull_sfp() and self.can_enter_long:
+                self._process_long_entry()
+            elif self._detect_bear_sfp() and self.can_enter_short:
+                self._process_short_entry()
+
+        except Exception as e:
+            print(f"[run_cycle ERROR] {e}")
+
+    # ==================== Equity (live) ====================
+
+    def _update_equity(self):
+        """Обновление equity"""
+        try:
+            if not self.api:
+                return
+            wallet = self.api.get_wallet_balance()
+            if wallet and wallet.get("list"):
+                for account in wallet["list"]:
+                    if account.get("accountType") == "SPOT":
+                        for coin in account.get("coin", []):
+                            if coin.get("coin") == "USDT":
+                                equity = float(coin.get("equity", 0))
+                                self.state.set_equity(equity)
+                                self.db.save_equity_snapshot(equity)
+                                break
+        except Exception as e:
+            print(f"Error updating equity: {str(e) if e else 'Unknown error'}")
