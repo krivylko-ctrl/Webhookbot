@@ -26,42 +26,75 @@ state = StateManager(db)
 # ===================== ДОБАВЛЕНО: прямой загрузчик Bybit v5 =====================
 BYBIT_V5_URL = "https://api.bybit.com/v5/market/kline"
 
+BYBIT_V5_URL = "https://api.bybit.com/v5/market/kline"
+
 def fetch_bybit_v5_window(symbol: str, days: int, interval: str = "15", category: str = "linear") -> list[dict]:
     """
-    Реальные 15m свечи Bybit v5 за окно [UTC-сейчас - days, UTC-сейчас].
-    Идём кусками по 1000 баров по параметрам start/end (мс).
-    Возвращаем список {timestamp, open, high, low, close, volume} (timestamp в мс, отсортирован).
+    Реальные 15m свечи Bybit v5 за окно [UTC-сейчас - days, UTC-сейчас] с пагинацией.
+    Возвращает список словарей {timestamp, open, high, low, close, volume} (timestamp в мс, возрастающий).
     """
     now_ms = int(datetime.utcnow().timestamp() * 1000)
     start_ms = now_ms - days * 24 * 60 * 60 * 1000
     end_ms = now_ms
 
-    limit = 1000
-    tf_ms = 15 * 60 * 1000
-    chunk_ms = limit * tf_ms
+    limit = 1000                 # макс. у v5
+    tf_ms = 15 * 60 * 1000       # 15m в миллисекундах
+    chunk_ms = limit * tf_ms     # сколько мс тянем за один запрос
 
     out = []
     cursor_start = start_ms
+    request_id = 0
+
     while cursor_start <= end_ms:
+        request_id += 1
         cursor_end = min(end_ms, cursor_start + chunk_ms - 1)
+
         params = {
             "category": category,
-            "symbol": symbol,
-            "interval": interval,
-            "start": cursor_start,  # ms
-            "end": cursor_end,      # ms
-            "limit": limit,
+            "symbol": symbol.upper(),
+            "interval": str(interval),     # "15"
+            "start": int(cursor_start),    # ms
+            "end": int(cursor_end),        # ms
+            "limit": int(limit),
         }
-        r = requests.get(BYBIT_V5_URL, params=params, timeout=15)
-        r.raise_for_status()
-        data = r.json()
+
+        # диагностическая подпись текущего чанка
+        st.caption(f"▸ Bybit v5 запрос #{request_id}: {datetime.utcfromtimestamp(params['start']/1000):%Y-%m-%d %H:%M} → "
+                   f"{datetime.utcfromtimestamp(params['end']/1000):%Y-%m-%d %H:%M} UTC")
+
+        try:
+            r = requests.get(BYBIT_V5_URL, params=params, timeout=20)
+            status = r.status_code
+        except Exception as net_err:
+            st.error(f"Сетевой сбой при обращении к Bybit v5: {net_err}")
+            break
+
+        if status != 200:
+            st.error(f"HTTP {status} от Bybit v5 (chunk #{request_id}). Тело: {r.text[:300]}")
+            break
+
+        try:
+            data = r.json()
+        except Exception:
+            st.error(f"Невалидный JSON от Bybit v5 (chunk #{request_id}). Тело: {r.text[:300]}")
+            break
+
+        # Стандартный ответ Bybit v5 имеет retCode/retMsg
+        ret_code = data.get("retCode")
+        ret_msg  = data.get("retMsg")
+        if ret_code not in (0, "0"):
+            st.error(f"Bybit v5 retCode={ret_code}, retMsg={ret_msg}. "
+                     f"Параметры: symbol={symbol}, interval={interval}, category={category}")
+            break
+
         rows = ((data.get("result") or {}).get("list") or [])
         if not rows:
-            # иногда на самом краю окна пусто — сдвигаемся вперёд
+            # Пусто в этом сегменте — сдвигаем курсор вперёд, чтобы не зациклиться
             cursor_start = cursor_end + 1
             continue
 
-        for row in rows:   # [start, open, high, low, close, volume, turnover]
+        # v5: [start, open, high, low, close, volume, turnover]
+        for row in rows:
             ts = int(row[0])
             if start_ms <= ts <= end_ms:
                 out.append({
@@ -73,16 +106,17 @@ def fetch_bybit_v5_window(symbol: str, days: int, interval: str = "15", category
                     "volume": float(row[5]) if row[5] is not None else 0.0,
                 })
 
-        cursor_start = int(rows[-1][0]) + 1  # следующий кусок
+        # следующий кусок
+        cursor_start = int(rows[-1][0]) + 1
 
     # дедуп и сортировка
     out = sorted({b["timestamp"]: b for b in out}.values(), key=lambda x: x["timestamp"])
 
-    # диагностическая подпись диапазона
     if out:
         first_dt = datetime.utcfromtimestamp(out[0]["timestamp"]/1000)
         last_dt  = datetime.utcfromtimestamp(out[-1]["timestamp"]/1000)
-        st.caption(f"Свечи Bybit v5: {len(out)} шт • {first_dt:%Y-%m-%d %H:%M} — {last_dt:%Y-%m-%d %H:%M} UTC")
+        st.success(f"✅ Свечи Bybit v5 загружены: {len(out)} шт • "
+                   f"{first_dt:%Y-%m-%d %H:%M} — {last_dt:%Y-%m-%d %H:%M} UTC")
     else:
         st.warning("Bybit v5 вернул пустой набор за выбранный период.")
 
