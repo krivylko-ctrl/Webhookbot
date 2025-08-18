@@ -4,7 +4,7 @@ import numpy as np
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from datetime import datetime, timedelta, timezone
-import requests   # ← ДОБАВЛЕНО: нужен для прямого запроса v5
+import requests   # ← добавлено: прямой REST к Bybit v5
 import sys
 import os
 
@@ -17,27 +17,25 @@ from config import Config
 from bybit_api import BybitAPI  # используется только для совместимости импортов
 from state_manager import StateManager
 
-# -------------------- Глобальные заглушки для бэктеста --------------------
-# одна БД и один StateManager на сессию
+# -------------------- Глобальные объекты --------------------
 api = None
-db = Database(memory=True)            # или Database("kwin_bot.db") — если хочешь файл
+db = Database(memory=True)            # или Database("kwin_bot.db")
 state = StateManager(db)
 
-# ===================== ДОБАВЛЕНО: прямой загрузчик Bybit v5 =====================
+# ===================== Прямой загрузчик Bybit v5 (реальные свечи) =====================
 BYBIT_V5_URL = "https://api.bybit.com/v5/market/kline"
 
 def fetch_bybit_v5_window(symbol: str, days: int, interval: str = "15", category: str = "linear") -> list[dict]:
     """
-    Реальные 15m свечи Bybit v5 за окно [UTC-сейчас - days, UTC-сейчас].
-    Идём кусками по 1000 баров по параметрам start/end (мс).
-    Возвращаем список {timestamp, open, high, low, close, volume} (timestamp в мс, отсортирован).
+    Реальные 15m свечи Bybit v5 за окно [UTC-сейчас - days, UTC-сейчас] с пагинацией.
+    Возвращает [{timestamp(ms), open, high, low, close, volume}], отсортировано.
     """
-    now_ms = int(datetime.utcnow().timestamp() * 1000)
+    now_ms   = int(datetime.utcnow().timestamp() * 1000)
     start_ms = now_ms - days * 24 * 60 * 60 * 1000
-    end_ms = now_ms
+    end_ms   = now_ms
 
-    limit = 1000
-    tf_ms = 15 * 60 * 1000
+    limit   = 1000
+    tf_ms   = 15 * 60 * 1000
     chunk_ms = limit * tf_ms
 
     out = []
@@ -48,8 +46,8 @@ def fetch_bybit_v5_window(symbol: str, days: int, interval: str = "15", category
             "category": category,
             "symbol": symbol,
             "interval": interval,
-            "start": cursor_start,  # ms
-            "end": cursor_end,      # ms
+            "start": cursor_start,
+            "end": cursor_end,
             "limit": limit,
         }
         r = requests.get(BYBIT_V5_URL, params=params, timeout=15)
@@ -57,11 +55,11 @@ def fetch_bybit_v5_window(symbol: str, days: int, interval: str = "15", category
         data = r.json()
         rows = ((data.get("result") or {}).get("list") or [])
         if not rows:
-            # иногда на самом краю окна пусто — сдвигаемся вперёд
             cursor_start = cursor_end + 1
             continue
 
-        for row in rows:   # [start, open, high, low, close, volume, turnover]
+        # v5 формат: [start, open, high, low, close, volume, turnover]
+        for row in rows:
             ts = int(row[0])
             if start_ms <= ts <= end_ms:
                 out.append({
@@ -73,7 +71,7 @@ def fetch_bybit_v5_window(symbol: str, days: int, interval: str = "15", category
                     "volume": float(row[5]) if row[5] is not None else 0.0,
                 })
 
-        cursor_start = int(rows[-1][0]) + 1  # следующий кусок
+        cursor_start = int(rows[-1][0]) + 1
 
     # дедуп и сортировка
     out = sorted({b["timestamp"]: b for b in out}.values(), key=lambda x: x["timestamp"])
@@ -88,7 +86,7 @@ def fetch_bybit_v5_window(symbol: str, days: int, interval: str = "15", category
 
     return out
 
-# ===================== ДОБАВЛЕНО: paper-API для стратегии =====================
+# ===================== Мини paper-API для стратегии =====================
 class PaperBybitAPI:
     """Мини-эмулятор методов, которые читает стратегия (без реальных ордеров)."""
     def __init__(self):
@@ -111,7 +109,7 @@ def main():
     st.title("📊 KWIN Strategy Backtest")
     st.markdown("Тестирование стратегии на исторических данных.")
 
-    # ↓↓↓ ДОБАВЛЕНО: выбор источника свечей
+    # выбор источника свечей
     data_src = st.radio(
         "Источник данных",
         ["Bybit v5 (реальные 15m)", "Синтетика (демо)"],
@@ -162,21 +160,21 @@ def main():
                 config.use_sfp_quality = bool(use_sfp_quality)
                 config.wick_min_ticks = int(wick_min_ticks)
                 config.close_back_pct = float(close_back_pct if close_back_pct <= 1 else close_back_pct / 100.0)
-                config.taker_fee_rate = float(fee_rate) / 100.0  # 0.055% -> 0.00055
-                config.days_back = int(period_days)  # чтобы _is_in_backtest_window_utc совпадало с окном
+                config.taker_fee_rate = float(fee_rate) / 100.0
+                config.days_back = int(period_days)
 
-                # Инициализируем стратегию с существующими db/state
+                # Инициализируем стратегию
                 strategy = KWINStrategy(config, api, state, db)
 
-                # ===== Выбор источника =====
+                # Источник данных
                 if data_src.startswith("Bybit"):
                     candles = fetch_bybit_v5_window(symbol, period_days, interval="15", category="linear")
                     if not candles:
-                        st.warning("Не удалось получить исторические свечи Bybit за выбранный период.")
+                        st.warning("Не удалось получить реальные свечи Bybit за выбранный период.")
                         return
                     results = run_backtest_real(strategy, candles, start_capital)
                 else:
-                    results = run_backtest(strategy, period_days, start_capital)  # твой демо на синтетике
+                    results = run_backtest(strategy, period_days, start_capital)  # синтетика (без рандом-сделок)
 
                 # Вывод
                 display_backtest_results(results)
@@ -187,7 +185,18 @@ def main():
 
 # ========================================================================
 def run_backtest(strategy: KWINStrategy, period_days: int, start_capital: float):
-    """Простая демо-симуляция: синтетические 15m данные + сделки (ОСТАВИЛ БЕЗ ИЗМЕНЕНИЙ)."""
+    """
+    СИНТЕТИКА (демо): формируем 15m свечи и ведём только кривую equity.
+    РАНДОМНЫЕ СДЕЛКИ УБРАНЫ по твоей просьбе.
+    """
+    # чистый старт, чтобы старые сделки не «подмешивались»
+    state.set_position(None)
+    state.set_equity(float(start_capital))
+    try:
+        if hasattr(db, "clear_trades"): db.clear_trades()
+        if hasattr(db, "clear_equity"): db.clear_equity()
+    except Exception:
+        pass
 
     end_date = datetime.now()
     start_date = end_date - timedelta(days=period_days)
@@ -197,7 +206,7 @@ def run_backtest(strategy: KWINStrategy, period_days: int, start_capital: float)
     dates = pd.date_range(start=start_date, periods=bars, freq="15T")
 
     base_price = 4500 if strategy.config.symbol == "ETHUSDT" else 118000
-    price_changes = np.random.randn(len(dates)) * 0.002  # ~0.2% вола
+    price_changes = np.random.randn(len(dates)) * 0.002
     prices = base_price * np.exp(np.cumsum(price_changes))
 
     candles = []
@@ -217,57 +226,13 @@ def run_backtest(strategy: KWINStrategy, period_days: int, start_capital: float)
         })
 
     current_equity = float(start_capital)
-    equity_points = []  # [{'timestamp': ..., 'equity': ...}]
+    equity_points = []
 
-    # цикл по барам
-    for i in range(2, len(candles)):  # с 3-й свечи, чтобы был контекст
-        candle = candles[i]
-
-        # Демо: вероятность сигнала 5%
-        if np.random.random() < 0.05:
-            direction   = "long" if np.random.random() > 0.5 else "short"
-            entry_price = candle["close"]
-            stop_loss   = entry_price * (0.98 if direction == "long" else 1.02)
-            take_profit = entry_price * (1.026 if direction == "long" else 0.974)
-
-            risk_amount   = current_equity * (strategy.config.risk_pct / 100.0)
-            stop_distance = abs(entry_price - stop_loss)
-            quantity = risk_amount / stop_distance if stop_distance > 0 else 0.0
-
-            if quantity > 0:
-                # результат сделки
-                win = (np.random.random() < 0.55)
-                exit_price = take_profit if win else stop_loss
-
-                pnl = (exit_price - entry_price) * quantity if direction == "long" else (entry_price - exit_price) * quantity
-                commission = (entry_price + exit_price) * quantity * strategy.config.taker_fee_rate
-                net_pnl = pnl - commission
-                current_equity += net_pnl
-
-                rr = abs(pnl) / (quantity * stop_distance) if stop_distance > 0 else 0.0
-
-                trade_data = {
-                    "symbol": strategy.config.symbol,
-                    "direction": direction,
-                    "entry_price": float(entry_price),
-                    "exit_price": float(exit_price),
-                    "stop_loss": float(stop_loss),
-                    "take_profit": float(take_profit),
-                    "quantity": float(quantity),
-                    "pnl": float(net_pnl),
-                    "rr": float(rr),
-                    "entry_time": candle["timestamp"],
-                    "exit_time": candle["timestamp"] + timedelta(minutes=int(np.random.randint(15, 240))),
-                    "exit_reason": "TP" if net_pnl > 0 else "SL",
-                    "status": "closed",
-                }
-                db.add_trade(trade_data)
-
-        # ровно один снэпшот equity на бар
+    # без сделок — просто рисуем «плоскую» кривую equity для демо
+    for candle in candles:
         equity_points.append({"timestamp": candle["timestamp"], "equity": current_equity})
 
-    # результаты
-    trades_df = pd.DataFrame(db.get_all_trades())
+    trades_df = pd.DataFrame([])  # пусто
     equity_df = pd.DataFrame(equity_points)
 
     return {
@@ -277,21 +242,27 @@ def run_backtest(strategy: KWINStrategy, period_days: int, start_capital: float)
         "initial_equity": start_capital,
     }
 
-# ===================== ДОБАВЛЕНО: реальный прогон через стратегию =====================
+# ===================== Реальный прогон через стратегию (Bybit v5 свечи) =====================
 def run_backtest_real(strategy: KWINStrategy, candles: list[dict], start_capital: float):
     """
-    Прогон реальных 15m свечей через KWINStrategy (paper).
-    - один вход максимум на бар (как в коде стратегии);
-    - время входа = время закрытия бара;
-    - SL/TP проверяются по high/low бара;
-    - комиссии учитываются.
+    Прогон реальных 15m свечей через KWINStrategy (paper):
+    — время входа = время бара,
+    — один снапшот equity на бар,
+    — SL/TP по high/low текущей свечи,
+    — комиссии учитываются.
     """
-    # подготовим paper-API и стартовый equity
+    # чистый старт этого прогона
+    state.set_position(None)
     state.set_equity(float(start_capital))
+    try:
+        if hasattr(db, "clear_trades"): db.clear_trades()
+        if hasattr(db, "clear_equity"): db.clear_equity()
+    except Exception:
+        pass
+
     paper_api = PaperBybitAPI()
     strategy.api = paper_api
 
-    # локальное хранилище сделок этого прогона (чтобы не мешать прошлым)
     bt_trades: list[dict] = []
     equity_points: list[dict] = []
 
@@ -299,19 +270,17 @@ def run_backtest_real(strategy: KWINStrategy, candles: list[dict], start_capital
         pos = state.get_current_position()
         if not pos or pos.get("status") != "open":
             return
-        direction = pos["direction"]
+        direction   = pos["direction"]
         entry_price = float(pos["entry_price"])
-        qty = float(pos["size"])
-        fee = float(getattr(strategy.config, "taker_fee_rate", 0.00055))
+        qty         = float(pos["size"])
+        fee         = float(getattr(strategy.config, "taker_fee_rate", 0.00055))
         gross = (exit_price - entry_price) * qty if direction == "long" else (entry_price - exit_price) * qty
-        fees = (entry_price + exit_price) * qty * fee
-        pnl = gross - fees
+        fees  = (entry_price + exit_price) * qty * fee
+        pnl   = gross - fees
 
-        # обновим equity
         new_eq = float(state.get_equity() or start_capital) + pnl
         state.set_equity(new_eq)
 
-        # запишем сделку локально
         bt_trades.append({
             "symbol": strategy.config.symbol,
             "direction": direction,
@@ -327,28 +296,26 @@ def run_backtest_real(strategy: KWINStrategy, candles: list[dict], start_capital
             "status": "closed",
         })
 
-        # пометим позицию закрытой
         pos["status"] = "closed"
         pos["exit_price"] = float(exit_price)
-        pos["exit_time"] = datetime.utcfromtimestamp(int(ts_ms)/1000)
+        pos["exit_time"]  = datetime.utcfromtimestamp(int(ts_ms)/1000)
         state.set_position(pos)
 
     # прогон от старых к новым
     for bar in candles:
-        # гарантируем типы
         ts_ms = int(bar["timestamp"])
         o = float(bar["open"]); h = float(bar["high"]); l = float(bar["low"]); c = float(bar["close"])
 
         paper_api.set_price(c)
 
-        # если позиция открыта — проверим SL/TP на этом баре
+        # проверка SL/TP на этой свече
         pos = state.get_current_position()
         if pos and pos.get("status") == "open":
             sl = float(pos.get("stop_loss") or 0)
             tp = pos.get("take_profit")
             if pos["direction"] == "long":
                 if sl > 0 and l <= sl:
-                    close_position(sl, ts_ms); 
+                    close_position(sl, ts_ms)
                 elif tp is not None and h >= float(tp):
                     close_position(float(tp), ts_ms)
             else:  # short
@@ -357,19 +324,21 @@ def run_backtest_real(strategy: KWINStrategy, candles: list[dict], start_capital
                 elif tp is not None and l <= float(tp):
                     close_position(float(tp), ts_ms)
 
-        # подадим бар в стратегию (закрытие 15m)
+        # подаём закрытую 15m свечу в стратегию
         before_pos = state.get_current_position()
         strategy.on_bar_close_15m({"timestamp": ts_ms, "open": o, "high": h, "low": l, "close": c})
         after_pos = state.get_current_position()
 
-        # если на этом баре открылась позиция — проставим время входа ровно по бару
+        # если открылась новая позиция — проставим штамп входа ровно по бару
         if after_pos and after_pos is not before_pos and after_pos.get("status") == "open" and "entry_time_ts" not in after_pos:
             after_pos["entry_time_ts"] = ts_ms
             state.set_position(after_pos)
 
-        # снимем equity на конец бара
-        equity_points.append({"timestamp": pd.to_datetime(ts_ms, unit="ms", utc=True), 
-                              "equity": float(state.get_equity() or start_capital)})
+        # снапшот equity на конец бара
+        equity_points.append({
+            "timestamp": ts_ms,
+            "equity": float(state.get_equity() or start_capital)
+        })
 
     # если к концу окна позиция открыта — закроем по последнему close
     if state.get_current_position() and state.get_current_position().get("status") == "open":
@@ -410,7 +379,6 @@ def display_backtest_results(results):
 
         if not equity_df.empty and len(equity_df) > 1:
             eq = equity_df.copy()
-            # нормализуем время оси, если передали мс
             if np.issubdtype(eq["timestamp"].dtype, np.number):
                 eq["timestamp"] = pd.to_datetime(eq["timestamp"], unit="ms", utc=True)
             eq["timestamp"] = pd.to_datetime(eq["timestamp"], utc=True).dt.tz_localize(None)
@@ -478,7 +446,7 @@ def display_backtest_results(results):
     st.markdown("---")
     st.info(
         "Выбери источник: **Bybit v5 (реальные 15m)** — прогон через стратегию; "
-        "**Синтетика (демо)** — старый случайный симулятор."
+        "**Синтетика (демо)** — без случайных сделок."
     )
 
 # ========================================================================
