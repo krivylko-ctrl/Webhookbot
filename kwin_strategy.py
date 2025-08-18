@@ -214,93 +214,126 @@ class KWINStrategy:
         elif bear_sfp and self.can_enter_short:
             self._process_short_entry()
 
-    def _detect_bull_sfp(self) -> bool:
-        sfpLen = 2
-        if len(self.candles_15m) < sfpLen + 1 + 2:
-            return False
-        for i in range(len(self.candles_15m)):
-            if i - sfpLen - 1 < 0 or i + 1 >= len(self.candles_15m):
-                continue
-            window = []
-            for k in range(i - sfpLen - 1, i + 2):
-                if k < len(self.candles_15m):
-                    window.append(self.candles_15m[k]['low'])
-            if not window or len(window) < sfpLen + 2:
-                continue
-            pivot_low = self.candles_15m[i]['low']
-            if pivot_low != min(window) or pivot_low >= self.candles_15m[i - sfpLen]['low']:
-                continue
-            current = self.candles_15m[0]
-            prev_pivot_low = self.candles_15m[i - 1]['low']
-            bull_condition = (
-                current['open'] > prev_pivot_low and
-                current['close'] > prev_pivot_low and
-                current['low'] < prev_pivot_low
-            )
-            if bull_condition:
-                if self.config.use_sfp_quality:
-                    return self._check_bull_sfp_quality_new(current, self.candles_15m[i])
-                return True
+# ======== PINE-EXACT SFP DETECTION (pivotlow/pivothigh) ========
+
+def _is_prev_pivot_low(self, left: int, right: int = 1) -> bool:
+    """
+    Точная копия ta.pivotlow(left, right), оценённая на ТЕКУЩЕМ баре,
+    где сам pivot стоит на предыдущем баре (index=1 в self.candles_15m).
+    Требует окно [0 .. 1+left] (right=1 → включает текущий бар 0).
+    """
+    need = left + right + 1  # кол-во баров вокруг пивота (включительно)
+    # нам нужен ещё 1 бар, т.к. пивот на index=1 → всего need+1 баров (0..1+left)
+    if len(self.candles_15m) < (need + 1):
+        return False
+    # окно индексов: 0 .. (1+left) включительно
+    window_lows = [float(self.candles_15m[i]['low']) for i in range(0, 1 + left + 1)]
+    pivot_val = float(self.candles_15m[1]['low'])
+    return pivot_val == min(window_lows)
+
+def _is_prev_pivot_high(self, left: int, right: int = 1) -> bool:
+    """Точная копия ta.pivothigh(left, right) для пивота на предыдущем баре (index=1)."""
+    need = left + right + 1
+    if len(self.candles_15m) < (need + 1):
+        return False
+    window_highs = [float(self.candles_15m[i]['high']) for i in range(0, 1 + left + 1)]
+    pivot_val = float(self.candles_15m[1]['high'])
+    return pivot_val == max(window_highs)
+
+def _detect_bull_sfp(self) -> bool:
+    """
+    Pine эквивалент:
+    isBullSFP_15m = pivotlow(sfpLen, 1)
+                    and low < low[sfpLen] and open > low[sfpLen] and close > low[sfpLen]
+    """
+    sfpLen = int(getattr(self.config, "sfp_len", 2))
+    # нужно как минимум sfpLen-сдвиг + текущий + предыдущий → sfpLen+1+1 баров
+    if len(self.candles_15m) < (sfpLen + 2):
         return False
 
-    def _detect_bear_sfp(self) -> bool:
-        sfpLen = 2
-        if len(self.candles_15m) < sfpLen + 1 + 2:
-            return False
-        for i in range(len(self.candles_15m)):
-            if i - sfpLen - 1 < 0 or i + 1 >= len(self.candles_15m):
-                continue
-            window = []
-            for k in range(i - sfpLen - 1, i + 2):
-                if k < len(self.candles_15m):
-                    window.append(self.candles_15m[k]['high'])
-            if not window or len(window) < sfpLen + 2:
-                continue
-            pivot_high = self.candles_15m[i]['high']
-            if pivot_high != max(window) or pivot_high <= self.candles_15m[i - sfpLen]['high']:
-                continue
-            current = self.candles_15m[0]
-            prev_pivot_high = self.candles_15m[i - 1]['high']
-            bear_condition = (
-                current['open'] < prev_pivot_high and
-                current['close'] < prev_pivot_high and
-                current['high'] > prev_pivot_high
-            )
-            if bear_condition:
-                if self.config.use_sfp_quality:
-                    return self._check_bear_sfp_quality_new(current, self.candles_15m[i])
-                return True
+    curr = self.candles_15m[0]
+    ref_low = float(self.candles_15m[sfpLen]['low'])  # low[sfpLen] в терминах Pine
+
+    cond_pivot = self._is_prev_pivot_low(sfpLen, right=1)
+    cond_break = float(curr['low'])   < ref_low
+    cond_close = float(curr['open'])  > ref_low and float(curr['close']) > ref_low
+
+    if cond_pivot and cond_break and cond_close:
+        if getattr(self.config, "use_sfp_quality", True):
+            # качество — ровно как в Pine: тень в тиках и close-back
+            return self._check_bull_sfp_quality_new(curr, {"low": ref_low})
+        return True
+    return False
+
+def _detect_bear_sfp(self) -> bool:
+    """
+    Pine эквивалент:
+    isBearSFP_15m = pivothigh(sfpLen, 1)
+                    and high > high[sfpLen] and open < high[sfpLen] and close < high[sfpLen]
+    """
+    sfpLen = int(getattr(self.config, "sfp_len", 2))
+    if len(self.candles_15m) < (sfpLen + 2):
         return False
 
-    def _check_bull_sfp_quality_new(self, current: Dict, pivot: Dict) -> bool:
-        prev_pivot_low = pivot['low']
-        wick_depth = prev_pivot_low - current['low']
-        min_tick = float(self.tick_size) if getattr(self, "tick_size", None) else 0.01
-        wick_depth_ticks = wick_depth / min_tick
-        if wick_depth_ticks < self.config.wick_min_ticks:
-            return False
-        close_back = current['close'] - current['low']
-        required_close_back = wick_depth * self.config.close_back_pct
-        return close_back >= required_close_back
+    curr = self.candles_15m[0]
+    ref_high = float(self.candles_15m[sfpLen]['high'])  # high[sfpLen]
 
-    def _check_bull_sfp_quality(self, current: Dict, pivot: Dict) -> bool:
-        return self._check_bull_sfp_quality_new(current, pivot)
+    cond_pivot = self._is_prev_pivot_high(sfpLen, right=1)
+    cond_break = float(curr['high']) > ref_high
+    cond_close = float(curr['open']) < ref_high and float(curr['close']) < ref_high
 
-    def _check_bear_sfp_quality_new(self, current: Dict, pivot: Dict) -> bool:
-        prev_pivot_high = pivot['high']
-        wick_depth = current['high'] - prev_pivot_high
-        min_tick = float(self.tick_size) if getattr(self, "tick_size", None) else 0.01
-        wick_depth_ticks = wick_depth / min_tick
-        if wick_depth_ticks < self.config.wick_min_ticks:
-            return False
-        close_back = current['high'] - current['close']
-        required_close_back = wick_depth * self.config.close_back_pct
-        return close_back >= required_close_back
+    if cond_pivot and cond_break and cond_close:
+        if getattr(self.config, "use_sfp_quality", True):
+            return self._check_bear_sfp_quality_new(curr, {"high": ref_high})
+        return True
+    return False
 
-    def _check_bear_sfp_quality(self, current: Dict, pivot: Dict) -> bool:
-        return self._check_bear_sfp_quality_new(current, pivot)
+def _check_bull_sfp_quality_new(self, current: dict, pivot: dict) -> bool:
+    """
+    Pine эквивалент quality-фильтра:
+    bullWickDepth   = (low < ref_low) ? (ref_low - low) : 0
+    bullCloseBackOK = bullWickDepth > 0 and (close - low) >= bullWickDepth * closeBackPct
+    плюс порог по тик-ам: wickMinTicks * mTick
+    """
+    ref_low = float(pivot['low'])
+    low     = float(current['low'])
+    close   = float(current['close'])
 
-    # ---------- УНИФИЦИРОВАННЫЙ ВЫЗОВ MARKET-ОРДЕРА (совместимость клиентов) ----------
+    wick_depth = max(ref_low - low, 0.0)
+    m_tick = float(getattr(self, "tick_size", 0.01))
+    if m_tick <= 0:
+        m_tick = 0.01
+    wick_ticks = wick_depth / m_tick
+    if wick_ticks < float(getattr(self.config, "wick_min_ticks", 7)):
+        return False
+
+    close_back_pct = float(getattr(self.config, "close_back_pct", 1.0))
+    required_close_back = wick_depth * close_back_pct
+    return (close - low) >= required_close_back
+
+def _check_bear_sfp_quality_new(self, current: dict, pivot: dict) -> bool:
+    """
+    Pine эквивалент quality-фильтра для шорта:
+    bearWickDepth   = (high > ref_high) ? (high - ref_high) : 0
+    bearCloseBackOK = bearWickDepth > 0 and (high - close) >= bearWickDepth * closeBackPct
+    и порог по тик-ам.
+    """
+    ref_high = float(pivot['high'])
+    high     = float(current['high'])
+    close    = float(current['close'])
+
+    wick_depth = max(high - ref_high, 0.0)
+    m_tick = float(getattr(self, "tick_size", 0.01))
+    if m_tick <= 0:
+        m_tick = 0.01
+    wick_ticks = wick_depth / m_tick
+    if wick_ticks < float(getattr(self.config, "wick_min_ticks", 7)):
+        return False
+
+    close_back_pct = float(getattr(self.config, "close_back_pct", 1.0))
+    required_close_back = wick_depth * close_back_pct
+    return (high - close) >= required_close_back
+# ======== /PINE-EXACT SFP DETECTION ========
     def _place_market_order(self, direction: str, quantity: float, stop_loss: Optional[float] = None):
         if not self.api or not hasattr(self.api, 'place_order'):
             print("API not available for placing order")
