@@ -30,95 +30,108 @@ BYBIT_V5_URL = "https://api.bybit.com/v5/market/kline"
 
 def fetch_bybit_v5_window(symbol: str, days: int, interval: str = "15", category: str = "linear") -> list[dict]:
     """
-    Реальные 15m свечи Bybit v5 за окно [UTC-сейчас - days, UTC-сейчас] с пагинацией.
-    Возвращает список словарей {timestamp, open, high, low, close, volume} (timestamp в мс, возрастающий).
+    Реальные 15m свечи Bybit v5 за окно [UTC-now - days, UTC-now] c устойчивыми ретраями.
+    Возвращает список {timestamp, open, high, low, close, volume} (timestamp в мс, по возрастанию).
     """
     now_ms = int(datetime.utcnow().timestamp() * 1000)
     start_ms = now_ms - days * 24 * 60 * 60 * 1000
     end_ms = now_ms
 
-    limit = 1000                 # макс. у v5
-    tf_ms = 15 * 60 * 1000       # 15m в миллисекундах
-    chunk_ms = limit * tf_ms     # сколько мс тянем за один запрос
+    limit = 1000
+    tf_ms = 15 * 60 * 1000
+    chunk_ms = limit * tf_ms  # ~10.4 дня на запрос
 
     out = []
     cursor_start = start_ms
-    request_id = 0
+    req_id = 0
 
     while cursor_start <= end_ms:
-        request_id += 1
+        req_id += 1
         cursor_end = min(end_ms, cursor_start + chunk_ms - 1)
 
         params = {
             "category": category,
             "symbol": symbol.upper(),
-            "interval": str(interval),     # "15"
-            "start": int(cursor_start),    # ms
-            "end": int(cursor_end),        # ms
+            "interval": str(interval),
+            "start": int(cursor_start),
+            "end": int(cursor_end),
             "limit": int(limit),
         }
-
-        # диагностическая подпись текущего чанка
         st.caption(
-            f"▸ Bybit v5 запрос #{request_id}: "
+            f"▸ Bybit v5 запрос #{req_id}: "
             f"{datetime.utcfromtimestamp(params['start']/1000):%Y-%m-%d %H:%M} → "
             f"{datetime.utcfromtimestamp(params['end']/1000):%Y-%m-%d %H:%M} UTC"
         )
 
-        try:
-            r = requests.get(BYBIT_V5_URL, params=params, timeout=20)
-        except Exception as net_err:
-            st.error(f"Сетевой сбой при обращении к Bybit v5: {net_err}")
-            break
+        # -------- РЕТРАИ НА ОДИН И ТОТ ЖЕ ЧАНК --------
+        max_retries = 6
+        backoff = 1.5  # сек стартовая пауза
+        attempt = 0
+        got_chunk = False
 
-        # анти-рейткэп: если 403 — подождём и продолжим следующий кусок
-        if r.status_code == 403:
-            st.error("HTTP 403 от Bybit v5: Access too frequent. Делаю паузу и продолжаю…")
-            time.sleep(1.2)
-            cursor_start = cursor_end + 1
-            continue
+        while attempt < max_retries and not got_chunk:
+            attempt += 1
+            try:
+                r = requests.get(BYBIT_V5_URL, params=params, timeout=25)
+            except Exception as e:
+                st.error(f"[#{req_id}/try{attempt}] Сетевой сбой: {e}")
+                time.sleep(backoff)
+                backoff *= 1.6
+                continue
 
-        if r.status_code != 200:
-            st.error(f"HTTP {r.status_code} от Bybit v5 (chunk #{request_id}). Тело: {r.text[:300]}")
-            break
+            if r.status_code == 403:
+                st.error(f"HTTP 403 (rate limit) на чанк #{req_id}, попытка {attempt}/{max_retries}. Жду {backoff:.1f}s…")
+                time.sleep(backoff)
+                backoff *= 1.6
+                continue
 
-        try:
-            data = r.json()
-        except Exception:
-            st.error(f"Невалидный JSON от Bybit v5 (chunk #{request_id}). Тело: {r.text[:300]}")
-            break
+            if r.status_code != 200:
+                st.error(f"HTTP {r.status_code} на чанк #{req_id}: {r.text[:200]}")
+                time.sleep(backoff)
+                backoff *= 1.6
+                continue
 
-        # Стандартный ответ Bybit v5 имеет retCode/retMsg
-        ret_code = data.get("retCode")
-        ret_msg  = data.get("retMsg")
-        if ret_code not in (0, "0"):
-            st.error(f"Bybit v5 retCode={ret_code}, retMsg={ret_msg}. "
-                     f"Параметры: symbol={symbol}, interval={interval}, category={category}")
-            break
+            try:
+                data = r.json()
+            except Exception:
+                st.error(f"Не удалось распарсить JSON на чанк #{req_id}: {r.text[:200]}")
+                time.sleep(backoff)
+                backoff *= 1.6
+                continue
 
-        rows = ((data.get("result") or {}).get("list") or [])
-        if not rows:
-            # Пусто в этом сегменте — сдвигаем курсор вперёд, чтобы не зациклиться
-            cursor_start = cursor_end + 1
-            time.sleep(0.25)  # маленькая пауза
-            continue
+            if str(data.get("retCode")) != "0":
+                st.error(f"retCode={data.get('retCode')} retMsg={data.get('retMsg')} на чанк #{req_id}")
+                time.sleep(backoff)
+                backoff *= 1.6
+                continue
 
-        # v5: [start, open, high, low, close, volume, turnover]
-        for row in rows:
-            ts = int(row[0])
-            if start_ms <= ts <= end_ms:
-                out.append({
-                    "timestamp": ts,
-                    "open":  float(row[1]),
-                    "high":  float(row[2]),
-                    "low":   float(row[3]),
-                    "close": float(row[4]),
-                    "volume": float(row[5]) if row[5] is not None else 0.0,
-                })
+            rows = ((data.get("result") or {}).get("list") or [])
+            if not rows:
+                # Пустой ответ: такое бывает на краях окна — считаем чанк обработанным
+                got_chunk = True
+                break
 
-        # следующий кусок
-        cursor_start = int(rows[-1][0]) + 1
-        time.sleep(0.25)  # смягчаем Rate Limit
+            # Успех
+            for row in rows:
+                ts = int(row[0])
+                if start_ms <= ts <= end_ms:
+                    out.append({
+                        "timestamp": ts,
+                        "open":  float(row[1]),
+                        "high":  float(row[2]),
+                        "low":   float(row[3]),
+                        "close": float(row[4]),
+                        "volume": float(row[5]) if row[5] is not None else 0.0,
+                    })
+            got_chunk = True
+
+        # если не удалось взять чанк после всех попыток — двигаемся дальше, чтобы не застревать
+        if not got_chunk:
+            st.error(f"Чанк #{req_id} не получен после {max_retries} попыток — пропускаю.")
+
+        # следующий отрезок окна + мягкая пауза между удачными чанками
+        cursor_start = cursor_end + 1
+        time.sleep(0.6)
 
     # дедуп и сортировка
     out = sorted({b["timestamp"]: b for b in out}.values(), key=lambda x: x["timestamp"])
@@ -126,10 +139,7 @@ def fetch_bybit_v5_window(symbol: str, days: int, interval: str = "15", category
     if out:
         first_dt = datetime.utcfromtimestamp(out[0]["timestamp"]/1000)
         last_dt  = datetime.utcfromtimestamp(out[-1]["timestamp"]/1000)
-        st.success(
-            f"✅ Свечи Bybit v5 загружены: {len(out)} шт • "
-            f"{first_dt:%Y-%m-%d %H:%M} — {last_dt:%Y-%m-%d %H:%M} UTC"
-        )
+        st.success(f"✅ Свечи Bybit v5 загружены: {len(out)} шт • {first_dt:%Y-%m-%d %H:%M} — {last_dt:%Y-%m-%d %H:%M} UTC")
     else:
         st.warning("Bybit v5 вернул пустой набор за выбранный период.")
 
