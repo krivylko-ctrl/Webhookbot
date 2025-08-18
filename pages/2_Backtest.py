@@ -212,8 +212,8 @@ def main():
                 config.risk_pct = float(risk_pct)
 
                 config.enable_smart_trail = bool(enable_smart_trail)
-                config.trailing_perc = float(trailing_perc) / 100.0  # проценты → доля
-                config.trailing_offset_perc = float(trailing_offset) / 100.0
+                config.trailing_perc = float(trailing_perc) # проценты → доля
+                config.trailing_offset_perc = float(trailing_offset)
                 config.trailing_offset = float(trailing_offset)
 
                 config.use_sfp_quality = bool(use_sfp_quality)
@@ -244,20 +244,23 @@ def main():
 
 # ========================================================================
 def run_backtest(strategy: KWINStrategy, period_days: int, start_capital: float):
-    """Простая демо-симуляция: синтетические 15m данные + сделки (ОСТАВИЛ БЕЗ ИЗМЕНЕНИЙ)."""
+    """
+    Синтетические 15m свечи -> прогон через KWINStrategy (paper).
+    Все параметры стратегии из UI реально влияют на вход/SL/TP.
+    """
 
-    end_date = datetime.now()
+    # ===== 1) Сгенерим синтетические свечи (UTC, 15m), timestamp в МИЛЛИСЕКУНДАХ =====
+    end_date = datetime.utcnow()
     start_date = end_date - timedelta(days=period_days)
 
-    # 15m таймфрейм
-    bars = period_days * 24 * 4
-    dates = pd.date_range(start=start_date, periods=bars, freq="15T")
+    bars = period_days * 24 * 4  # 15m
+    dates = pd.date_range(start=start_date, periods=bars, freq="15T", tz="UTC")
 
-    base_price = 4500 if strategy.config.symbol == "ETHUSDT" else 118000
+    base_price = 4500 if strategy.config.symbol.upper() == "ETHUSDT" else 118000
     price_changes = np.random.randn(len(dates)) * 0.002  # ~0.2% вола
     prices = base_price * np.exp(np.cumsum(price_changes))
 
-    candles = []
+    candles: list[dict] = []
     for i, (dt, p) in enumerate(zip(dates, prices)):
         vol = abs(np.random.randn() * 0.001)
         high = p * (1 + vol)
@@ -265,75 +268,110 @@ def run_backtest(strategy: KWINStrategy, period_days: int, start_capital: float)
         open_p  = prices[i-1] if i > 0 else p
         close_p = p
         candles.append({
-            "timestamp": dt,
-            "open": open_p,
-            "high": high,
-            "low": low,
-            "close": close_p,
+            "timestamp": int(pd.Timestamp(dt).timestamp() * 1000),  # ms
+            "open": float(open_p),
+            "high": float(high),
+            "low":  float(low),
+            "close": float(close_p),
             "volume": float(np.random.uniform(1_000, 10_000)),
         })
 
-    current_equity = float(start_capital)
-    equity_points = []  # [{'timestamp': ..., 'equity': ...}]
+    # ===== 2) Подготовим paper-API и стартовые состояния =====
+    state.set_equity(float(start_capital))
+    class _Paper:
+        def __init__(self): self._p = None
+        def set_price(self, p): self._p = float(p)
+        def get_ticker(self, symbol): return {"mark_price": self._p, "last_price": self._p}
+        def place_order(self, **kw): return {"status": "Filled"}
+        def modify_order(self, **kw): return {"status": "OK"}
+        def get_wallet_balance(self): return {"list": []}
 
-    # цикл по барам
-    for i in range(2, len(candles)):  # с 3-й свечи, чтобы был контекст
-        candle = candles[i]
+    paper = _Paper()
+    strategy.api = paper
 
-        # Демо: вероятность сигнала 5%
-        if np.random.random() < 0.05:
-            direction   = "long" if np.random.random() > 0.5 else "short"
-            entry_price = candle["close"]
-            stop_loss   = entry_price * (0.98 if direction == "long" else 1.02)
-            take_profit = entry_price * (1.026 if direction == "long" else 0.974)
+    bt_trades: list[dict] = []
+    equity_points: list[dict] = []
 
-            risk_amount   = current_equity * (strategy.config.risk_pct / 100.0)
-            stop_distance = abs(entry_price - stop_loss)
-            quantity = risk_amount / stop_distance if stop_distance > 0 else 0.0
+    # Вспомогательное закрытие позиции с PnL и комиссиями
+    def _close(exit_price: float, ts_ms: int):
+        pos = state.get_current_position()
+        if not pos or pos.get("status") != "open":
+            return
+        direction   = pos["direction"]
+        entry_price = float(pos["entry_price"])
+        qty         = float(pos["size"])
+        fee_rate    = float(getattr(strategy.config, "taker_fee_rate", 0.00055))
+        gross = (exit_price - entry_price) * qty if direction == "long" else (entry_price - exit_price) * qty
+        fees  = (entry_price + exit_price) * qty * fee_rate
+        pnl   = gross - fees
+        state.set_equity(float(state.get_equity() or 0) + pnl)
 
-            if quantity > 0:
-                # результат сделки
-                win = (np.random.random() < 0.55)
-                exit_price = take_profit if win else stop_loss
+        bt_trades.append({
+            "symbol": strategy.config.symbol,
+            "direction": direction,
+            "entry_price": entry_price,
+            "exit_price": float(exit_price),
+            "stop_loss": float(pos.get("stop_loss") or 0),
+            "take_profit": float(pos.get("take_profit") or 0),
+            "quantity": qty,
+            "pnl": float(pnl),
+            "rr": None,
+            "entry_time": datetime.utcfromtimestamp(int(pos.get("entry_time_ts", ts_ms))/1000),
+            "exit_time":  datetime.utcfromtimestamp(int(ts_ms)/1000),
+            "status": "closed",
+        })
+        pos["status"] = "closed"
+        pos["exit_price"] = float(exit_price)
+        pos["exit_time"]  = datetime.utcfromtimestamp(int(ts_ms)/1000)
+        state.set_position(pos)
 
-                pnl = (exit_price - entry_price) * quantity if direction == "long" else (entry_price - exit_price) * quantity
-                commission = (entry_price + exit_price) * quantity * strategy.config.taker_fee_rate
-                net_pnl = pnl - commission
-                current_equity += net_pnl
+    # ===== 3) Прогон от старых к новым =====
+    for bar in candles:
+        ts_ms = int(bar["timestamp"])
+        o = float(bar["open"]); h = float(bar["high"]); l = float(bar["low"]); c = float(bar["close"])
 
-                rr = abs(pnl) / (quantity * stop_distance) if stop_distance > 0 else 0.0
+        paper.set_price(c)
 
-                trade_data = {
-                    "symbol": strategy.config.symbol,
-                    "direction": direction,
-                    "entry_price": float(entry_price),
-                    "exit_price": float(exit_price),
-                    "stop_loss": float(stop_loss),
-                    "take_profit": float(take_profit),
-                    "quantity": float(quantity),
-                    "pnl": float(net_pnl),
-                    "rr": float(rr),
-                    "entry_time": candle["timestamp"],
-                    "exit_time": candle["timestamp"] + timedelta(minutes=int(np.random.randint(15, 240))),
-                    "exit_reason": "TP" if net_pnl > 0 else "SL",
-                    "status": "closed",
-                }
-                db.add_trade(trade_data)
+        # Если позиция открыта — проверим SL/TP на этом баре
+        pos = state.get_current_position()
+        if pos and pos.get("status") == "open":
+            sl = float(pos.get("stop_loss") or 0)
+            tp = pos.get("take_profit")
+            if pos["direction"] == "long":
+                if sl > 0 and l <= sl: _close(sl, ts_ms)
+                elif tp is not None and h >= float(tp): _close(float(tp), ts_ms)
+            else:
+                if sl > 0 and h >= sl: _close(sl, ts_ms)
+                elif tp is not None and l <= float(tp): _close(float(tp), ts_ms)
 
-        # ровно один снэпшот equity на бар
-        equity_points.append({"timestamp": candle["timestamp"], "equity": current_equity})
+        # Подадим закрытую 15m свечу в стратегию
+        before = state.get_current_position()
+        strategy.on_bar_close_15m({"timestamp": ts_ms, "open": o, "high": h, "low": l, "close": c})
+        after = state.get_current_position()
 
-    # результаты
-    trades_df = pd.DataFrame(db.get_all_trades())
+        # Если на этом баре открылась позиция — проставим время входа ровно по бару
+        if after and after is not before and after.get("status") == "open" and "entry_time_ts" not in after:
+            after["entry_time_ts"] = ts_ms
+            state.set_position(after)
+
+        # Снимем equity на конец бара
+        equity_points.append({"timestamp": ts_ms, "equity": float(state.get_equity() or start_capital)})
+
+    # Закроем хвост, если осталось открыто
+    pos = state.get_current_position()
+    if pos and pos.get("status") == "open":
+        last = candles[-1]
+        _close(float(last["close"]), int(last["timestamp"]))
+
+    # Результаты
+    trades_df = pd.DataFrame(bt_trades)
     equity_df = pd.DataFrame(equity_points)
-
     return {
         "trades_df": trades_df,
         "equity_df": equity_df,
-        "final_equity": current_equity,
-        "initial_equity": start_capital,
+        "final_equity": float(state.get_equity() or start_capital),
+        "initial_equity": float(start_capital),
     }
-
 # ===================== реальный прогон через стратегию =====================
 def run_backtest_real(strategy: KWINStrategy, candles: list[dict], start_capital: float):
     """
@@ -343,32 +381,80 @@ def run_backtest_real(strategy: KWINStrategy, candles: list[dict], start_capital
     - SL/TP проверяются по high/low бара;
     - комиссии учитываются.
     """
-    # подготовим paper-API и стартовый equity
+
+    # --- 0) Нормализация входных свечей ---
+    norm = []
+    for b in candles or []:
+        try:
+            ts = b.get("timestamp")
+            # поддержка разных типов: int(ms)/float(ms)/str/Datetime
+            if isinstance(ts, str):
+                ts = int(pd.to_datetime(ts, utc=True).value // 10**6)
+            elif isinstance(ts, (pd.Timestamp, np.datetime64)):
+                ts = int(pd.to_datetime(ts, utc=True).value // 10**6)
+            else:
+                ts = int(ts)
+
+            norm.append({
+                "timestamp": ts,
+                "open":  float(b["open"]),
+                "high":  float(b["high"]),
+                "low":   float(b["low"]),
+                "close": float(b["close"]),
+                "volume": float(b.get("volume", 0.0)),
+            })
+        except Exception:
+            continue
+
+    candles = sorted(norm, key=lambda x: x["timestamp"])
+    if not candles:
+        return {
+            "trades_df": pd.DataFrame([]),
+            "equity_df": pd.DataFrame([]),
+            "final_equity": float(start_capital),
+            "initial_equity": float(start_capital),
+        }
+
+    # --- 1) Подготовим paper-API и стартовый equity ---
     state.set_equity(float(start_capital))
-    paper_api = PaperBybitAPI()
+    # по возможности сбросим открытую позицию
+    cur = state.get_current_position()
+    if cur and cur.get("status") == "open":
+        cur["status"] = "closed"
+        state.set_position(cur)
+
+    class _Paper:
+        def __init__(self): self._p = None
+        def set_price(self, p): self._p = float(p)
+        def get_ticker(self, symbol): return {"mark_price": self._p, "last_price": self._p}
+        def place_order(self, **kw): return {"status": "Filled"}
+        def modify_order(self, **kw): return {"status": "OK"}
+        def get_wallet_balance(self): return {"list": []}
+
+    paper_api = _Paper()
     strategy.api = paper_api
 
-    # локальное хранилище сделок этого прогона (чтобы не мешать прошлым)
     bt_trades: list[dict] = []
     equity_points: list[dict] = []
 
+    # --- 2) Закрытие позиции с учётом комиссий ---
     def close_position(exit_price: float, ts_ms: int):
         pos = state.get_current_position()
         if not pos or pos.get("status") != "open":
             return
-        direction = pos["direction"]
-        entry_price = float(pos["entry_price"])
-        qty = float(pos["size"])
-        fee = float(getattr(strategy.config, "taker_fee_rate", 0.00055))
-        gross = (exit_price - entry_price) * qty if direction == "long" else (entry_price - exit_price) * qty
-        fees = (entry_price + exit_price) * qty * fee
-        pnl = gross - fees
 
-        # обновим equity
+        direction   = pos["direction"]
+        entry_price = float(pos["entry_price"])
+        qty         = float(pos["size"])
+        fee_rate    = float(getattr(strategy.config, "taker_fee_rate", 0.00055))
+
+        gross = (exit_price - entry_price) * qty if direction == "long" else (entry_price - exit_price) * qty
+        fees  = (entry_price + exit_price) * qty * fee_rate
+        pnl   = gross - fees
+
         new_eq = float(state.get_equity() or start_capital) + pnl
         state.set_equity(new_eq)
 
-        # запишем сделку локально
         bt_trades.append({
             "symbol": strategy.config.symbol,
             "direction": direction,
@@ -384,57 +470,58 @@ def run_backtest_real(strategy: KWINStrategy, candles: list[dict], start_capital
             "status": "closed",
         })
 
-        # пометим позицию закрытой
         pos["status"] = "closed"
         pos["exit_price"] = float(exit_price)
-        pos["exit_time"] = datetime.utcfromtimestamp(int(ts_ms)/1000)
+        pos["exit_time"]  = datetime.utcfromtimestamp(int(ts_ms)/1000)
         state.set_position(pos)
 
-    # прогон от старых к новым
+    # --- 3) Прогон по барам (от старых к новым) ---
     for bar in candles:
-        # гарантируем типы
         ts_ms = int(bar["timestamp"])
         o = float(bar["open"]); h = float(bar["high"]); l = float(bar["low"]); c = float(bar["close"])
 
         paper_api.set_price(c)
 
-        # если позиция открыта — проверим SL/TP на этом баре
+        # проверим SL/TP на текущем баре, если позиция открыта
         pos = state.get_current_position()
         if pos and pos.get("status") == "open":
             sl = float(pos.get("stop_loss") or 0)
-            tp = pos.get("take_profit")
+            tp_raw = pos.get("take_profit")
             if pos["direction"] == "long":
                 if sl > 0 and l <= sl:
                     close_position(sl, ts_ms)
-                elif tp is not None and h >= float(tp):
-                    close_position(float(tp), ts_ms)
+                elif tp_raw is not None and h >= float(tp_raw):
+                    close_position(float(tp_raw), ts_ms)
             else:  # short
                 if sl > 0 and h >= sl:
                     close_position(sl, ts_ms)
-                elif tp is not None and l <= float(tp):
-                    close_position(float(tp), ts_ms)
+                elif tp_raw is not None and l <= float(tp_raw):
+                    close_position(float(tp_raw), ts_ms)
 
-        # подадим бар в стратегию (закрытие 15m)
-        before_pos = state.get_current_position()
+        # дадим стратегии закрытую 15m свечу
+        before = state.get_current_position()
+        before_open = bool(before and before.get("status") == "open")
+
         strategy.on_bar_close_15m({"timestamp": ts_ms, "open": o, "high": h, "low": l, "close": c})
-        after_pos = state.get_current_position()
 
-        # если на этом баре открылась позиция — проставим время входа ровно по бару
-        if after_pos and after_pos is not before_pos and after_pos.get("status") == "open" and "entry_time_ts" not in after_pos:
-            after_pos["entry_time_ts"] = ts_ms
-            state.set_position(after_pos)
+        after = state.get_current_position()
+        after_open = bool(after and after.get("status") == "open")
 
-        # снимем equity на конец бара (КЛАДЁМ МИЛЛИСЕКУНДЫ!)
-        equity_points.append({
-            "timestamp": int(ts_ms),
-            "equity": float(state.get_equity() or start_capital)
-        })
+        # если позиция открылась именно на этом баре — зафиксируем entry_time_ts
+        if after_open and not before_open and "entry_time_ts" not in after:
+            after["entry_time_ts"] = ts_ms
+            state.set_position(after)
 
-    # если к концу окна позиция открыта — закроем по последнему close
-    if state.get_current_position() and state.get_current_position().get("status") == "open":
+        # снимем equity на конец бара (в мс)
+        equity_points.append({"timestamp": ts_ms, "equity": float(state.get_equity() or start_capital)})
+
+    # --- 4) Если что-то осталось открыто — закрываем по последнему close ---
+    pos = state.get_current_position()
+    if pos and pos.get("status") == "open":
         last = candles[-1]
         close_position(float(last["close"]), int(last["timestamp"]))
 
+    # --- 5) Результаты ---
     trades_df = pd.DataFrame(bt_trades)
     equity_df = pd.DataFrame(equity_points)
     return {
@@ -443,7 +530,6 @@ def run_backtest_real(strategy: KWINStrategy, candles: list[dict], start_capital
         "final_equity": float(state.get_equity() or start_capital),
         "initial_equity": float(start_capital),
     }
-
 # ========================================================================
 def display_backtest_results(results):
     trades_df = results["trades_df"]
