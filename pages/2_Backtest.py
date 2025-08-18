@@ -224,6 +224,21 @@ def main():
 
                 # Инициализируем стратегию с существующими db/state
                 strategy = KWINStrategy(config, api, state, db)
+                # --- Биржевые фильтры для paper-режима (после создания strategy) ---
+                if config.symbol.upper() == "ETHUSDT":
+                    strategy.tick_size      = 0.01
+                    strategy.qty_step       = 0.001
+                    strategy.min_order_qty  = 0.001
+                else:
+    # дефолт на всякий случай
+                     strategy.tick_size      = 0.01
+                     strategy.qty_step       = 0.001
+                     strategy.min_order_qty  = 0.001
+
+# синхронизируем в config – часть проверок читает оттуда
+               config.tick_size = strategy.tick_size
+               config.qty_step = strategy.qty_step
+               config.min_order_qty = strategy.min_order_qty
 
                 # ===== Выбор источника =====
                 if data_src.startswith("Bybit"):
