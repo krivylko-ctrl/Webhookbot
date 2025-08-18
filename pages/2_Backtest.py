@@ -405,26 +405,25 @@ def run_backtest(strategy: KWINStrategy, period_days: int, start_capital: float)
 # ===================== реальный прогон через стратегию =====================
 def run_backtest_real(strategy: KWINStrategy, candles: list[dict], start_capital: float):
     """
-    Прогон реальных 15m свечей через KWINStrategy (paper).
-    - один вход максимум на бар (как в коде стратегии);
-    - время входа = время закрытия бара;
-    - SL/TP проверяются по high/low бара;
-    - комиссии учитываются.
+    Прогон реальных 15m свечей через KWINStrategy (paper) c корректным порядком:
+    1) Обновить Smart Trailing на этом баре
+    2) Затем проверить SL/TP по high/low текущего бара
+    3) Только потом отдать бар стратегии (входы считаются на закрытии)
     """
+    import pandas as pd
+    from datetime import datetime
 
-    # --- 0) Нормализация входных свечей ---
+    # --- нормализация входа (мс, float-ы) ---
     norm = []
     for b in candles or []:
         try:
             ts = b.get("timestamp")
-            # поддержка разных типов: int(ms)/float(ms)/str/Datetime
             if isinstance(ts, str):
                 ts = int(pd.to_datetime(ts, utc=True).value // 10**6)
             elif isinstance(ts, (pd.Timestamp, np.datetime64)):
                 ts = int(pd.to_datetime(ts, utc=True).value // 10**6)
             else:
                 ts = int(ts)
-
             norm.append({
                 "timestamp": ts,
                 "open":  float(b["open"]),
@@ -435,7 +434,6 @@ def run_backtest_real(strategy: KWINStrategy, candles: list[dict], start_capital
             })
         except Exception:
             continue
-
     candles = sorted(norm, key=lambda x: x["timestamp"])
     if not candles:
         return {
@@ -445,13 +443,10 @@ def run_backtest_real(strategy: KWINStrategy, candles: list[dict], start_capital
             "initial_equity": float(start_capital),
         }
 
-    # --- 1) Подготовим paper-API и стартовый equity ---
+    # --- подготовка окружения ---
+    state = strategy.state
+    db = strategy.db
     state.set_equity(float(start_capital))
-    # по возможности сбросим открытую позицию
-    cur = state.get_current_position()
-    if cur and cur.get("status") == "open":
-        cur["status"] = "closed"
-        state.set_position(cur)
 
     class _Paper:
         def __init__(self): self._p = None
@@ -464,24 +459,21 @@ def run_backtest_real(strategy: KWINStrategy, candles: list[dict], start_capital
     paper_api = _Paper()
     strategy.api = paper_api
 
-    bt_trades: list[dict] = []
-    equity_points: list[dict] = []
+    bt_trades = []
+    equity_points = []
 
-    # --- 2) Закрытие позиции с учётом комиссий ---
-    def close_position(exit_price: float, ts_ms: int):
+    # --- утилиты ---
+    def close_position(exit_price: float, ts_ms: int, reason: str):
         pos = state.get_current_position()
         if not pos or pos.get("status") != "open":
             return
-
         direction   = pos["direction"]
         entry_price = float(pos["entry_price"])
         qty         = float(pos["size"])
         fee_rate    = float(getattr(strategy.config, "taker_fee_rate", 0.00055))
-
         gross = (exit_price - entry_price) * qty if direction == "long" else (entry_price - exit_price) * qty
         fees  = (entry_price + exit_price) * qty * fee_rate
         pnl   = gross - fees
-
         new_eq = float(state.get_equity() or start_capital) + pnl
         state.set_equity(new_eq)
 
@@ -497,61 +489,121 @@ def run_backtest_real(strategy: KWINStrategy, candles: list[dict], start_capital
             "rr": None,
             "entry_time": datetime.utcfromtimestamp(int(pos.get("entry_time_ts", ts_ms))/1000),
             "exit_time":  datetime.utcfromtimestamp(int(ts_ms)/1000),
+            "exit_reason": reason,
             "status": "closed",
         })
-
         pos["status"] = "closed"
         pos["exit_price"] = float(exit_price)
         pos["exit_time"]  = datetime.utcfromtimestamp(int(ts_ms)/1000)
         state.set_position(pos)
 
-    # --- 3) Прогон по барам (от старых к новым) ---
+    def apply_smart_trail(pos: dict, current_price: float) -> None:
+        """
+        PINE-подобный процентный трейл:
+        - активация по RR (если use_arm_after_rr)
+        - затем % от цены входа + offset
+        - обновляем SL только в сторону сокращения риска
+        """
+        if not getattr(strategy.config, "enable_smart_trail", True):
+            return
+        if not pos or pos.get("status") != "open":
+            return
+
+        entry = float(pos["entry_price"])
+        sl    = float(pos.get("stop_loss") or 0)
+        if sl <= 0 or entry <= 0:
+            return
+
+        # 1) ARM по RR (если включён)
+        armed = bool(pos.get("armed", not getattr(strategy.config, "use_arm_after_rr", True)))
+        if not armed and getattr(strategy.config, "use_arm_after_rr", True):
+            risk = abs(entry - sl)
+            if risk > 0:
+                if pos["direction"] == "long":
+                    rr = (current_price - entry) / risk
+                else:
+                    rr = (entry - current_price) / risk
+                if rr >= float(getattr(strategy.config, "arm_rr", 0.5)):
+                    armed = True
+                    pos["armed"] = True
+                    state.set_position(pos)
+                    print(f"[TRAIL] Armed at {getattr(strategy.config,'arm_rr',0.5)}R (price={current_price:.4f})")
+        if not armed:
+            return
+
+        # 2) % трейл от цены входа
+        trail_pct   = float(getattr(strategy.config, "trailing_perc", 0.5)) / 100.0
+        offset_pct  = float(getattr(strategy.config, "trailing_offset_perc", 0.4)) / 100.0
+        trail_dist  = entry * trail_pct
+        offset_dist = entry * offset_pct
+
+        if pos["direction"] == "long":
+            candidate = current_price - trail_dist - offset_dist
+            if candidate > sl:
+                pos["stop_loss"] = candidate
+                state.set_position(pos)
+                print(f"[TRAIL] Long SL {sl:.4f} → {candidate:.4f}")
+        else:
+            candidate = current_price + trail_dist + offset_dist
+            if candidate < sl:
+                pos["stop_loss"] = candidate
+                state.set_position(pos)
+                print(f"[TRAIL] Short SL {sl:.4f} → {candidate:.4f}")
+
+    # --- цикл по барам ---
     for bar in candles:
         ts_ms = int(bar["timestamp"])
         o = float(bar["open"]); h = float(bar["high"]); l = float(bar["low"]); c = float(bar["close"])
-
         paper_api.set_price(c)
 
-        # проверим SL/TP на текущем баре, если позиция открыта
+        # ===== (A) Сначала применяем Smart Trailing на этом баре =====
+        pos = state.get_current_position()
+        if pos and pos.get("status") == "open":
+            apply_smart_trail(pos, c)
+
+        # ===== (B) Затем проверяем SL/TP по high/low этого бара =====
         pos = state.get_current_position()
         if pos and pos.get("status") == "open":
             sl = float(pos.get("stop_loss") or 0)
-            tp_raw = pos.get("take_profit")
+            tp = pos.get("take_profit")
             if pos["direction"] == "long":
                 if sl > 0 and l <= sl:
-                    close_position(sl, ts_ms)
-                elif tp_raw is not None and h >= float(tp_raw):
-                    close_position(float(tp_raw), ts_ms)
-            else:  # short
+                    print(f"[SLHIT] Long SL hit @ {sl:.4f}")
+                    close_position(sl, ts_ms, reason="SL")
+                elif tp is not None and h >= float(tp):
+                    print(f"[TPHIT] Long TP hit @ {float(tp):.4f}")
+                    close_position(float(tp), ts_ms, reason="TP")
+            else:
                 if sl > 0 and h >= sl:
-                    close_position(sl, ts_ms)
-                elif tp_raw is not None and l <= float(tp_raw):
-                    close_position(float(tp_raw), ts_ms)
+                    print(f"[SLHIT] Short SL hit @ {sl:.4f}")
+                    close_position(sl, ts_ms, reason="SL")
+                elif tp is not None and l <= float(tp):
+                    print(f"[TPHIT] Short TP hit @ {float(tp):.4f}")
+                    close_position(float(tp), ts_ms, reason="TP")
 
-        # дадим стратегии закрытую 15m свечу
-        before = state.get_current_position()
-        before_open = bool(before and before.get("status") == "open")
-
+        # ===== (C) Теперь передаём закрытую 15m свечу в стратегию (возможен вход) =====
+        before_pos = state.get_current_position()
         strategy.on_bar_close_15m({"timestamp": ts_ms, "open": o, "high": h, "low": l, "close": c})
+        after_pos = state.get_current_position()
 
-        after = state.get_current_position()
-        after_open = bool(after and after.get("status") == "open")
+        # если позиция открылась — зафиксируем время входа и ARM по настройке
+        if after_pos and after_pos is not before_pos and after_pos.get("status") == "open":
+            if "entry_time_ts" not in after_pos:
+                after_pos["entry_time_ts"] = ts_ms
+            # в Pine ты сразу ставишь armed = not useArmAfterRR
+            after_pos["armed"] = not getattr(strategy.config, "use_arm_after_rr", True)
+            state.set_position(after_pos)
 
-        # если позиция открылась именно на этом баре — зафиксируем entry_time_ts
-        if after_open and not before_open and "entry_time_ts" not in after:
-            after["entry_time_ts"] = ts_ms
-            state.set_position(after)
-
-        # снимем equity на конец бара (в мс)
+        # equity-снимок
         equity_points.append({"timestamp": ts_ms, "equity": float(state.get_equity() or start_capital)})
 
-    # --- 4) Если что-то осталось открыто — закрываем по последнему close ---
+    # хвост: если что-то осталось открытым — закрываем по последнему close
     pos = state.get_current_position()
     if pos and pos.get("status") == "open":
         last = candles[-1]
-        close_position(float(last["close"]), int(last["timestamp"]))
+        print("[CLOSE] Forced exit at last close")
+        close_position(float(last["close"]), int(last["timestamp"]), reason="EOD")
 
-    # --- 5) Результаты ---
     trades_df = pd.DataFrame(bt_trades)
     equity_df = pd.DataFrame(equity_points)
     return {
