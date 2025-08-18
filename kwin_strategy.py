@@ -508,12 +508,12 @@ def _check_bear_sfp_quality_new(self, current: dict, pivot: dict) -> bool:
 
     def _validate_position_requirements(self, entry_price: float, stop_loss: float,
                                     take_profit: float, quantity: float) -> bool:
-    """
-    Pine-эквивалент okTrade:
-      okTrade = qty > 0
+        """
+        Pine-эквивалент okTrade:
+          okTrade = qty > 0
                 and qty >= minOrderQty
                 and expNetPnL >= minNetProfit
-    """
+        """
     try:
         if quantity is None:
             return False
