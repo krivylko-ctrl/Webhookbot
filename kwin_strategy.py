@@ -14,6 +14,28 @@ from database import Database
 
 class KWINStrategy:
     """Основная логика стратегии KWIN"""
+    def run_cycle(self, candle: dict):
+        """
+        Основной цикл стратегии — вызывается при закрытии 15m бара.
+        candle = {"open":..., "high":..., "low":..., "close":..., "volume":..., "timestamp":...}
+        """
+    try:
+        # 1. Обновляем текущие данные
+        self.last_candle = candle
+
+        # 2. Проверяем условия входа/выхода (твоя логика из PineScript)
+        signal = self.check_signals(candle)
+
+        # 3. Если сигнал есть → открываем или управляем позицией
+        if signal:
+            self.execute_signal(signal, candle)
+
+        # 4. Если позиция открыта → управляем стопами (Smart Trailing и т.д.)
+        if self.position:
+            self.update_trailing(candle)
+
+    except Exception as e:
+        print(f"[run_cycle ERROR] {e}")
 
     def __init__(self, config: Config, bybit_api, state_manager: StateManager, db: Database):
         self.config = config
