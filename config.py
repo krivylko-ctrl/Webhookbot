@@ -42,7 +42,14 @@ class Config:
         self.use_bar_trail = True       # Use Bar-Low/High Smart Trail
         self.trail_lookback = 50        # Trail lookback bars
         self.trail_buf_ticks = 40       # Trail buffer (ticks)
-        
+
+        # === ИНТРАБАР (1m) ЛОГИКА ДЛЯ LIVE/BT ===
+        self.use_intrabar = True        # Включить обработку внутри бара (эмуляция calc_on_every_tick)
+        self.intrabar_tf = "1"          # Таймфрейм для интрабара (минуты как в Bybit/TV)
+        self.intrabar_pull_limit = 1000 # Сколько 1m баров подкачивать/держать в памяти
+        self.intrabar_sim_two_phase = True  # В бэктесте: двухфазный проход high/low
+        self.intrabar_sl_first = True       # Приоритет: сначала SL, затем TP (как у strategy.exit)
+
         # === ОГРАНИЧЕНИЯ ПОЗИЦИИ ===
         self.limit_qty_enabled = True   # Limit Max Position Qty
         self.max_qty_manual = 50.0      # Max Qty (ETH)
@@ -130,6 +137,14 @@ class Config:
             'use_bar_trail': self.use_bar_trail,
             'trail_lookback': self.trail_lookback,
             'trail_buf_ticks': self.trail_buf_ticks,
+
+            # --- интрабар ---
+            'use_intrabar': self.use_intrabar,
+            'intrabar_tf': self.intrabar_tf,
+            'intrabar_pull_limit': self.intrabar_pull_limit,
+            'intrabar_sim_two_phase': self.intrabar_sim_two_phase,
+            'intrabar_sl_first': self.intrabar_sl_first,
+
             'limit_qty_enabled': self.limit_qty_enabled,
             'max_qty_manual': self.max_qty_manual,
             'use_sfp_quality': self.use_sfp_quality,
@@ -233,6 +248,38 @@ class Config:
                 'step': 1,
                 'value': self.trail_buf_ticks
             },
+
+            # --- интрабар UI ---
+            'use_intrabar': {
+                'type': 'bool',
+                'label': '💚 Use intrabar (1m) processing',
+                'value': self.use_intrabar
+            },
+            'intrabar_tf': {
+                'type': 'select',
+                'label': 'Intrabar timeframe',
+                'options': ['1', '3', '5'],
+                'value': self.intrabar_tf
+            },
+            'intrabar_pull_limit': {
+                'type': 'int',
+                'label': 'Intrabar pull limit (bars)',
+                'min': 100,
+                'max': 5000,
+                'step': 50,
+                'value': self.intrabar_pull_limit
+            },
+            'intrabar_sim_two_phase': {
+                'type': 'bool',
+                'label': 'Intrabar two-phase sim (backtest)',
+                'value': self.intrabar_sim_two_phase
+            },
+            'intrabar_sl_first': {
+                'type': 'bool',
+                'label': 'SL priority over TP (intrabar)',
+                'value': self.intrabar_sl_first
+            },
+
             'limit_qty_enabled': {
                 'type': 'bool',
                 'label': 'Limit Max Position Qty',
@@ -293,6 +340,9 @@ class Config:
             
             if self.close_back_pct < 0 or self.close_back_pct > 1:
                 raise ValueError("Close back percentage must be between 0 and 1")
+
+            if self.intrabar_pull_limit < 100:
+                raise ValueError("Intrabar pull limit must be >= 100")
             
             return True
         
