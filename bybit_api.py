@@ -7,6 +7,7 @@ from urllib.parse import urlencode
 import websocket
 import threading
 from typing import Dict, List, Optional, Callable
+from utils_round import round_price, round_qty
 
 class BybitAPI:
     """Класс для работы с Bybit API v5"""
