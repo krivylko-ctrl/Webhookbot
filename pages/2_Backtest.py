@@ -19,11 +19,15 @@ from config import Config
 from bybit_api import BybitAPI  # используется только для совместимости импортов
 from state_manager import StateManager
 
-# -------------------- Глобальные заглушки для бэктеста --------------------
-# одна БД и один StateManager на сессию
-api = None
-db = Database(memory=True)            # или Database("kwin_bot.db") — если хочешь файл
-state = StateManager(db)
+# -------------------- Ресурсы на сессию (фикс "SessionInfo before it was initialized") --------------------
+api = None  # paper API подменяется ниже
+
+@st.cache_resource
+def get_runtime():
+    """Создаёт один экземпляр БД и StateManager на сессию Streamlit."""
+    _db = Database(memory=True)            # или Database("kwin_bot.db")
+    _state = StateManager(_db)
+    return _db, _state
 
 # ===================== прямой загрузчик Bybit v5 =====================
 BYBIT_V5_URL = "https://api.bybit.com/v5/market/kline"
@@ -48,6 +52,11 @@ def fetch_bybit_v5_window(symbol: str, days: int, interval: str = "15", category
     cursor_start = start_ms
     req_id = 0
 
+    # re-use HTTP session (keep-alive) и более широкие лимиты
+    if "BYBIT_SESSION" not in st.session_state:
+        st.session_state.BYBIT_SESSION = requests.Session()
+    session = st.session_state.BYBIT_SESSION
+
     while cursor_start <= end_ms:
         req_id += 1
         cursor_end = min(end_ms, cursor_start + chunk_ms - 1)
@@ -67,15 +76,15 @@ def fetch_bybit_v5_window(symbol: str, days: int, interval: str = "15", category
         )
 
         # -------- РЕТРАИ НА ОДИН И ТОТ ЖЕ ЧАНК --------
-        max_retries = 6
-        backoff = 1.5
+        max_retries = 12
+        backoff = 3.0
         attempt = 0
         got_chunk = False
 
         while attempt < max_retries and not got_chunk:
             attempt += 1
             try:
-                r = requests.get(BYBIT_V5_URL, params=params, timeout=25)
+                r = session.get(BYBIT_V5_URL, params=params, timeout=60)
             except Exception as e:
                 st.error(f"[#{req_id}/try{attempt}] Сетевой сбой: {e}")
                 time.sleep(backoff); backoff *= 1.6
@@ -120,12 +129,13 @@ def fetch_bybit_v5_window(symbol: str, days: int, interval: str = "15", category
                         "volume": float(row[5]) if row[5] is not None else 0.0,
                     })
             got_chunk = True
+            st.caption(f"✓ Чанк #{req_id} загружен • всего баров: {len(out)}")
 
         if not got_chunk:
             st.error(f"Чанк #{req_id} не получен после {max_retries} попыток — пропускаю.")
 
         cursor_start = cursor_end + 1
-        time.sleep(0.6)
+        time.sleep(1.0)
 
     # дедуп и сортировка по возрастанию времени
     out = sorted({b["timestamp"]: b for b in out}.values(), key=lambda x: x["timestamp"])
@@ -161,6 +171,10 @@ def main():
 
     st.title("📊 KWIN Strategy Backtest")
     st.markdown("Тестирование стратегии на исторических данных.")
+
+    # Инициализируем ресурсы под эту сессию (после старта Streamlit-сессии)
+    global api
+    db, state = get_runtime()
 
     # выбор источника свечей
     data_src = st.radio(
@@ -261,7 +275,9 @@ def main():
                         return
 
                     if use_intrabar:
-                        candles_1m = fetch_bybit_v5_window(symbol, period_days, interval="1", category="linear")
+                        # Ограничим объём 1m (ради стабильности на Railway)
+                        one_min_days = min(period_days, 30)
+                        candles_1m = fetch_bybit_v5_window(symbol, one_min_days, interval="1", category="linear")
                         if not candles_1m:
                             st.warning("1m свечи не получены — интрабар будет отключён.")
                             candles_1m = []
@@ -285,6 +301,9 @@ def run_backtest(strategy: KWINStrategy, period_days: int, start_capital: float)
     Синтетические 15m свечи -> прогон через KWINStrategy (paper).
     Все параметры стратегии из UI реально влияют на вход/SL/TP.
     """
+    # используем состояние из самой стратегии (чтобы не зависеть от глобальных переменных)
+    state = strategy.state
+
     # ===== 1) Сгенерим синтетические свечи (UTC, 15m), timestamp в МИЛЛИСЕКУНДАХ =====
     end_date = datetime.utcnow()
     start_date = end_date - timedelta(days=period_days)
@@ -314,6 +333,7 @@ def run_backtest(strategy: KWINStrategy, period_days: int, start_capital: float)
 
     # ===== 2) Подготовим paper-API и стартовые состояния =====
     state.set_equity(float(start_capital))
+
     class _Paper:
         def __init__(self): self._p = None
         def set_price(self, p): self._p = float(p)
@@ -629,6 +649,7 @@ def run_backtest_real(strategy: KWINStrategy, candles: list[dict], start_capital
             if candidate < sl:
                 pos["stop_loss"] = candidate
                 state.set_position(pos)
+    # ---------------------------------------------------------------------
 
     # --- цикл по барам ---
     for bar in candles:
@@ -1055,4 +1076,3 @@ def display_backtest_results(results):
 # ========================================================================
 if __name__ == "__main__":
     main()
-
