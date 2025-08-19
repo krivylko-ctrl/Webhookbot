@@ -3,6 +3,7 @@ import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
+from trail_engine import TrailEngine
 from datetime import datetime, timedelta, timezone
 import requests   # ← нужен для прямого запроса v5
 import time       # ← анти-рейткэп в загрузчике
@@ -857,98 +858,126 @@ def run_backtest_real_intrabar(strategy: KWINStrategy,
             trail_engine.reset()
             trail_engine = None
 
-    def ensure_trail_engine_on_entry(ts_ms: int):
-        """Если позиция только что открылась — инициализируем TrailEngine и вспом. поля."""
+    # ---- локальный трейл-движок (одна позиция за раз) ----
+    trail_engine = None
+
+    def ensure_trail_engine_for_open_position():
+        """Создаёт/сбрасывает TrailEngine когда открылась/закрылась позиция."""
         nonlocal trail_engine
         pos = state.get_current_position()
-        if not pos or pos.get("status") != "open":
-            return
-        if trail_engine is None:
-            # завести движок и активировать по входу
-            trail_engine = TrailEngine(strategy.config)
-            entry = float(pos["entry_price"])
-            sl    = float(pos.get("stop_loss") or 0)
-            direction = pos["direction"]
-            trail_engine.on_entry(entry, sl, direction)
-            # метки позиции
-            if "entry_time_ts" not in pos:
-                pos["entry_time_ts"] = ts_ms
-            state.set_position(pos)
+        if pos and pos.get("status") == "open":
+            if trail_engine is None:
+                trail_engine = TrailEngine(strategy.config)
+                trail_engine.on_entry(
+                    entry_price=float(pos["entry_price"]),
+                    stop_loss=float(pos.get("stop_loss") or 0.0),
+                    direction=str(pos["direction"])
+                )
+        else:
+            if trail_engine is not None:
+                trail_engine.reset()
+                trail_engine = None
 
-    # --- основной цикл по 15m ---
+    def iter_micro_prices_1m(bar: dict, steps: int = 6):
+        """
+        Генерирует плавный путь цены внутри 1m: open→extreme1→extreme2→close.
+        Если close>=open: open→high→low→close, иначе open→low→high→close.
+        Каждый отрезок режем на 'steps' равных микрошагов (линейная интерполяция).
+        """
+        o = float(bar["open"]); h = float(bar["high"]); l = float(bar["low"]); c = float(bar["close"])
+        # порядок движения внутри свечи
+        path = [(o, h), (h, l), (l, c)] if c >= o else [(o, l), (l, h), (h, c)]
+        # микрошаги
+        for a, b in path:
+            # пропустим вырожденные куски
+            if steps <= 0 or a == b:
+                yield b
+                continue
+            for k in range(1, steps + 1):
+                yield a + (b - a) * (k / steps)
+
+    # основной цикл: идём по 15m барам (от старых к новым)
     for i in range(len(n15)):
         bar = n15[i]
         ts_ms = int(bar["timestamp"])
         o = float(bar["open"]); h = float(bar["high"]); l = float(bar["low"]); c = float(bar["close"])
 
-        # (1) закрывается 15m — стратегия может войти
+        # 1) закрытие 15m — стратегия может войти
         paper.set_price(c)
         before_pos = state.get_current_position()
         strategy.on_bar_close_15m({"timestamp": ts_ms, "open": o, "high": h, "low": l, "close": c})
         after_pos = state.get_current_position()
 
+        # если позиция открылась — отметим вспомогательные поля и инициализируем трейл
         if after_pos and after_pos is not before_pos and after_pos.get("status") == "open":
-            ensure_trail_engine_on_entry(ts_ms)
+            if "entry_time_ts" not in after_pos:
+                after_pos["entry_time_ts"] = ts_ms
+            after_pos["armed"] = not getattr(strategy.config, "use_arm_after_rr", True)
+            after_pos["trail_anchor"] = float(after_pos["entry_price"])
+            state.set_position(after_pos)
+        ensure_trail_engine_for_open_position()
 
-        # (2) проигрываем следующий 15m-отрезок минутами
+        # 2) симулируем следующий 15-минутный интервал по 1m с МИКРОШАГАМИ
         start_next = ((ts_ms // 900_000) * 900_000) + 900_000
         end_next   = start_next + 900_000
-        minute_bars = get_1m_between(start_next, end_next)
 
+        minute_bars = get_1m_between(start_next, end_next)
         for m in minute_bars:
             m_ts = int(m["timestamp"])
-            mo = float(m["open"]); mh = float(m["high"]); ml = float(m["low"]); mc = float(m["close"])
-
-            # определяем порядок микрошагов в зависимости от направления позиции
-            pos = state.get_current_position()
-            if pos and pos.get("status") == "open":
-                if pos["direction"] == "long":
-                    micro_path = (mo, mh, ml, mc)  # сначала проверим TP, потом SL
-                else:
-                    micro_path = (mo, ml, mh, mc)  # сначала проверим SL, потом TP
-            else:
-                micro_path = (mo, mc)  # позиции нет
-
-            for px in micro_path:
+            # ——— плавные микрошаги внутри 1m ———
+            for px in iter_micro_prices_1m(m, steps=6):  # ← хочешь — вынеси 6 в UI
                 paper.set_price(px)
 
-                # если позиция открыта — сначала обновим трейл движком
+                # 2.1) если позиция открыта — обновляем трейл-движок и стоп
                 pos = state.get_current_position()
                 if pos and pos.get("status") == "open":
                     if trail_engine is None:
-                        ensure_trail_engine_on_entry(m_ts)
+                        # защита от рассинхронизации
+                        ensure_trail_engine_for_open_position()
                         pos = state.get_current_position()
+                        if not (pos and pos.get("status") == "open"):
+                            continue
 
-                    # обновить SL по плавному трейлу
+                    # апдейт стопа по текущей цене (процентный, ARM по RR — внутри TrailEngine)
                     new_sl = trail_engine.update(px)
-                    if new_sl is not None and new_sl != pos.get("stop_loss"):
-                        pos["stop_loss"] = float(new_sl)
-                        state.set_position(pos)
+                    if isinstance(new_sl, (int, float)) and new_sl > 0:
+                        # обновляем стоп только если он стал "лучше"
+                        if pos["direction"] == "long":
+                            if new_sl > float(pos.get("stop_loss") or 0):
+                                pos["stop_loss"] = float(new_sl)
+                                state.set_position(pos)
+                        else:  # short
+                            if new_sl < float(pos.get("stop_loss") or 1e18):
+                                pos["stop_loss"] = float(new_sl)
+                                state.set_position(pos)
 
-                    # затем немедленная проверка SL/TP на текущем микрошаге
+                    # 2.2) проверяем SL/TP на этом микрошаге
                     sl = float(pos.get("stop_loss") or 0.0)
                     tp = pos.get("take_profit")
                     if pos["direction"] == "long":
                         if sl > 0 and px <= sl:
-                            log_trade_and_close(sl, m_ts, reason="SL")
-                            break
+                            close_position(sl, m_ts, reason="SL (micro)")
+                            ensure_trail_engine_for_open_position()
+                            break  # позиция закрыта — выходим из микрошагов этой минуты
                         if tp is not None and px >= float(tp):
-                            log_trade_and_close(float(tp), m_ts, reason="TP")
+                            close_position(float(tp), m_ts, reason="TP (micro)")
+                            ensure_trail_engine_for_open_position()
                             break
                     else:
                         if sl > 0 and px >= sl:
-                            log_trade_and_close(sl, m_ts, reason="SL")
+                            close_position(sl, m_ts, reason="SL (micro)")
+                            ensure_trail_engine_for_open_position()
                             break
                         if tp is not None and px <= float(tp):
-                            log_trade_and_close(float(tp), m_ts, reason="TP")
+                            close_position(float(tp), m_ts, reason="TP (micro)")
+                            ensure_trail_engine_for_open_position()
                             break
 
-            # снимок equity по итогу минуты
+            # equity-снимок раз в минуту (чтобы не раздувать dataframe)
             equity_points.append({"timestamp": m_ts, "equity": float(state.get_equity() or start_capital)})
 
-        # дополнительный снимок на конце 15m окна
+        # 3) снимок на конце 15m окна (для визуальной “ступеньки”)
         equity_points.append({"timestamp": end_next - 1, "equity": float(state.get_equity() or start_capital)})
-
     # хвост — если позиция осталась, закрываем по последнему доступному close
     pos = state.get_current_position()
     if pos and pos.get("status") == "open":
