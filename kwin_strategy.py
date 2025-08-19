@@ -69,6 +69,11 @@ class KWINStrategy:
         if self.candles_15m and self.candles_15m[0].get("timestamp") is not None:
             self.candles_15m.sort(key=lambda x: x.get("timestamp", 0), reverse=True)
 
+    def _ensure_1m_desc(self):
+        """Новейшая 1m свеча первой (индекс 0)."""
+        if self.candles_1m and self.candles_1m[0].get("timestamp") is not None:
+            self.candles_1m.sort(key=lambda x: x.get("timestamp", 0), reverse=True)
+
     def _current_bar_ts_ms(self) -> int:
         """Штамп времени ТЕКУЩЕГО закрытого 15m бара (мс)."""
         return int(self.last_processed_bar_ts or 0)
@@ -151,8 +156,24 @@ class KWINStrategy:
             print(f"Error in on_bar_close_60m: {e}")
 
     def on_bar_close_1m(self, candle: Dict):
-        """Обработка 1м баров для дополнительного мониторинга"""
-        pass
+        """
+        Обработка 1м баров (интрабар трейлинг).
+        Входы по-прежнему принимаются только на закрытии 15м.
+        """
+        try:
+            # буфер 1m
+            self.candles_1m.insert(0, candle)
+            max_history = int(getattr(self.config, "intrabar_pull_limit", 1000) or 1000)
+            if len(self.candles_1m) > max_history:
+                self.candles_1m = self.candles_1m[:max_history]
+            self._ensure_1m_desc()
+
+            # если есть открытая позиция — обновить Smart Trailing по 1m high/low
+            pos = self.state.get_current_position()
+            if pos and pos.get("status") == "open" and getattr(self.config, "use_intrabar", True):
+                self._update_smart_trailing(pos)
+        except Exception as e:
+            print(f"Error in on_bar_close_1m: {e}")
 
     # ==================== Пуллинг свечей с биржи ====================
 
@@ -173,11 +194,19 @@ class KWINStrategy:
                 klines_15m.sort(key=lambda x: x.get("timestamp", 0), reverse=True)
                 self.candles_15m = klines_15m
 
-            # 1m
-            klines_1m = self.api.get_klines(self.symbol, "1", 10)
+            # 1m (интрабар)
+            intrabar_tf = str(getattr(self.config, "intrabar_tf", "1"))
+            intrabar_lim = int(getattr(self.config, "intrabar_pull_limit", 1000) or 1000)
+            klines_1m = self.api.get_klines(self.symbol, intrabar_tf, min(1000, intrabar_lim))
             if klines_1m:
-                self.candles_1m = klines_1m
+                for k in klines_1m:
+                    ts = k.get("timestamp")
+                    if ts is not None and ts < 1_000_000_000_000:
+                        k["timestamp"] = int(ts * 1000)
+                klines_1m.sort(key=lambda x: x.get("timestamp", 0), reverse=True)
+                self.candles_1m = klines_1m[:intrabar_lim]
 
+            # «одно срабатывание» на закрытый 15m бар
             if self.candles_15m:
                 current_candle = self.candles_15m[0]
                 current_timestamp = int(current_candle.get('timestamp', 0))
@@ -185,8 +214,11 @@ class KWINStrategy:
                     current_timestamp *= 1000
                 aligned_timestamp = self._align_15m_ms(current_timestamp)
 
-                # ГАРД: один вызов на закрытый бар
                 if self.last_processed_bar_ts == aligned_timestamp:
+                    # но при этом, если позиция открыта — разрешим интрабар-трейл
+                    pos = self.state.get_current_position()
+                    if pos and pos.get("status") == "open" and getattr(self.config, "use_intrabar", True):
+                        self._update_smart_trailing(pos)
                     return
 
                 self.last_processed_bar_ts = aligned_timestamp
@@ -567,6 +599,22 @@ class KWINStrategy:
         current_time = datetime.utcfromtimestamp(current_timestamp / 1000)
         return current_time >= start_date.replace(tzinfo=None)
 
+    def _get_bar_extremes_for_trailing(self, fallback_price: float) -> Tuple[float, float]:
+        """
+        Возвращает (bar_high, bar_low) для расчёта якоря трейла.
+        При use_intrabar=True берём последнюю 1m свечу, иначе — 15m.
+        """
+        try:
+            if getattr(self.config, "use_intrabar", True) and self.candles_1m:
+                last_bar = self.candles_1m[0]
+                return float(last_bar['high']), float(last_bar['low'])
+            elif self.candles_15m:
+                last_bar = self.candles_15m[0]
+                return float(last_bar['high']), float(last_bar['low'])
+        except Exception:
+            pass
+        return float(fallback_price), float(fallback_price)
+
     def _update_smart_trailing(self, position: Dict):
         """
         Pine-эквивалент Smart Trailing:
@@ -610,12 +658,7 @@ class KWINStrategy:
 
             # 3) Поддерживаем якорь экстремума с момента входа
             anchor = float(position.get('trail_anchor') or entry)
-            try:
-                last_bar = self.candles_15m[0] if self.candles_15m else None
-                bar_high = float(last_bar['high']) if last_bar else price
-                bar_low  = float(last_bar['low'])  if last_bar else price
-            except Exception:
-                bar_high, bar_low = price, price
+            bar_high, bar_low = self._get_bar_extremes_for_trailing(price)
 
             if direction == 'long':
                 anchor = max(anchor, bar_high)
