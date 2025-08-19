@@ -335,6 +335,8 @@ class KWINStrategy:
         side_up = "Buy" if direction == "long" else "Sell"
         side_lo = "buy" if direction == "long" else "sell"
         qty = float(quantity)
+        # округлим стоп до тика перед отправкой
+        sl_send = price_round(stop_loss, self.tick_size) if stop_loss is not None else None
         try:
             # стиль v5
             return self.api.place_order(
@@ -342,7 +344,7 @@ class KWINStrategy:
                 side=side_up,
                 orderType="Market",
                 qty=qty,
-                stop_loss=stop_loss
+                stop_loss=sl_send
             )
         except TypeError:
             # snake_case стиль
@@ -351,7 +353,7 @@ class KWINStrategy:
                 side=side_lo,
                 order_type="market",
                 qty=qty,
-                stop_loss=stop_loss
+                stop_loss=sl_send
             )
 
     def _process_long_entry(self):
@@ -362,13 +364,27 @@ class KWINStrategy:
                 return
             if len(self.candles_15m) < 2:
                 return
-            stop_loss = float(self.candles_15m[1]['low'])
+
+            # SL = low предыдущего бара, потом всё округляем к тикам
+            raw_sl = float(self.candles_15m[1]['low'])
             entry_price = float(current_price)
+
+            # округление цен к тик-сайзу (как в Pine через mintick)
+            entry_price = price_round(entry_price, self.tick_size)
+            stop_loss   = price_round(raw_sl, self.tick_size)
+
+            # риск/TP
+            stop_size = entry_price - stop_loss
+            if stop_size <= 0:
+                return
+            take_profit = entry_price + stop_size * self.config.risk_reward
+            take_profit = price_round(take_profit, self.tick_size)
+
+            # размер позиции
             quantity = self._calculate_position_size(entry_price, stop_loss, "long")
             if not quantity:
                 return
-            stop_size = entry_price - stop_loss
-            take_profit = entry_price + stop_size * self.config.risk_reward
+
             if not self._validate_position_requirements(entry_price, stop_loss, take_profit, quantity):
                 return
 
@@ -398,10 +414,7 @@ class KWINStrategy:
                 'stop_loss': stop_loss,
                 'take_profit': take_profit,
                 'status': 'open',
-                # Pine: arm сразу активен, если useArmAfterRR=false
-                'armed': not getattr(self.config, 'use_arm_after_rr', True),
-                # якорь для процентного трейла = экстремум с момента входа
-                'trail_anchor': float(entry_price),
+                'armed': not self.config.use_arm_after_rr,
                 'entry_time_ts': bar_ts_ms
             })
             self.can_enter_long = False
@@ -418,13 +431,24 @@ class KWINStrategy:
                 return
             if len(self.candles_15m) < 2:
                 return
-            stop_loss = float(self.candles_15m[1]['high'])
+
+            # SL = high предыдущего бара, округление
+            raw_sl = float(self.candles_15m[1]['high'])
             entry_price = float(current_price)
+
+            entry_price = price_round(entry_price, self.tick_size)
+            stop_loss   = price_round(raw_sl, self.tick_size)
+
+            stop_size = stop_loss - entry_price
+            if stop_size <= 0:
+                return
+            take_profit = entry_price - stop_size * self.config.risk_reward
+            take_profit = price_round(take_profit, self.tick_size)
+
             quantity = self._calculate_position_size(entry_price, stop_loss, "short")
             if not quantity:
                 return
-            stop_size = stop_loss - entry_price
-            take_profit = entry_price - stop_size * self.config.risk_reward
+
             if not self._validate_position_requirements(entry_price, stop_loss, take_profit, quantity):
                 return
 
@@ -454,8 +478,7 @@ class KWINStrategy:
                 'stop_loss': stop_loss,
                 'take_profit': take_profit,
                 'status': 'open',
-                'armed': not getattr(self.config, 'use_arm_after_rr', True),
-                'trail_anchor': float(entry_price),
+                'armed': not self.config.use_arm_after_rr,
                 'entry_time_ts': bar_ts_ms
             })
             self.can_enter_short = False
@@ -547,41 +570,37 @@ class KWINStrategy:
     def _update_smart_trailing(self, position: Dict):
         """
         Pine-эквивалент Smart Trailing:
-        - ARM по RR считается по close (если use_arm_after_rr)
-        - Если use_bar_trail: барный трейл (lowest/highest с lookback и буфером tick'ов)
-        - Иначе: процентный трейл от entry с якорем-экстремумом
-        - Стоп двигаем только в сторону сокращения риска (монотонно)
+        - anchor = экстремум с момента входа (high для long, low для short)
+        - ARM по RR (от текущей цены; при арминге сохраняем флаг)
+        - стоп = anchor ± (entry * trailing_perc% + entry * offset_perc%)
+        - стоп двигаем только в сторону сокращения риска (монотонно)
         """
         try:
-            if not getattr(self.config, 'enable_smart_trail', True):
+            if not self.config.enable_smart_trail:
                 return
 
             direction = position.get('direction')
-            entry     = float(position.get('entry_price') or 0.0)
-            sl        = float(position.get('stop_loss') or 0.0)
+            entry = float(position.get('entry_price') or 0)
+            sl = float(position.get('stop_loss') or 0)
             if not direction or entry <= 0 or sl <= 0:
                 return
 
-            # --- текущие данные бара ---
-            try:
-                bar = self.candles_15m[0] if self.candles_15m else None
-                bar_high = float(bar['high']) if bar else entry
-                bar_low  = float(bar['low'])  if bar else entry
-                bar_close = float(bar['close']) if bar else entry
-            except Exception:
-                bar_high = bar_low = bar_close = entry
+            # 1) Текущая цена для ARM
+            price = self._get_current_price()
+            if price is None:
+                return
+            price = float(price)
 
-            # --- ARM по RR (по close) ---
-            use_arm = bool(getattr(self.config, 'use_arm_after_rr', True))
-            armed   = bool(position.get('armed', not use_arm))
-            if not armed and use_arm:
+            # 2) ARM по RR (если включено)
+            armed = bool(position.get('armed', not getattr(self.config, 'use_arm_after_rr', True)))
+            if not armed and getattr(self.config, 'use_arm_after_rr', True):
                 risk = abs(entry - sl)
                 if risk > 0:
                     if direction == 'long':
-                        rr_now = (bar_close - entry) / risk
+                        rr = (price - entry) / risk
                     else:
-                        rr_now = (entry - bar_close) / risk
-                    if rr_now >= float(getattr(self.config, 'arm_rr', 0.5)):
+                        rr = (entry - price) / risk
+                    if rr >= float(getattr(self.config, 'arm_rr', 0.5)):
                         armed = True
                         position['armed'] = True
                         self.state.set_position(position)
@@ -589,38 +608,25 @@ class KWINStrategy:
             if not armed:
                 return
 
-            # --- Режим 1: барный трейл ---
-            if bool(getattr(self.config, 'use_bar_trail', True)):
-                lookback = int(getattr(self.config, 'trail_lookback', 50) or 50)
-                hist = self.candles_15m[1:lookback+1] if self.candles_15m else []
-                if not hist:
-                    return
-                tick = float(getattr(self, 'tick_size', 0.01)) or 0.01
-                buf_ticks = int(getattr(self.config, 'trail_buf_ticks', 40) or 0)
-                buf = tick * buf_ticks
-
-                if direction == 'long':
-                    lb_low = min(float(b['low']) for b in hist)
-                    candidate = max(lb_low - buf, float(position.get('stop_loss', sl)))
-                    if candidate > sl:
-                        self._update_stop_loss(position, candidate)
-                else:
-                    lb_high = max(float(b['high']) for b in hist)
-                    candidate = min(lb_high + buf, float(position.get('stop_loss', sl)))
-                    if candidate < sl:
-                        self._update_stop_loss(position, candidate)
-                return
-
-            # --- Режим 2: процентный трейл ---
+            # 3) Поддерживаем якорь экстремума с момента входа
             anchor = float(position.get('trail_anchor') or entry)
+            try:
+                last_bar = self.candles_15m[0] if self.candles_15m else None
+                bar_high = float(last_bar['high']) if last_bar else price
+                bar_low  = float(last_bar['low'])  if last_bar else price
+            except Exception:
+                bar_high, bar_low = price, price
+
             if direction == 'long':
                 anchor = max(anchor, bar_high)
             else:
                 anchor = min(anchor, bar_low)
+
             if anchor != position.get('trail_anchor'):
                 position['trail_anchor'] = anchor
                 self.state.set_position(position)
 
+            # 4) Расчёт процентного трейла от entry + offset (в процентах от entry)
             trail_perc  = float(getattr(self.config, 'trailing_perc', 0.5)) / 100.0
             offset_perc = float(getattr(self.config, 'trailing_offset_perc', 0.4)) / 100.0
             trail_dist  = entry * trail_perc
@@ -628,11 +634,13 @@ class KWINStrategy:
 
             if direction == 'long':
                 candidate = anchor - trail_dist - offset_dist
-                if candidate > sl:
+                candidate = price_round(candidate, self.tick_size)
+                if candidate > sl:  # только ужесточаем
                     self._update_stop_loss(position, candidate)
             else:
                 candidate = anchor + trail_dist + offset_dist
-                if candidate < sl:
+                candidate = price_round(candidate, self.tick_size)
+                if candidate < sl:  # только ужесточаем
                     self._update_stop_loss(position, candidate)
 
         except Exception as e:
@@ -643,14 +651,25 @@ class KWINStrategy:
             lookback = getattr(self.config, 'trail_lookback', 50) or 50
             if len(self.candles_15m) < lookback:
                 return current_sl
+
+            # Берём историю БЕЗ текущего бара (эквивалент [1:lookback+1])
             history_bars = self.candles_15m[1:lookback + 1]
+            buf_ticks = int(getattr(self.config, 'trail_buf_ticks', 0) or 0)
+            buf = float(buf_ticks) * float(self.tick_size)
+
             if direction == 'long':
-                min_low = min(bar['low'] for bar in history_bars)
-                new_sl = max(min_low, current_sl)
+                min_low = min(float(bar['low']) for bar in history_bars)
+                candidate = min_low - buf
+                # монотонность: только вверх
+                new_sl = max(candidate, current_sl)
             else:
-                max_high = max(bar['high'] for bar in history_bars)
-                new_sl = min(max_high, current_sl)
-            return new_sl
+                max_high = max(float(bar['high']) for bar in history_bars)
+                candidate = max_high + buf
+                # монотонность: только вниз
+                new_sl = min(candidate, current_sl)
+
+            # всегда к тик-сайзу
+            return price_round(new_sl, self.tick_size)
         except Exception as e:
             print(f"Error calculating bar trailing stop: {e}")
             return current_sl
@@ -661,10 +680,12 @@ class KWINStrategy:
             if direction == 'long':
                 trail_distance = current_price * trail_pct
                 new_sl = current_price - trail_distance
+                new_sl = price_round(new_sl, self.tick_size)
                 return max(new_sl, current_sl)
             else:
                 trail_distance = current_price * trail_pct
                 new_sl = current_price + trail_distance
+                new_sl = price_round(new_sl, self.tick_size)
                 return min(new_sl, current_sl)
         except Exception as e:
             print(f"Error calculating percentage trailing stop: {e}")
@@ -674,6 +695,8 @@ class KWINStrategy:
         try:
             if not self.api or not hasattr(self.api, "modify_order"):
                 return False
+            # округляем перед отправкой и сохранением
+            new_sl = price_round(float(new_sl), self.tick_size)
             _ = self.api.modify_order(symbol=position['symbol'], stop_loss=new_sl)
             position['stop_loss'] = new_sl
             self.state.set_position(position)
