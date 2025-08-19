@@ -139,7 +139,7 @@ def fetch_bybit_v5_window(symbol: str, days: int, interval: str = "15", category
     if out:
         first_dt = datetime.utcfromtimestamp(out[0]["timestamp"]/1000)
         last_dt  = datetime.utcfromtimestamp(out[-1]["timestamp"]/1000)
-        st.success(f"✅ Свечи Bybit v5 загружены: {len(out)} шт • {first_dt:%Y-%m-%d %H:%М} — {last_dt:%Y-%m-%d %H:%М} UTC")
+        st.success(f"✅ Свечи Bybit v5 загружены: {len(out)} шт • {first_dt:%Y-%m-%d %H:%M} — {last_dt:%Y-%m-%d %H:%M} UTC")
     else:
         st.warning("Bybit v5 вернул пустой набор за выбранный период.")
 
