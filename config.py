@@ -31,6 +31,17 @@ class Config:
         self.risk_reward = 1.3          # TP Risk/Reward Ratio
         self.sfp_len = 2                # Swing Length
         self.risk_pct = 3.0             # Risk % per trade
+
+    # ... твои существующие поля ...
+        price_for_logic: str = "last"          # "last" | "mark"
+        trigger_price_source: str = "last"     # "last" | "mark"
+        arm_rr_basis: str = "extremum"         # "extremum" | "last"
+
+        taker_fee_rate: float = 0.00055
+        maker_fee_rate: float = 0.0002
+
+        slippage_pct: float = 0.0              # 0.0005 => 5 bps
+        latency_ms: int = 0                    # микрозадержка обработки SL/TP
         
         # === SMART TRAILING ===
         self.enable_smart_trail = True  # Enable Smart Trailing TP
