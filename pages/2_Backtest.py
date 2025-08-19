@@ -20,6 +20,42 @@ from config import Config
 from bybit_api import BybitAPI  # используется только для совместимости импортов
 from state_manager import StateManager
 
+def _close_position(exit_price: float, ts_ms: int, reason: str):
+    pos = state.get_current_position()
+    if not pos or pos.get("status") != "open":
+        return
+    direction   = pos["direction"]
+    entry_price = float(pos["entry_price"])
+    qty         = float(pos["size"])
+    fee_rate    = float(getattr(strategy.config, "taker_fee_rate", 0.00055))
+
+    gross = (exit_price - entry_price) * qty if direction == "long" else (entry_price - exit_price) * qty
+    fees  = (entry_price + exit_price) * qty * fee_rate
+    pnl   = gross - fees
+
+    new_eq = float(state.get_equity() or start_capital) + pnl
+    state.set_equity(new_eq)
+
+    bt_trades.append({
+        "symbol": strategy.config.symbol,
+        "direction": direction,
+        "entry_price": entry_price,
+        "exit_price": float(exit_price),
+        "stop_loss": float(pos.get("stop_loss") or 0),
+        "take_profit": float(pos.get("take_profit") or 0),
+        "quantity": qty,
+        "pnl": float(pnl),
+        "rr": None,
+        "entry_time": datetime.utcfromtimestamp(int(pos.get("entry_time_ts", ts_ms))/1000),
+        "exit_time":  datetime.utcfromtimestamp(int(ts_ms)/1000),
+        "exit_reason": reason,
+        "status": "closed",
+    })
+    pos["status"] = "closed"
+    pos["exit_price"] = float(exit_price)
+    pos["exit_time"]  = datetime.utcfromtimestamp(int(ts_ms)/1000)
+    state.set_position(pos)
+
 # -------------------- Ресурсы на сессию (фикс "SessionInfo before it was initialized") --------------------
 api = None  # paper API подменяется ниже
 
@@ -676,14 +712,14 @@ def run_backtest_real(strategy: KWINStrategy, candles: list[dict], start_capital
             tp = pos.get("take_profit")
             if pos["direction"] == "long":
                 if sl > 0 and l <= sl:
-                    close_position(sl, ts_ms, reason="SL")
+                    _close_position(sl, ts_ms, reason="SL")
                 elif tp is not None and h >= float(tp):
-                    close_position(float(tp), ts_ms, reason="TP")
+                    _close_position(float(tp), ts_ms, reason="TP")
             else:
                 if sl > 0 and h >= sl:
-                    close_position(sl, ts_ms, reason="SL")
+                    _close_position(sl, ts_ms, reason="SL")
                 elif tp is not None and l <= float(tp):
-                    close_position(float(tp), ts_ms, reason="TP")
+                    _close_position(float(tp), ts_ms, reason="TP")
 
         # (C) передать закрытый бар в стратегию (возможен вход)
         before_pos = state.get_current_position()
@@ -704,7 +740,7 @@ def run_backtest_real(strategy: KWINStrategy, candles: list[dict], start_capital
     pos = state.get_current_position()
     if pos and pos.get("status") == "open":
         last = candles[-1]
-        close_position(float(last["close"]), int(last["timestamp"]), reason="EOD")
+        _close_position(float(last["close"]), int(last["timestamp"]), reason="EOD")
 
     trades_df = pd.DataFrame(bt_trades)
     equity_df = pd.DataFrame(equity_points)
@@ -956,20 +992,20 @@ def run_backtest_real_intrabar(strategy: KWINStrategy,
                     tp = pos.get("take_profit")
                     if pos["direction"] == "long":
                         if sl > 0 and px <= sl:
-                            close_position(sl, m_ts, reason="SL (micro)")
+                            _close_position(sl, m_ts, reason="SL (micro)")
                             ensure_trail_engine_for_open_position()
                             break  # позиция закрыта — выходим из микрошагов этой минуты
                         if tp is not None and px >= float(tp):
-                            close_position(float(tp), m_ts, reason="TP (micro)")
+                            _close_position(float(tp), m_ts, reason="TP (micro)")
                             ensure_trail_engine_for_open_position()
                             break
                     else:
                         if sl > 0 and px >= sl:
-                            close_position(sl, m_ts, reason="SL (micro)")
+                            _close_position(sl, m_ts, reason="SL (micro)")
                             ensure_trail_engine_for_open_position()
                             break
                         if tp is not None and px <= float(tp):
-                            close_position(float(tp), m_ts, reason="TP (micro)")
+                            _close_position(float(tp), m_ts, reason="TP (micro)")
                             ensure_trail_engine_for_open_position()
                             break
 
@@ -1175,17 +1211,17 @@ def run_backtest_real_intrabar(strategy: KWINStrategy,
                     tp = pos.get("take_profit")
                     if pos["direction"] == "long":
                         if sl > 0 and px <= sl:
-                            close_position(sl, m_ts, reason="SLi")
+                            _close_position(sl, m_ts, reason="SLi")
                             break
                         elif tp is not None and px >= float(tp):
-                            close_position(float(tp), m_ts, reason="TPi")
+                            _close_position(float(tp), m_ts, reason="TPi")
                             break
                     else:
                         if sl > 0 and px >= sl:
-                            close_position(sl, m_ts, reason="SLi")
+                            _close_position(sl, m_ts, reason="SLi")
                             break
                         elif tp is not None and px <= float(tp):
-                            close_position(float(tp), m_ts, reason="TPi")
+                            _close_position(float(tp), m_ts, reason="TPi")
                             break
 
             # equity-снимок 1 раз на минуту (без раздувания массива)
@@ -1202,7 +1238,7 @@ def run_backtest_real_intrabar(strategy: KWINStrategy,
             last = n1[-1]
         else:
             last = n15[-1]
-        close_position(float(last["close"]), int(last["timestamp"]), reason="EOD")
+        _close_position(float(last["close"]), int(last["timestamp"]), reason="EOD")
 
     trades_df = pd.DataFrame(bt_trades)
     equity_df = pd.DataFrame(equity_points)
