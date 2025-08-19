@@ -10,6 +10,8 @@ from trail_engine import TrailEngine
 from analytics import TradingAnalytics
 from utils import price_round, qty_round
 from database import Database
+from utils_round import round_price, round_qty
+
 
 
 class KWINStrategy:
