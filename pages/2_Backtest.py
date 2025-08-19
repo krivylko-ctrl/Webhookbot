@@ -5,6 +5,7 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from trail_engine import TrailEngine
 from datetime import datetime, timedelta, timezone
+from utils_round import round_price, round_qty
 import requests   # ← нужен для прямого запроса v5
 import time       # ← анти-рейткэп в загрузчике
 from pandas.api.types import is_numeric_dtype, is_datetime64_any_dtype  # ← для стабильной нормализации времени
