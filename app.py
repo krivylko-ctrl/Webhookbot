@@ -41,7 +41,6 @@ def init_components():
     state_manager = StateManager(db)
 
     # ====== ТОЧЕЧНО: прокидываем трейлинг-настройки и ARM в config из cfg/env ======
-    # Безопасные дефолты, если в cfg нет полей
     config.enable_smart_trail      = bool(getattr(cfg, "ENABLE_SMART_TRAIL", True))
     config.trailing_perc           = float(getattr(cfg, "TRAILING_PERC", 0.5))           # в %
     config.trailing_offset_perc    = float(getattr(cfg, "TRAILING_OFFSET_PERC", 0.4))    # в %
@@ -52,10 +51,11 @@ def init_components():
     config.use_arm_after_rr        = bool(getattr(cfg, "USE_ARM_AFTER_RR", True))
     config.arm_rr                  = float(getattr(cfg, "ARM_RR", 0.5))
 
-    # Базовые параметры риска (на случай отсутствия явной инициализации в другом месте)
+    # Базовые параметры риска
     config.risk_pct                = float(getattr(cfg, "RISK_PCT", getattr(config, "risk_pct", 3.0)))
     config.risk_reward             = float(getattr(cfg, "RISK_REWARD", getattr(config, "risk_reward", 1.3)))
-    # Символ/таймфреймы (если стратегия на них опирается из config)
+
+    # Символ/рынок
     if hasattr(cfg, "SYMBOL"):
         config.symbol = cfg.SYMBOL
     # ==============================================================================
@@ -64,8 +64,7 @@ def init_components():
     if getattr(cfg, "BYBIT_API_KEY", None) and getattr(cfg, "BYBIT_API_SECRET", None):
         # Пробуем подключиться к Bybit
         bybit_api = BybitAPI(cfg.BYBIT_API_KEY, cfg.BYBIT_API_SECRET, testnet=False)
-
-        # Проверяем доступность API
+        # Проверка доступности API
         try:
             server_time = bybit_api.get_server_time()
             if not server_time:
@@ -83,8 +82,86 @@ def init_components():
         st.info("ℹ️ API ключи не настроены. Работаем в демо-режиме.")
 
     strategy = KWINStrategy(config, bybit_api, state_manager, db)
-
     return config, db, state_manager, bybit_api, strategy
+
+# ---------- ФОНОВЫЙ ЦИКЛ ДЛЯ ЛАЙВ-РЕЖИМА (чаще обновляет трейлинг и закрытые бары) ----------
+def _bg_bot_loop(bybit_api, strategy: KWINStrategy, state_manager: StateManager, config: Config, poll_sec: float = 2.0):
+    """
+    Лёгкий поток:
+      - раз в poll_sec обновляет «текущую цену» через get_ticker
+      - пытается взять последние свечи 15m (2-3 штуки) и отдать закрытый бар стратегии ровно 1 раз
+      - вызывает strategy.process_trailing() для имитации calc_on_every_tick
+    """
+    # последний отданный в стратегию таймстамп закрытого бара (мс), для защиты от дублей
+    last_closed_ts = 0
+
+    while getattr(st.session_state, "bot_running", False):
+        try:
+            # 1) Обновим текущую цену для ARM/трейлинга
+            try:
+                t = bybit_api.get_ticker(config.symbol) if hasattr(bybit_api, "get_ticker") else {}
+                # ничего не делаем: внутренняя стратегия сама читает через self.api.get_ticker()
+                _ = t
+            except Exception:
+                pass
+
+            # 2) Возьмём последние 2-3 закрытые 15m свечи
+            closed_bar = None
+            try:
+                kl = bybit_api.get_klines(config.symbol, "15", 3) if hasattr(bybit_api, "get_klines") else []
+                if kl:
+                    # предполагаем, что API возвращает закрытые бары, отсортируем по времени по возрастанию
+                    df = pd.DataFrame(kl)
+                    if "timestamp" in df.columns:
+                        df = df.sort_values("timestamp")
+                        # берём самый новый закрытый бар
+                        closed_bar = df.iloc[-1].to_dict()
+                        ts = int(closed_bar.get("timestamp", 0))
+                        # защита от повторов
+                        if ts and ts != last_closed_ts:
+                            strategy.on_bar_close_15m({
+                                "timestamp": int(closed_bar["timestamp"]),
+                                "open": float(closed_bar["open"]),
+                                "high": float(closed_bar["high"]),
+                                "low":  float(closed_bar["low"]),
+                                "close": float(closed_bar["close"])
+                            })
+                            last_closed_ts = ts
+            except Exception:
+                pass
+
+            # 3) По месту — обновим трейлинг (имитация calc_on_every_tick)
+            try:
+                strategy.process_trailing()
+            except Exception:
+                pass
+
+        except Exception:
+            # не рушим поток
+            pass
+
+        # пауза опроса
+        time.sleep(poll_sec)
+
+def _start_bot_thread(bybit_api, strategy, state_manager, config):
+    if "bot_thread" in st.session_state and st.session_state.bot_thread and st.session_state.bot_thread.is_alive():
+        return
+    th = threading.Thread(
+        target=_bg_bot_loop,
+        args=(bybit_api, strategy, state_manager, config, 2.0),
+        daemon=True
+    )
+    st.session_state.bot_thread = th
+    th.start()
+
+def _stop_bot_thread():
+    # сам поток закончится, когда bot_running станет False
+    th = st.session_state.get("bot_thread")
+    if th and th.is_alive():
+        # дадим мягко завершиться
+        pass
+
+# ---------------------------------------------------------------------------------------------
 
 def main():
 
@@ -109,12 +186,14 @@ def main():
             if st.button("▶️ Старт", use_container_width=True):
                 if not st.session_state.bot_running:
                     st.session_state.bot_running = True
+                    _start_bot_thread(bybit_api, strategy, state_manager, config)
                     st.success("Бот запущен!")
 
         with col2:
             if st.button("⏹️ Стоп", use_container_width=True):
                 if st.session_state.bot_running:
                     st.session_state.bot_running = False
+                    _stop_bot_thread()
                     st.error("Бот остановлен!")
 
         # Статус подключения
@@ -146,9 +225,10 @@ def main():
 
         # Текущие настройки
         st.markdown("### ⚙️ Текущие настройки")
+        st.write(f"**Символ:** {config.symbol}")
         st.write(f"**Риск:** {config.risk_pct}%")
         st.write(f"**RR:** {config.risk_reward}")
-        st.write(f"**Макс. позиция:** {getattr(config, 'max_qty_manual', 0)} ETH")
+        st.write(f"**Макс. позиция:** {getattr(config, 'max_qty_manual', 0)}")
         st.write(f"**Трейлинг активен:** {'✅' if config.enable_smart_trail else '❌'}")
 
         # ====== ТОЧЕЧНО: блок с трейлинг-настройками/ARM для наглядности ======
@@ -178,13 +258,18 @@ def show_dashboard(db, state_manager, strategy):
     """Показать основную информацию дашборда"""
     col1, col2, col3, col4 = st.columns(4)
 
+    eq = state_manager.get_equity() or 0.0
     with col1:
-        st.metric("💰 Equity", f"${state_manager.get_equity():.2f}")
+        st.metric("💰 Equity", f"${float(eq):.2f}")
 
     with col2:
         current_pos = state_manager.get_current_position()
-        pos_text = f"{current_pos.get('size', 0):.4f} ETH" if current_pos else "0 ETH"
-        st.metric("📍 Позиция", pos_text)
+        if current_pos:
+            sz = float(current_pos.get('size') or 0)
+            base = getattr(strategy.config, "symbol", "BASE")
+            st.metric("📍 Позиция", f"{sz:.4f} ({base})")
+        else:
+            st.metric("📍 Позиция", "0")
 
     with col3:
         trades_today = db.get_trades_count_today()
@@ -192,32 +277,34 @@ def show_dashboard(db, state_manager, strategy):
 
     with col4:
         pnl_today = db.get_pnl_today()
-        st.metric("💵 PnL сегодня", f"${pnl_today:.2f}")
+        st.metric("💵 PnL сегодня", f"${float(pnl_today):.2f}")
 
     # Статистика за последние 30 дней
     st.markdown("### 📈 Статистика за 30 дней")
 
-    stats = db.get_performance_stats(days=30)
+    stats = db.get_performance_stats(days=30) or {}
 
     col1, col2, col3 = st.columns(3)
     with col1:
-        st.metric("🎯 Win Rate", f"{stats.get('win_rate', 0):.1f}%")
+        st.metric("🎯 Win Rate", f"{float(stats.get('win_rate', 0)):.1f}%")
     with col2:
-        st.metric("📊 Avg RR", f"{stats.get('avg_rr', 0):.2f}")
+        st.metric("📊 Avg RR", f"{float(stats.get('avg_rr', 0)):.2f}")
     with col3:
-        st.metric("⏱️ Avg Hold Time", f"{stats.get('avg_hold_time', 0):.1f}h")
+        st.metric("⏱️ Avg Hold Time", f"{float(stats.get('avg_hold_time', 0)):.1f}h")
 
 def show_chart(bybit_api, db, strategy):
     """Показать график с сделками"""
-    st.markdown("### 📈 График ETH/USDT")
+    symbol = getattr(strategy.config, "symbol", "ETHUSDT")
+    st.markdown(f"### 📈 График {symbol}")
 
     # Получаем данные свечей
     if bybit_api:
         try:
-            klines = bybit_api.get_klines("ETHUSDT", "15", 100)
+            klines = bybit_api.get_klines(symbol, "15", 100)
             if klines:
                 df = pd.DataFrame(klines)
-                df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+                if "timestamp" in df.columns:
+                    df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms', errors='coerce')
 
                 # Создаем график свечей
                 fig = go.Figure(data=[go.Candlestick(
@@ -226,28 +313,31 @@ def show_chart(bybit_api, db, strategy):
                     high=df['high'],
                     low=df['low'],
                     close=df['close'],
-                    name="ETH/USDT"
+                    name=symbol
                 )])
 
                 # Добавляем сделки
-                trades = db.get_recent_trades(50)
+                trades = db.get_recent_trades(50) or []
                 for trade in trades:
-                    if trade['entry_time']:
-                        entry_time = pd.to_datetime(trade['entry_time'])
-                        fig.add_trace(go.Scatter(
-                            x=[entry_time],
-                            y=[trade['entry_price']],
-                            mode='markers',
-                            marker=dict(
-                                symbol='triangle-up' if trade['direction'] == 'long' else 'triangle-down',
-                                size=10,
-                                color='green' if trade['direction'] == 'long' else 'red'
-                            ),
-                            name=f"Entry {trade['direction']}"
-                        ))
+                    try:
+                        if trade.get('entry_time'):
+                            entry_time = pd.to_datetime(trade['entry_time'], errors='coerce')
+                            fig.add_trace(go.Scatter(
+                                x=[entry_time],
+                                y=[float(trade['entry_price'])],
+                                mode='markers',
+                                marker=dict(
+                                    symbol='triangle-up' if trade.get('direction') == 'long' else 'triangle-down',
+                                    size=10,
+                                    color='green' if trade.get('direction') == 'long' else 'red'
+                                ),
+                                name=f"Entry {trade.get('direction')}"
+                            ))
+                    except Exception:
+                        pass
 
                 fig.update_layout(
-                    title="ETH/USDT 15m с входами",
+                    title=f"{symbol} 15m с входами",
                     xaxis_title="Время",
                     yaxis_title="Цена",
                     height=600
@@ -267,7 +357,8 @@ def show_equity_curve(db):
 
     if equity_data:
         df = pd.DataFrame(equity_data)
-        df['timestamp'] = pd.to_datetime(df['timestamp'])
+        if "timestamp" in df.columns:
+            df['timestamp'] = pd.to_datetime(df['timestamp'], errors='coerce')
 
         fig = go.Figure()
         fig.add_trace(go.Scatter(
@@ -299,16 +390,17 @@ def show_trades_table(db):
         df = pd.DataFrame(trades)
 
         # Форматируем данные для отображения
-        df['entry_time'] = pd.to_datetime(df['entry_time'])
-        df['exit_time'] = pd.to_datetime(df['exit_time'])
-        df['pnl'] = df['pnl'].round(2)
-        df['rr'] = df['rr'].round(2)
+        if 'entry_time' in df.columns:
+            df['entry_time'] = pd.to_datetime(df['entry_time'], errors='coerce')
+        if 'exit_time' in df.columns:
+            df['exit_time'] = pd.to_datetime(df['exit_time'], errors='coerce')
+        for col in ('pnl', 'rr', 'entry_price', 'exit_price', 'quantity'):
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors='coerce')
 
         # Отображаем таблицу
-        st.dataframe(
-            df[['entry_time', 'direction', 'entry_price', 'exit_price', 'quantity', 'pnl', 'rr', 'status']],
-            use_container_width=True
-        )
+        cols = [c for c in ['entry_time', 'direction', 'entry_price', 'exit_price', 'quantity', 'pnl', 'rr', 'status'] if c in df.columns]
+        st.dataframe(df[cols].round(4), use_container_width=True)
     else:
         st.info("Нет сделок для отображения")
 
