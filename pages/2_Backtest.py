@@ -721,11 +721,14 @@ def run_backtest_real_intrabar(strategy: KWINStrategy,
                                start_capital: float):
     """
     Входы — на закрытии 15m.
-    Управление позицией (Smart Trail + SL/TP) — пошагово по 1m между закрытиями 15m.
-    (ДОБАВЛЕНО) Плавный интрабар: микрошаги внутри каждой 1m свечи.
+    Управление позицией — пошагово по 1m, с плавными микрошагами внутри каждой минутной свечи:
+      • для LONG:  O -> H -> L -> C
+      • для SHORT: O -> L -> H -> C
+    На каждом микрошаге: обновляем SmartTrail (TrailEngine) и сразу проверяем SL/TP.
     """
     import pandas as pd
     from datetime import datetime
+    from trail_engine import TrailEngine  # новый плавный трейл
 
     # --- нормализация 15m ---
     n15 = []
@@ -793,12 +796,12 @@ def run_backtest_real_intrabar(strategy: KWINStrategy,
     bt_trades = []
     equity_points = []
 
-    # быстрая навигация по 1m
+    # быстрый доступ к 1m
     idx1 = 0
     n1_len = len(n1)
 
     def get_1m_between(start_ms: int, end_ms: int) -> list[dict]:
-        """Вернёт 1m свечи с ts ∈ [start_ms, end_ms) (полузакрытый интервал)."""
+        """Возвращает массив 1m-баров с ts ∈ [start_ms, end_ms)."""
         nonlocal idx1
         out = []
         while idx1 < n1_len and n1[idx1]["timestamp"] < start_ms:
@@ -809,6 +812,157 @@ def run_backtest_real_intrabar(strategy: KWINStrategy,
             j += 1
         return out
 
+    # трейл-движок создаём «на позицию»
+    trail_engine: TrailEngine | None = None
+
+    # --- утилиты ---
+    def log_trade_and_close(exit_price: float, ts_ms: int, reason: str):
+        """Закрытие позиции: расчёт PnL, комиссии, запись трейда, фикс equity."""
+        nonlocal trail_engine
+        pos = state.get_current_position()
+        if not pos or pos.get("status") != "open":
+            return
+        direction   = pos["direction"]
+        entry_price = float(pos["entry_price"])
+        qty         = float(pos["size"])
+        fee_rate    = float(getattr(strategy.config, "taker_fee_rate", 0.00055))
+        gross = (exit_price - entry_price) * qty if direction == "long" else (entry_price - exit_price) * qty
+        fees  = (entry_price + exit_price) * qty * fee_rate
+        pnl   = gross - fees
+        state.set_equity(float(state.get_equity() or start_capital) + pnl)
+
+        bt_trades.append({
+            "symbol": strategy.config.symbol,
+            "direction": direction,
+            "entry_price": entry_price,
+            "exit_price": float(exit_price),
+            "stop_loss": float(pos.get("stop_loss") or 0),
+            "take_profit": float(pos.get("take_profit") or 0),
+            "quantity": qty,
+            "pnl": float(pnl),
+            "rr": None,
+            "entry_time": datetime.utcfromtimestamp(int(pos.get("entry_time_ts", ts_ms))/1000),
+            "exit_time":  datetime.utcfromtimestamp(int(ts_ms)/1000),
+            "exit_reason": reason,
+            "status": "closed",
+        })
+
+        # финализуем позицию
+        pos["status"] = "closed"
+        pos["exit_price"] = float(exit_price)
+        pos["exit_time"]  = datetime.utcfromtimestamp(int(ts_ms)/1000)
+        state.set_position(pos)
+        # сбрасываем движок
+        if trail_engine:
+            trail_engine.reset()
+            trail_engine = None
+
+    def ensure_trail_engine_on_entry(ts_ms: int):
+        """Если позиция только что открылась — инициализируем TrailEngine и вспом. поля."""
+        nonlocal trail_engine
+        pos = state.get_current_position()
+        if not pos or pos.get("status") != "open":
+            return
+        if trail_engine is None:
+            # завести движок и активировать по входу
+            trail_engine = TrailEngine(strategy.config)
+            entry = float(pos["entry_price"])
+            sl    = float(pos.get("stop_loss") or 0)
+            direction = pos["direction"]
+            trail_engine.on_entry(entry, sl, direction)
+            # метки позиции
+            if "entry_time_ts" not in pos:
+                pos["entry_time_ts"] = ts_ms
+            state.set_position(pos)
+
+    # --- основной цикл по 15m ---
+    for i in range(len(n15)):
+        bar = n15[i]
+        ts_ms = int(bar["timestamp"])
+        o = float(bar["open"]); h = float(bar["high"]); l = float(bar["low"]); c = float(bar["close"])
+
+        # (1) закрывается 15m — стратегия может войти
+        paper.set_price(c)
+        before_pos = state.get_current_position()
+        strategy.on_bar_close_15m({"timestamp": ts_ms, "open": o, "high": h, "low": l, "close": c})
+        after_pos = state.get_current_position()
+
+        if after_pos and after_pos is not before_pos and after_pos.get("status") == "open":
+            ensure_trail_engine_on_entry(ts_ms)
+
+        # (2) проигрываем следующий 15m-отрезок минутами
+        start_next = ((ts_ms // 900_000) * 900_000) + 900_000
+        end_next   = start_next + 900_000
+        minute_bars = get_1m_between(start_next, end_next)
+
+        for m in minute_bars:
+            m_ts = int(m["timestamp"])
+            mo = float(m["open"]); mh = float(m["high"]); ml = float(m["low"]); mc = float(m["close"])
+
+            # определяем порядок микрошагов в зависимости от направления позиции
+            pos = state.get_current_position()
+            if pos and pos.get("status") == "open":
+                if pos["direction"] == "long":
+                    micro_path = (mo, mh, ml, mc)  # сначала проверим TP, потом SL
+                else:
+                    micro_path = (mo, ml, mh, mc)  # сначала проверим SL, потом TP
+            else:
+                micro_path = (mo, mc)  # позиции нет
+
+            for px in micro_path:
+                paper.set_price(px)
+
+                # если позиция открыта — сначала обновим трейл движком
+                pos = state.get_current_position()
+                if pos and pos.get("status") == "open":
+                    if trail_engine is None:
+                        ensure_trail_engine_on_entry(m_ts)
+                        pos = state.get_current_position()
+
+                    # обновить SL по плавному трейлу
+                    new_sl = trail_engine.update(px)
+                    if new_sl is not None and new_sl != pos.get("stop_loss"):
+                        pos["stop_loss"] = float(new_sl)
+                        state.set_position(pos)
+
+                    # затем немедленная проверка SL/TP на текущем микрошаге
+                    sl = float(pos.get("stop_loss") or 0.0)
+                    tp = pos.get("take_profit")
+                    if pos["direction"] == "long":
+                        if sl > 0 and px <= sl:
+                            log_trade_and_close(sl, m_ts, reason="SL")
+                            break
+                        if tp is not None and px >= float(tp):
+                            log_trade_and_close(float(tp), m_ts, reason="TP")
+                            break
+                    else:
+                        if sl > 0 and px >= sl:
+                            log_trade_and_close(sl, m_ts, reason="SL")
+                            break
+                        if tp is not None and px <= float(tp):
+                            log_trade_and_close(float(tp), m_ts, reason="TP")
+                            break
+
+            # снимок equity по итогу минуты
+            equity_points.append({"timestamp": m_ts, "equity": float(state.get_equity() or start_capital)})
+
+        # дополнительный снимок на конце 15m окна
+        equity_points.append({"timestamp": end_next - 1, "equity": float(state.get_equity() or start_capital)})
+
+    # хвост — если позиция осталась, закрываем по последнему доступному close
+    pos = state.get_current_position()
+    if pos and pos.get("status") == "open":
+        last = n1[-1] if n1 else n15[-1]
+        log_trade_and_close(float(last["close"]), int(last["timestamp"]), reason="EOD")
+
+    trades_df = pd.DataFrame(bt_trades)
+    equity_df = pd.DataFrame(equity_points)
+    return {
+        "trades_df": trades_df,
+        "equity_df": equity_df,
+        "final_equity": float(state.get_equity() or start_capital),
+        "initial_equity": float(start_capital),
+    }
     # утилиты
     def close_position(exit_price: float, ts_ms: int, reason: str):
         pos = state.get_current_position()
