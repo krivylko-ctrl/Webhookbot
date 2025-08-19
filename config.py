@@ -64,7 +64,7 @@ class Config:
         
         # === НАСТРОЙКИ РЫНКА ===
         self.market_type = "linear"     # "linear" для деривативов, "spot" для спота
-        self.symbol = SYMBOL         # Торгуемый символ
+        self.symbol = SYMBOL            # Торгуемый символ
         self.tick_size = 0.01           # Тик-сайз для округления цен
         
         # Обновляем days_back на основе period_choice
@@ -190,6 +190,14 @@ class Config:
                 'max': 5.0,
                 'step': 0.1,
                 'value': self.trailing_offset
+            },
+            'trailing_offset_perc': {
+                'type': 'float',
+                'label': 'Trailing Offset % (perc mode)',
+                'min': 0.1,
+                'max': 5.0,
+                'step': 0.1,
+                'value': self.trailing_offset_perc
             },
             'use_arm_after_rr': {
                 'type': 'bool',
