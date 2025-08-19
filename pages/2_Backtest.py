@@ -217,6 +217,10 @@ def main():
         intrabar_tf  = "1"  # фиксировано 1m для бэктеста
         intrabar_pull_limit = st.number_input("1m history limit (per fetch)", min_value=200, max_value=2000, value=1500, step=100)
 
+        # --- плавность интрабара (микрошаги) ---
+        smooth_intrabar = st.checkbox("Smooth intrabar trailing (micro-steps)", value=True)
+        intrabar_steps  = st.slider("Micro-steps per 1m", min_value=1, max_value=12, value=6, step=1)
+
     if st.button("🚀 Запустить бэктест", type="primary"):
         with st.spinner("Выполняется бэктест..."):
             try:
@@ -249,6 +253,8 @@ def main():
                 config.use_intrabar = bool(use_intrabar)
                 config.intrabar_tf = intrabar_tf
                 config.intrabar_pull_limit = int(intrabar_pull_limit)
+                config.smooth_intrabar = bool(smooth_intrabar)
+                config.intrabar_steps = int(intrabar_steps)
 
                 # Инициализируем стратегию с существующими db/state
                 strategy = KWINStrategy(config, api, state, db)
@@ -716,6 +722,7 @@ def run_backtest_real_intrabar(strategy: KWINStrategy,
     """
     Входы — на закрытии 15m.
     Управление позицией (Smart Trail + SL/TP) — пошагово по 1m между закрытиями 15m.
+    (ДОБАВЛЕНО) Плавный интрабар: микрошаги внутри каждой 1m свечи.
     """
     import pandas as pd
     from datetime import datetime
@@ -838,7 +845,7 @@ def run_backtest_real_intrabar(strategy: KWINStrategy,
         state.set_position(pos)
 
     def apply_smart_trail_minute(pos: dict, bar_high: float, bar_low: float) -> None:
-        """Процентный трейл с ARM и якорем — на 1m баре."""
+        """Процентный трейл с ARM и якорем — на 1m баре (поддерживает постепенное обновление high/low)."""
         cfg = strategy.config
         if not getattr(cfg, "enable_smart_trail", True):
             return
@@ -860,7 +867,7 @@ def run_backtest_real_intrabar(strategy: KWINStrategy,
             pos["trail_anchor"] = anchor
         state.set_position(pos)
 
-        # ARM по RR (по 1m high/low)
+        # ARM по RR (по текущему intrabar high/low)
         armed = bool(pos.get("armed", not getattr(cfg, "use_arm_after_rr", True)))
         if not armed and getattr(cfg, "use_arm_after_rr", True):
             risk = abs(entry - sl)
@@ -891,7 +898,40 @@ def run_backtest_real_intrabar(strategy: KWINStrategy,
                 pos["stop_loss"] = candidate
                 state.set_position(pos)
 
-    # основной цикл: идём по 15m барам (от старых к новым)
+    # --- генерация микропути внутри 1m свечи (open→high/low→low/high→close) ---
+    def sample_minute_path(o: float, h: float, l: float, c: float, steps: int) -> list[float]:
+        """
+        Возвращает список микропрайсов длиной steps.
+        Алгоритм: кусочно-линейный маршрут через 3 сегмента:
+          если close>=open: O→H→L→C, иначе O→L→H→C.
+        Отдаём равномерно по времени.
+        """
+        steps = max(1, int(steps))
+        if steps == 1:
+            return [c]
+        if c >= o:
+            v = [o, h, l, c]
+        else:
+            v = [o, l, h, c]
+        # три равных по времени сегмента
+        res = []
+        for s in range(1, steps+1):
+            t = s / steps  # 0..1
+            if t <= 1/3:
+                # O -> X1
+                tloc = t * 3.0
+                res.append(v[0] + (v[1] - v[0]) * tloc)
+            elif t <= 2/3:
+                # X1 -> X2
+                tloc = (t - 1/3) * 3.0
+                res.append(v[1] + (v[2] - v[1]) * tloc)
+            else:
+                # X2 -> C
+                tloc = (t - 2/3) * 3.0
+                res.append(v[2] + (v[3] - v[2]) * tloc)
+        return res
+
+    # --- основной цикл: идём по 15m барам (от старых к новым) ---
     for i in range(len(n15)):
         bar = n15[i]
         ts_ms = int(bar["timestamp"])
@@ -911,37 +951,61 @@ def run_backtest_real_intrabar(strategy: KWINStrategy,
             after_pos["trail_anchor"] = float(after_pos["entry_price"])
             state.set_position(after_pos)
 
-        # 2) симулируем следующий 15-минутный интервал по 1m
+        # 2) симулируем следующий 15-минутный интервал по 1m (с микрошагами внутри 1m)
         start_next = ((ts_ms // 900_000) * 900_000) + 900_000
         end_next   = start_next + 900_000
 
         minute_bars = get_1m_between(start_next, end_next)
+
+        # динамический кламп шагов, чтобы не положить хост при длинной истории
+        user_steps = int(getattr(strategy.config, "intrabar_steps", 6))
+        if not bool(getattr(strategy.config, "smooth_intrabar", True)):
+            user_steps = 1
+        total_minutes = len(n1)
+        if total_minutes > 30000:
+            user_steps = min(user_steps, 3)
+        elif total_minutes > 20000:
+            user_steps = min(user_steps, 4)
+
         for m in minute_bars:
             m_ts = int(m["timestamp"])
-            mh = float(m["high"]); ml = float(m["low"]); mc = float(m["close"])
-            paper.set_price(mc)
+            mo = float(m["open"]); mh = float(m["high"]); ml = float(m["low"]); mc = float(m["close"])
 
-            pos = state.get_current_position()
-            if pos and pos.get("status") == "open":
-                # трейлим по минутке
-                apply_smart_trail_minute(pos, bar_high=mh, bar_low=ml)
+            # генерим микропуть и идём шагами
+            path = sample_minute_path(mo, mh, ml, mc, user_steps)
+            run_hi = mo
+            run_lo = mo
 
-                # проверяем SL/TP на минутном баре
+            for px in path:
+                paper.set_price(px)
+                run_hi = max(run_hi, px)
+                run_lo = min(run_lo, px)
+
                 pos = state.get_current_position()
-                sl = float(pos.get("stop_loss") or 0)
-                tp = pos.get("take_profit")
-                if pos["direction"] == "long":
-                    if sl > 0 and ml <= sl:
-                        close_position(sl, m_ts, reason="SL")
-                    elif tp is not None and mh >= float(tp):
-                        close_position(float(tp), m_ts, reason="TP")
-                else:
-                    if sl > 0 and mh >= sl:
-                        close_position(sl, m_ts, reason="SL")
-                    elif tp is not None and ml <= float(tp):
-                        close_position(float(tp), m_ts, reason="TP")
+                if pos and pos.get("status") == "open":
+                    # трейлим по текущему накопленному high/low
+                    apply_smart_trail_minute(pos, bar_high=run_hi, bar_low=run_lo)
 
-            # equity-снимок раз в минуту
+                    # проверяем SL/TP на текущем микрошаге
+                    pos = state.get_current_position()
+                    sl = float(pos.get("stop_loss") or 0)
+                    tp = pos.get("take_profit")
+                    if pos["direction"] == "long":
+                        if sl > 0 and px <= sl:
+                            close_position(sl, m_ts, reason="SLi")
+                            break
+                        elif tp is not None and px >= float(tp):
+                            close_position(float(tp), m_ts, reason="TPi")
+                            break
+                    else:
+                        if sl > 0 and px >= sl:
+                            close_position(sl, m_ts, reason="SLi")
+                            break
+                        elif tp is not None and px <= float(tp):
+                            close_position(float(tp), m_ts, reason="TPi")
+                            break
+
+            # equity-снимок 1 раз на минуту (без раздувания массива)
             equity_points.append({"timestamp": m_ts, "equity": float(state.get_equity() or start_capital)})
 
         # 3) на всякий случай снимок на конце 15m окна
@@ -1070,7 +1134,8 @@ def display_backtest_results(results):
     st.info(
         "Выбери источник: **Bybit v5 (реальные 15m)** — прогон через стратегию; "
         "**Синтетика (демо)** — случайный симулятор. "
-        "Опция **Use 1m intrabar trailing** включает траление и выходы внутри 1-минутных свечей между закрытиями 15m."
+        "Опция **Use 1m intrabar trailing** включает траление и выходы внутри 1-минутных свечей между закрытиями 15m. "
+        "Опция **Smooth intrabar trailing** добавляет микрошаги внутри каждой 1m для более плавного бэктеста."
     )
 
 # ========================================================================
