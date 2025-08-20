@@ -577,10 +577,9 @@ class KWINStrategy:
         return float(fallback_price), float(fallback_price)
 
     def _update_smart_trailing(self, position: Dict):
-            
-            """
-            Процентный Smart Trailing с ARM по RR.
-            """
+        """
+        Процентный Smart Trailing с ARM по RR.
+        """
         try:
             if not getattr(self.config, "enable_smart_trail", True):
                 return
@@ -591,31 +590,23 @@ class KWINStrategy:
             if not direction or entry <= 0 or sl <= 0:
                 return
 
-            # 1) Текущая цена для самой стратегии
+        # 1) Текущая цена для самой стратегии
             price = self._get_current_price()
             if price is None:
                 return
             price = float(price)
 
-            # 2) Экстремумы последнего бара — понадобятся и для якоря, и (опционально) для ARM
+        # 2) Экстремумы последнего бара — понадобятся и для якоря, и (опционально) для ARM
             bar_high, bar_low = self._get_bar_extremes_for_trailing(price)
 
-            # 2a) ARM по RR с учётом базы: 'extremum' | 'last'
+        # 2a) ARM по RR с учётом базы: 'extremum' | 'last'
             armed = bool(position.get('armed', not getattr(self.config, 'use_arm_after_rr', True)))
             if not armed and getattr(self.config, 'use_arm_after_rr', True):
                 risk = abs(entry - sl)
                 if risk > 0:
                     basis = str(getattr(self.config, 'arm_rr_basis', 'extremum')).lower()
-                    if basis == "extremum":
-                        rr_px = bar_high if direction == 'long' else bar_low
-                    else:  # 'last'
-                        rr_px = price
-
-                    if direction == 'long':
-                        rr = (rr_px - entry) / risk
-                    else:
-                        rr = (entry - rr_px) / risk
-
+                    rr_px = (bar_high if direction == 'long' else bar_low) if basis == "extremum" else price
+                    rr = (rr_px - entry) / risk if direction == 'long' else (entry - rr_px) / risk
                     if rr >= float(getattr(self.config, 'arm_rr', 0.5)):
                         armed = True
                         position['armed'] = True
@@ -624,34 +615,32 @@ class KWINStrategy:
             if not armed:
                 return
 
-            # 3) Якорь экстремума (как в Pine) — с момента входа
+        # 3) Якорь экстремума (как в Pine) — с момента входа
             anchor = float(position.get('trail_anchor') or entry)
-            if direction == 'long':
-                anchor = max(anchor, bar_high)
-            else:
-                anchor = min(anchor, bar_low)
+            anchor = max(anchor, bar_high) if direction == 'long' else min(anchor, bar_low)
             if anchor != position.get('trail_anchor'):
                 position['trail_anchor'] = anchor
                 self.state.set_position(position)
 
-            # 4) Процентный трейл от entry + offset
+        # 4) Процентный трейл от entry + offset
             trail_perc  = float(getattr(self.config, 'trailing_perc', 0.5)) / 100.0
             offset_perc = float(getattr(self.config, 'trailing_offset_perc', 0.4)) / 100.0
             trail_dist  = entry * trail_perc
             offset_dist = entry * offset_perc
 
             if direction == 'long':
-                candidate = price_round(anchor - trail_dist - offset_dist, self.tick_size)
+                candidate = round_price(anchor - trail_dist - offset_dist, self.tick_size)
                 if candidate > sl:
                     self._update_stop_loss(position, candidate)
             else:
-                candidate = price_round(anchor + trail_dist + offset_dist, self.tick_size)
+                candidate = round_price(anchor + trail_dist + offset_dist, self.tick_size)
                 if candidate < sl:
                     self._update_stop_loss(position, candidate)
 
         except Exception as e:
             print(f"Error in smart trailing: {e}")
 
+    
     def _update_stop_loss(self, position: Dict, new_sl: float):
         try:
             if not self.api:
