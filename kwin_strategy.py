@@ -1,388 +1,715 @@
-import requests
-import json
-import time
-import hashlib
-import hmac
-from urllib.parse import urlencode
-import threading
-from typing import Dict, List, Optional, Callable
+import pandas as pd
+import numpy as np
+from typing import Dict, List, Optional, Tuple
+from datetime import datetime, timedelta, timezone
 
-# Необязательные хелперы округления по тик-сайзу/шагу
-try:
-    from utils_round import round_price, round_qty  # noqa: F401
-except Exception:
-    def round_price(x, *_args, **_kw): return x
-    def round_qty(x, *_args, **_kw): return x
+from config import Config
+from state_manager import StateManager
+from trail_engine import TrailEngine
+from analytics import TradingAnalytics
+from utils import price_round, qty_round
+from database import Database
 
 
-class BybitAPI:
-    """Лёгкая обёртка над Bybit v5 (HTTP + паблик WS). Совместима с KWINStrategy."""
+class KWINStrategy:
+    """Основная логика стратегии KWIN"""
 
-    def __init__(self, api_key: str, api_secret: str, testnet: bool = False):
-        self.api_key = api_key
-        self.api_secret = api_secret
-        self.testnet = testnet
+    def __init__(self, config: Config, bybit_api, state_manager: StateManager, db: Database):
+        self.config = config
+        self.api = bybit_api
+        self.state = state_manager
+        self.db = db
+        self.trail_engine = TrailEngine(config, state_manager, bybit_api)
+        self.analytics = TradingAnalytics()
 
-        # По умолчанию деривативы ("linear"); можно сменить set_market_type("spot")
-        self.market_type = "linear"
+        # Внутренние данные (crash-safe state)
+        self.candles_15m: List[Dict] = []
+        self.candles_1m: List[Dict] = []
+        self.candles_1h: List[Dict] = []
+        self.last_processed_time = None
+        self.last_processed_bar_ts = 0  # Для восстановления после crash
 
-        if testnet:
-            self.base_url = "https://api-testnet.bybit.com"
-            self.ws_url = "wss://stream-testnet.bybit.com/v5/public/linear"
-        else:
-            self.base_url = "https://api.bybit.com"
-            self.ws_url = "wss://stream.bybit.com/v5/public/linear"
+        # Trade state
+        self.entry_price: Optional[float] = None
+        self.entry_sl: Optional[float] = None
+        self.trade_id: Optional[int] = None
+        self.armed: bool = False  # ArmRR статус
 
-        self.session = requests.Session()
-        self.ws = None
-        self.ws_callbacks: Dict[str, Callable] = {}
+        self.strategy_version = "2.0.1"
 
-    # -------------------- общие утилиты --------------------
+        # Состояние входов
+        self.can_enter_long = True
+        self.can_enter_short = True
+        self.last_candle_close_15m: Optional[int] = None
 
-    def set_market_type(self, market_type: str):
-        """Установить тип рынка: 'linear' | 'inverse' | 'option' | 'spot'."""
-        self.market_type = market_type
-        if self.testnet:
-            self.ws_url = f"wss://stream-testnet.bybit.com/v5/public/{market_type}"
-        else:
-            self.ws_url = f"wss://stream.bybit.com/v5/public/{market_type}"
+        # Инструмент
+        self.symbol = self.config.symbol
+        self.tick_size = 0.01
+        self.qty_step = 0.01
+        self.min_order_qty = 0.01
 
-    def _generate_signature(self, payload: str, timestamp: str) -> str:
-        """
-        v5 HMAC: sign = HMAC_SHA256(secret, timestamp + apiKey + recvWindow + payload)
-        где payload = urlencode(params) для GET, json.dumps(params) для POST.
-        """
-        prehash = timestamp + self.api_key + "5000" + payload
-        return hmac.new(
-            self.api_secret.encode("utf-8"),
-            prehash.encode("utf-8"),
-            hashlib.sha256
-        ).hexdigest()
+        self._init_instrument_info()
 
-    def _send_request(self, method: str, endpoint: str, params: Optional[Dict] = None) -> Dict:
-        """Отправка HTTP-запроса. Подписываем ВСЁ (GET/POST) — безопасно и стабильно."""
-        params = params or {}
-        url = f"{self.base_url}{endpoint}"
-        timestamp = str(int(time.time() * 1000))
+        # Нормализация close_back_pct к [0..1]
+        if self.config.close_back_pct > 1.0:
+            self.config.close_back_pct = self.config.close_back_pct / 100.0
+        elif self.config.close_back_pct < 0.0:
+            self.config.close_back_pct = 0.0
 
-        if method.upper() == "GET":
-            payload_str = urlencode(params) if params else ""
-        else:
-            payload_str = json.dumps(params) if params else ""
+    # ====== утилиты выравнивания и порядка ======
+    def _align_15m_ms(self, ts_ms: int) -> int:
+        return (int(ts_ms) // 900_000) * 900_000
 
-        signature = self._generate_signature(payload_str, timestamp)
+    def _ensure_15m_desc(self):
+        if self.candles_15m and self.candles_15m[0].get("timestamp") is not None:
+            self.candles_15m.sort(key=lambda x: x.get("timestamp", 0), reverse=True)
 
-        headers = {
-            "X-BAPI-API-KEY": self.api_key,
-            "X-BAPI-SIGN": signature,
-            "X-BAPI-SIGN-TYPE": "2",
-            "X-BAPI-TIMESTAMP": timestamp,
-            "X-BAPI-RECV-WINDOW": "5000",
-            "Content-Type": "application/json",
-        }
+    def _ensure_1m_desc(self):
+        if self.candles_1m and self.candles_1m[0].get("timestamp") is not None:
+            self.candles_1m.sort(key=lambda x: x.get("timestamp", 0), reverse=True)
 
+    def _current_bar_ts_ms(self) -> int:
+        return int(self.last_processed_bar_ts or 0)
+    # ============================================
+
+    def _init_instrument_info(self):
+        """Инициализация информации об инструменте"""
         try:
-            if method.upper() == "GET":
-                r = self.session.get(url, params=params, headers=headers, timeout=30)
-            elif method.upper() == "POST":
-                r = self.session.post(url, data=payload_str, headers=headers, timeout=30)
-            else:
-                raise ValueError(f"Unsupported method: {method}")
-            r.raise_for_status()
-            return r.json()
-        except requests.exceptions.RequestException as e:
-            print(f"API Request Error: {e}")
-            return {"retCode": -1, "retMsg": str(e)}
+            if self.api:
+                if hasattr(self.api, 'set_market_type') and hasattr(self.config, 'market_type'):
+                    self.api.set_market_type(self.config.market_type)
+                if hasattr(self.api, 'get_instruments_info'):
+                    info = self.api.get_instruments_info(self.symbol)
+                    if info:
+                        if 'priceFilter' in info:
+                            self.tick_size = float(info['priceFilter']['tickSize'])
+                        if 'lotSizeFilter' in info:
+                            self.qty_step = float(info['lotSizeFilter']['qtyStep'])
+                            self.min_order_qty = float(info['lotSizeFilter']['minOrderQty'])
+        except Exception as e:
+            print(f"Error initializing instrument info: {e}")
 
-    @staticmethod
-    def _map_trigger_by(source: str) -> str:
-        """'last'|'mark' -> Bybit triggerBy значение."""
-        return "MarkPrice" if str(source).lower() == "mark" else "LastPrice"
+        # Синхронизируем в конфиг
+        if self.qty_step and self.qty_step > 0:
+            self.config.qty_step = self.qty_step
+        if self.min_order_qty and self.min_order_qty > 0:
+            self.config.min_order_qty = self.min_order_qty
 
-    # -------------------- маркет-данные --------------------
+        # Fallback
+        if not self.tick_size or self.tick_size <= 0:
+            self.tick_size = 0.01
+        if not self.qty_step or self.qty_step <= 0:
+            self.qty_step = 0.01
+        if not self.min_order_qty or self.min_order_qty <= 0:
+            self.min_order_qty = 0.01
 
-    def get_server_time(self) -> Optional[int]:
-        """Время сервера (секунды)."""
-        resp = self._send_request("GET", "/v5/market/time")
-        if resp.get("retCode") == 0:
-            result = resp.get("result") or {}
-            # timeSecond (сек), timeNano (нс) — встречаются оба варианта
-            if "timeSecond" in result:
-                return int(result["timeSecond"])
-            if "timeNano" in result:
-                return int(int(result["timeNano"]) / 1_000_000_000)
-        return None
+    # ==================== Приём закрытых баров ====================
 
-    def get_klines(self, symbol: str, interval: str, limit: int = 200) -> Optional[List[Dict]]:
-        """
-        Исторические свечи.
-        Возвращает список в возрастающем порядке времени: out[0] — самая старая,
-        out[-1] — САМАЯ СВЕЖАЯ ЗАКРЫТАЯ (эквивалент TV).
-        """
-        params = {
-            "category": self.market_type,
-            "symbol": symbol,
-            "interval": interval,
-            "limit": limit,
-        }
-        resp = self._send_request("GET", "/v5/market/kline", params)
-        if resp.get("retCode") == 0:
-            lst = (resp.get("result") or {}).get("list") or []
-            out: List[Dict] = []
-            for it in lst:
-                out.append({
-                    "timestamp": int(it[0]),
-                    "open": float(it[1]),
-                    "high": float(it[2]),
-                    "low": float(it[3]),
-                    "close": float(it[4]),
-                    "volume": float(it[5]) if it[5] is not None else 0.0,
-                })
-            out.sort(key=lambda x: x["timestamp"])  # возрастающе
-            return out
-        return None
+    def on_bar_close_15m(self, candle: Dict):
+        """ТОЧНАЯ синхронизация с Pine Script: обработка только закрытых 15м баров"""
+        try:
+            self.candles_15m.insert(0, candle)
+            max_history = 200
+            if len(self.candles_15m) > max_history:
+                self.candles_15m = self.candles_15m[:max_history]
 
-    def get_ticker(self, symbol: str) -> Dict:
-        """Тикер по символу (last/mark + best bid/ask)."""
-        params = {"category": self.market_type, "symbol": symbol}
-        resp = self._send_request("GET", "/v5/market/tickers", params)
-        if resp.get("retCode") == 0:
-            lst = (resp.get("result") or {}).get("list") or []
-            if lst:
-                t = lst[0]
-                return {
-                    "symbol": t.get("symbol"),
-                    "lastPrice": float(t.get("lastPrice", 0) or 0),
-                    "markPrice": float(t.get("markPrice", 0) or 0),
-                    "bid1Price": float(t.get("bid1Price", 0) or 0),
-                    "ask1Price": float(t.get("ask1Price", 0) or 0),
-                    "volume24h": float(t.get("volume24h", 0) or 0),
-                }
-        return {}
+            self._ensure_15m_desc()
 
-    def get_price(self, symbol: str, source: str = "last") -> float:
-        """
-        Унифицированный доступ к цене для логики/триггеров.
-        source: 'last' | 'mark'
-        """
-        t = self.get_ticker(symbol)
-        last = float(t.get("lastPrice", 0) or 0)
-        mark = float(t.get("markPrice", 0) or 0)
-        return mark if (str(source).lower() == "mark" and mark > 0) else last
+            current_bar_time = candle.get('start') or candle.get('open_time') or candle.get('timestamp')
+            if not current_bar_time:
+                return
+            aligned_ts = self._align_15m_ms(int(current_bar_time))
+            if self.last_processed_bar_ts == aligned_ts:
+                return  # этот бар уже обработан
 
-    def get_instruments_info(self, symbol: str) -> Optional[Dict]:
-        """Информация об инструменте (тик-сайз, шаг количества и т.д.)."""
-        params = {"category": self.market_type, "symbol": symbol}
-        resp = self._send_request("GET", "/v5/market/instruments-info", params)
-        if resp.get("retCode") == 0:
-            lst = (resp.get("result") or {}).get("list") or []
-            return lst[0] if lst else None
-        return None
-
-    # -------------------- аккаунт / ордера --------------------
-
-    def get_wallet_balance(self, account_type: str = "UNIFIED") -> Optional[Dict]:
-        """Баланс кошелька (по умолчанию UNIFIED для деривативов)."""
-        params = {"accountType": account_type}
-        resp = self._send_request("GET", "/v5/account/wallet-balance", params)
-        if resp.get("retCode") == 0:
-            return resp.get("result")
-        return None
-
-    def place_order(
-        self,
-        symbol: str,
-        side: str,
-        order_type: str,
-        qty: float,
-        price: Optional[float] = None,
-        stop_loss: Optional[float] = None,
-        take_profit: Optional[float] = None,
-        order_link_id: Optional[str] = None,
-        reduce_only: bool = False,
-        trigger_by_source: str = "last",   # 'last' | 'mark' — важно для стопов/условных
-        time_in_force: Optional[str] = None,
-        position_idx: Optional[int] = None,
-    ) -> Optional[Dict]:
-        """Создать ордер (Market/Limit/Conditional/Stop)."""
-        params: Dict[str, str] = {
-            "category": self.market_type,
-            "symbol": symbol,
-            "side": str(side).title(),            # Buy/Sell
-            "orderType": str(order_type).title(), # Market/Limit/Conditional/Stop
-            "qty": str(qty),
-        }
-
-        if reduce_only:
-            params["reduceOnly"] = "true"
-        if order_link_id:
-            params["orderLinkId"] = order_link_id
-        if time_in_force:
-            params["timeInForce"] = time_in_force
-        if position_idx is not None:
-            params["positionIdx"] = str(position_idx)
-
-        if price is not None:
-            params["price"] = str(price)
-        if stop_loss is not None:
-            params["stopLoss"] = str(stop_loss)
-        if take_profit is not None:
-            params["takeProfit"] = str(take_profit)
-
-        # Для условных/стопов — источник триггера
-        if order_type.lower() in {"stop", "conditional"}:
-            params["triggerBy"] = self._map_trigger_by(trigger_by_source)
-
-        resp = self._send_request("POST", "/v5/order/create", params)
-        if resp.get("retCode") == 0:
-            return resp.get("result")
-        return None
-
-    def modify_order(
-        self,
-        symbol: str,
-        order_id: Optional[str] = None,
-        order_link_id: Optional[str] = None,
-        price: Optional[float] = None,
-        qty: Optional[float] = None,
-        stop_loss: Optional[float] = None,
-        take_profit: Optional[float] = None,
-        trigger_by_source: str = "last",
-    ) -> Optional[Dict]:
-        """
-        Унифицированная правка:
-        - Если меняем SL/TP активной ПОЗИЦИИ (деривативы) -> /v5/position/trading-stop
-        - Если правим параметры конкретного ОРДЕРА (price/qty) -> /v5/order/amend
-        """
-        # 1) апдейт стоп-лосса/тейк-профита позиции (чаще всего используется в трейлинге)
-        if stop_loss is not None or take_profit is not None:
-            if self.market_type != "linear":
-                # для spot тут обычно не используется; можно расширить при необходимости
-                pass
-            params_ts: Dict[str, str] = {
-                "category": "linear",
-                "symbol": symbol,
-            }
-            if stop_loss is not None:
-                params_ts["stopLoss"] = str(stop_loss)
-                # можно указать источник триггера для SL
-                params_ts["slTriggerBy"] = self._map_trigger_by(trigger_by_source)
-            if take_profit is not None:
-                params_ts["takeProfit"] = str(take_profit)
-                params_ts["tpTriggerBy"] = self._map_trigger_by(trigger_by_source)
-
-            resp = self._send_request("POST", "/v5/position/trading-stop", params_ts)
-            if resp.get("retCode") == 0:
-                return resp.get("result")
-            return None
-
-        # 2) апдейт существующего ОРДЕРА (лимитники и т.п.)
-        if order_id is None and order_link_id is None:
-            # нечего менять — не знаем какой ордер
-            return None
-
-        params_amend: Dict[str, str] = {
-            "category": self.market_type,
-            "symbol": symbol,
-        }
-        if order_id:
-            params_amend["orderId"] = order_id
-        if order_link_id:
-            params_amend["orderLinkId"] = order_link_id
-        if price is not None:
-            params_amend["price"] = str(price)
-        if qty is not None:
-            params_amend["qty"] = str(qty)
-
-        resp = self._send_request("POST", "/v5/order/amend", params_amend)
-        if resp.get("retCode") == 0:
-            return resp.get("result")
-        return None
-
-    def cancel_order(self, symbol: str, order_id: Optional[str] = None, order_link_id: Optional[str] = None) -> bool:
-        """Отменить ордер по orderId или orderLinkId."""
-        params: Dict[str, str] = {"category": self.market_type, "symbol": symbol}
-        if order_id:
-            params["orderId"] = order_id
-        if order_link_id:
-            params["orderLinkId"] = order_link_id
-        resp = self._send_request("POST", "/v5/order/cancel", params)
-        return resp.get("retCode") == 0
-
-    def get_open_orders(self, symbol: Optional[str] = None) -> Optional[List[Dict]]:
-        """Открытые ордера."""
-        params: Dict[str, str] = {"category": self.market_type}
-        if symbol:
-            params["symbol"] = symbol
-        resp = self._send_request("GET", "/v5/order/realtime", params)
-        if resp.get("retCode") == 0:
-            return (resp.get("result") or {}).get("list")
-        return None
-
-    def get_order_history(self, symbol: Optional[str] = None, limit: int = 50) -> Optional[List[Dict]]:
-        """История ордеров."""
-        params: Dict[str, str] = {"category": self.market_type, "limit": str(limit)}
-        if symbol:
-            params["symbol"] = symbol
-        resp = self._send_request("GET", "/v5/order/history", params)
-        if resp.get("retCode") == 0:
-            return (resp.get("result") or {}).get("list")
-        return None
-
-    def update_position_stop_loss(self, symbol: str, stop_loss: float) -> Optional[Dict]:
-        """Старый интерфейс (деривативы): прокся на position/trading-stop."""
-        if self.market_type != "linear":
-            return None
-        params = {"category": "linear", "symbol": symbol, "stopLoss": str(stop_loss)}
-        resp = self._send_request("POST", "/v5/position/trading-stop", params)
-        if resp.get("retCode") == 0:
-            return resp.get("result")
-        return None
-
-    # -------------------- WebSocket (паблик) --------------------
-
-    def start_websocket(self, on_message: Optional[Callable] = None):
-        """Запуск паблик WebSocket-соединения."""
-        def on_ws_message(ws, message):
+            # сброс флагов входа на новом закрытом баре
+            self.can_enter_long = True
+            self.can_enter_short = True
+            self.last_candle_close_15m = aligned_ts
+            self.last_processed_bar_ts = aligned_ts
             try:
-                data = json.loads(message)
-                if on_message:
-                    on_message(data)
-                topic = data.get("topic")
-                if topic and topic in self.ws_callbacks:
-                    self.ws_callbacks[topic](data)
-            except Exception as e:
-                print(f"WebSocket message error: {e}")
+                print(f"[STRATEGY] New 15m bar: {float(candle['close']):.2f} at {aligned_ts}")
+            except Exception:
+                pass
 
-        def on_ws_error(ws, error):
-            print(f"WebSocket error: {error}")
+            self.run_cycle()
+        except Exception as e:
+            print(f"Error in on_bar_close_15m: {e}")
 
-        def on_ws_close(ws, close_status_code, close_msg):
-            print("WebSocket connection closed")
-
-        def on_ws_open(ws):
-            print("WebSocket connection opened")
-
+    def on_bar_close_60m(self, candle: Dict):
         try:
-            from websocket import WebSocketApp  # type: ignore
-            self.ws = WebSocketApp(
-                self.ws_url,
-                on_open=on_ws_open,
-                on_message=on_ws_message,
-                on_error=on_ws_error,
-                on_close=on_ws_close,
-            )
-            th = threading.Thread(target=self.ws.run_forever, daemon=True)
-            th.start()
-        except ImportError:
-            print("WebSocket library not available")
+            self.candles_1h.insert(0, candle)
+            if len(self.candles_1h) > 100:
+                self.candles_1h = self.candles_1h[:100]
+        except Exception as e:
+            print(f"Error in on_bar_close_60m: {e}")
 
-    def subscribe_kline(self, symbol: str, interval: str, callback: Callable):
-        """Подписка на kline через паблик WebSocket."""
-        if not self.ws:
-            self.start_websocket()
-        topic = f"kline.{interval}.{symbol}"
-        self.ws_callbacks[topic] = callback
-        msg = {"op": "subscribe", "args": [topic]}
-        if self.ws:
-            self.ws.send(json.dumps(msg))
+    def on_bar_close_1m(self, candle: Dict):
+        """
+        Обработка 1м баров (интрабар трейлинг). Входы — только на закрытии 15м.
+        """
+        try:
+            self.candles_1m.insert(0, candle)
+            max_history = int(getattr(self.config, "intrabar_pull_limit", 1000) or 1000)
+            if len(self.candles_1m) > max_history:
+                self.candles_1m = self.candles_1m[:max_history]
+            self._ensure_1m_desc()
+
+            pos = self.state.get_current_position()
+            if pos and pos.get("status") == "open" and getattr(self.config, "use_intrabar", True):
+                self._update_smart_trailing(pos)
+        except Exception as e:
+            print(f"Error in on_bar_close_1m: {e}")
+
+    # ==================== Пуллинг свечей с биржи ====================
+
+    def update_candles(self):
+        try:
+            if not self.api:
+                return
+
+            # 15m
+            klines_15m = self.api.get_klines(self.symbol, "15", 100)
+            if klines_15m:
+                for k in klines_15m:
+                    ts = k.get("timestamp")
+                    if ts is not None and ts < 1_000_000_000_000:
+                        k["timestamp"] = int(ts * 1000)
+                klines_15m.sort(key=lambda x: x.get("timestamp", 0), reverse=True)
+                self.candles_15m = klines_15m
+
+            # 1m
+            intrabar_tf = str(getattr(self.config, "intrabar_tf", "1"))
+            intrabar_lim = int(getattr(self.config, "intrabar_pull_limit", 1000) or 1000)
+            klines_1m = self.api.get_klines(self.symbol, intrabar_tf, min(1000, intrabar_lim))
+            if klines_1m:
+                for k in klines_1m:
+                    ts = k.get("timestamp")
+                    if ts is not None and ts < 1_000_000_000_000:
+                        k["timestamp"] = int(ts * 1000)
+                klines_1m.sort(key=lambda x: x.get("timestamp", 0), reverse=True)
+                self.candles_1m = klines_1m[:intrabar_lim]
+
+            # «одно срабатывание» на закрытый 15m бар
+            if self.candles_15m:
+                current_candle = self.candles_15m[0]
+                current_timestamp = int(current_candle.get('timestamp', 0))
+                if current_timestamp and current_timestamp < 1_000_000_000_000:
+                    current_timestamp *= 1000
+                aligned_timestamp = self._align_15m_ms(current_timestamp)
+
+                if self.last_processed_bar_ts == aligned_timestamp:
+                    # если позиция открыта — можно подтрейлить интрабар
+                    pos = self.state.get_current_position()
+                    if pos and pos.get("status") == "open" and getattr(self.config, "use_intrabar", True):
+                        self._update_smart_trailing(pos)
+                    return
+
+                self.last_processed_bar_ts = aligned_timestamp
+                self.can_enter_long = True
+                self.can_enter_short = True
+                self.on_bar_close()
+        except Exception as e:
+            print(f"Error updating candles: {str(e) if e else 'Unknown error'}")
+
+    # ==================== Логика входов ====================
+
+    def on_bar_close(self):
+        if len(self.candles_15m) < self.config.sfp_len + 2:
+            return
+
+        bull_sfp = self._detect_bull_sfp()
+        bear_sfp = self._detect_bear_sfp()
+
+        current_ts = self.candles_15m[0]['timestamp']  # ms
+        if not self._is_in_backtest_window_utc(current_ts):
+            return
+
+        current_position = self.state.get_current_position()
+        if current_position and current_position.get('status') == 'open':
+            return
+
+        if bull_sfp and self.can_enter_long:
+            self._process_long_entry()
+        elif bear_sfp and self.can_enter_short:
+            self._process_short_entry()
+
+    # ======== PINE-EXACT SFP DETECTION ========
+
+    def _is_prev_pivot_low(self, left: int, right: int = 1) -> bool:
+        need = left + right + 1
+        if len(self.candles_15m) < (need + 1):
+            return False
+        window_lows = [float(self.candles_15m[i]['low']) for i in range(0, 1 + left + 1)]
+        pivot_val = float(self.candles_15m[1]['low'])
+        return pivot_val == min(window_lows)
+
+    def _is_prev_pivot_high(self, left: int, right: int = 1) -> bool:
+        need = left + right + 1
+        if len(self.candles_15m) < (need + 1):
+            return False
+        window_highs = [float(self.candles_15m[i]['high']) for i in range(0, 1 + left + 1)]
+        pivot_val = float(self.candles_15m[1]['high'])
+        return pivot_val == max(window_highs)
+
+    def _detect_bull_sfp(self) -> bool:
+        sfpLen = int(getattr(self.config, "sfp_len", 2))
+        if len(self.candles_15m) < (sfpLen + 2):
+            return False
+
+        curr = self.candles_15m[0]
+        ref_low = float(self.candles_15m[sfpLen]['low'])
+
+        cond_pivot = self._is_prev_pivot_low(sfpLen, right=1)
+        cond_break = float(curr['low']) < ref_low
+        cond_close = float(curr['open']) > ref_low and float(curr['close']) > ref_low
+
+        if cond_pivot and cond_break and cond_close:
+            if getattr(self.config, "use_sfp_quality", True):
+                return self._check_bull_sfp_quality_new(curr, {"low": ref_low})
+            return True
+        return False
+
+    def _detect_bear_sfp(self) -> bool:
+        sfpLen = int(getattr(self.config, "sfp_len", 2))
+        if len(self.candles_15m) < (sfpLen + 2):
+            return False
+
+        curr = self.candles_15m[0]
+        ref_high = float(self.candles_15m[sfpLen]['high'])
+
+        cond_pivot = self._is_prev_pivot_high(sfpLen, right=1)
+        cond_break = float(curr['high']) > ref_high
+        cond_close = float(curr['open']) < ref_high and float(curr['close']) < ref_high
+
+        if cond_pivot and cond_break and cond_close:
+            if getattr(self.config, "use_sfp_quality", True):
+                return self._check_bear_sfp_quality_new(curr, {"high": ref_high})
+            return True
+        return False
+
+    def _check_bull_sfp_quality_new(self, current: dict, pivot: dict) -> bool:
+        ref_low = float(pivot['low'])
+        low     = float(current['low'])
+        close   = float(current['close'])
+
+        wick_depth = max(ref_low - low, 0.0)
+        m_tick = float(getattr(self, "tick_size", 0.01)) or 0.01
+        wick_ticks = wick_depth / m_tick
+        if wick_ticks < float(getattr(self.config, "wick_min_ticks", 7)):
+            return False
+
+        close_back_pct = float(getattr(self.config, "close_back_pct", 1.0))
+        required_close_back = wick_depth * close_back_pct
+        return (close - low) >= required_close_back
+
+    def _check_bear_sfp_quality_new(self, current: dict, pivot: dict) -> bool:
+        ref_high = float(pivot['high'])
+        high     = float(current['high'])
+        close    = float(current['close'])
+
+        wick_depth = max(high - ref_high, 0.0)
+        m_tick = float(getattr(self, "tick_size", 0.01)) or 0.01
+        wick_ticks = wick_depth / m_tick
+        if wick_ticks < float(getattr(self.config, "wick_min_ticks", 7)):
+            return False
+
+        close_back_pct = float(getattr(self.config, "close_back_pct", 1.0))
+        required_close_back = wick_depth * close_back_pct
+        return (high - close) >= required_close_back
+
+    # ==================== Ордеры / вход ====================
+
+    def _place_market_order(self, direction: str, quantity: float, stop_loss: Optional[float] = None):
+        if not self.api or not hasattr(self.api, 'place_order'):
+            print("API not available for placing order")
+            return None
+        side_up = "Buy" if direction == "long" else "Sell"
+        side_lo = "buy" if direction == "long" else "sell"
+        qty = float(quantity)
+        sl_send = price_round(stop_loss, self.tick_size) if stop_loss is not None else None
+        try:
+            return self.api.place_order(
+                symbol=self.symbol,
+                side=side_up,
+                orderType="Market",
+                qty=qty,
+                stop_loss=sl_send  # наш BybitAPI понимает camel/snake (мы обернём внутри)
+            )
+        except TypeError:
+            return self.api.place_order(
+                symbol=self.symbol,
+                side=side_lo,
+                order_type="market",
+                qty=qty,
+                stop_loss=sl_send
+            )
+
+    def _process_long_entry(self):
+        try:
+            current_price = self._get_current_price()
+            if not current_price or len(self.candles_15m) < 2:
+                return
+
+            raw_sl = float(self.candles_15m[1]['low'])
+            entry_price = price_round(float(current_price), self.tick_size)
+            stop_loss   = price_round(raw_sl, self.tick_size)
+
+            stop_size = entry_price - stop_loss
+            if stop_size <= 0:
+                return
+            take_profit = price_round(entry_price + stop_size * self.config.risk_reward, self.tick_size)
+
+            quantity = self._calculate_position_size(entry_price, stop_loss, "long")
+            if not quantity:
+                return
+            if not self._validate_position_requirements(entry_price, stop_loss, take_profit, quantity):
+                return
+
+            order_result = self._place_market_order("long", quantity, stop_loss=stop_loss)
+            if order_result is None:
+                return
+
+            bar_ts_ms = self._current_bar_ts_ms()
+
+            trade_data = {
+                'symbol': self.symbol,
+                'direction': 'long',
+                'entry_price': entry_price,
+                'stop_loss': stop_loss,
+                'take_profit': take_profit,
+                'quantity': float(quantity),
+                'entry_time': datetime.utcfromtimestamp(bar_ts_ms / 1000) if bar_ts_ms else datetime.utcnow(),
+                'status': 'open'
+            }
+            self.db.save_trade(trade_data)
+
+            self.state.set_position({
+                'symbol': self.symbol,
+                'direction': 'long',
+                'size': float(quantity),
+                'entry_price': entry_price,
+                'stop_loss': stop_loss,
+                'take_profit': take_profit,
+                'status': 'open',
+                'armed': not self.config.use_arm_after_rr,
+                'trail_anchor': entry_price,            # удобный старт для якоря
+                'entry_time_ts': bar_ts_ms
+            })
+
+            # синхронизируем трейл-движок
+            try:
+                self.trail_engine.on_entry(entry_price, stop_loss, "long")
+            except Exception:
+                pass
+
+            self.can_enter_long = False
+            self.can_enter_short = False
+            print(f"Long entry: {quantity} @ {entry_price}, SL: {stop_loss}, TP: {take_profit}")
+        except Exception as e:
+            print(f"Error processing long entry: {str(e) if e else 'Unknown error'}")
+
+    def _process_short_entry(self):
+        try:
+            current_price = self._get_current_price()
+            if not current_price or len(self.candles_15m) < 2:
+                return
+
+            raw_sl = float(self.candles_15m[1]['high'])
+            entry_price = price_round(float(current_price), self.tick_size)
+            stop_loss   = price_round(raw_sl, self.tick_size)
+
+            stop_size = stop_loss - entry_price
+            if stop_size <= 0:
+                return
+            take_profit = price_round(entry_price - stop_size * self.config.risk_reward, self.tick_size)
+
+            quantity = self._calculate_position_size(entry_price, stop_loss, "short")
+            if not quantity:
+                return
+            if not self._validate_position_requirements(entry_price, stop_loss, take_profit, quantity):
+                return
+
+            order_result = self._place_market_order("short", quantity, stop_loss=stop_loss)
+            if order_result is None:
+                return
+
+            bar_ts_ms = self._current_bar_ts_ms()
+
+            trade_data = {
+                'symbol': self.symbol,
+                'direction': 'short',
+                'entry_price': entry_price,
+                'stop_loss': stop_loss,
+                'take_profit': take_profit,
+                'quantity': float(quantity),
+                'entry_time': datetime.utcfromtimestamp(bar_ts_ms / 1000) if bar_ts_ms else datetime.utcnow(),
+                'status': 'open'
+            }
+            self.db.save_trade(trade_data)
+
+            self.state.set_position({
+                'symbol': self.symbol,
+                'direction': 'short',
+                'size': float(quantity),
+                'entry_price': entry_price,
+                'stop_loss': stop_loss,
+                'take_profit': take_profit,
+                'status': 'open',
+                'armed': not self.config.use_arm_after_rr,
+                'trail_anchor': entry_price,
+                'entry_time_ts': bar_ts_ms
+            })
+
+            try:
+                self.trail_engine.on_entry(entry_price, stop_loss, "short")
+            except Exception:
+                pass
+
+            self.can_enter_short = False
+            self.can_enter_long = False
+            print(f"Short entry: {quantity} @ {entry_price}, SL: {stop_loss}, TP: {take_profit}")
+        except Exception as e:
+            print(f"Error processing short entry: {str(e) if e else 'Unknown error'}")
+
+    # ==================== Поддержка позиции / трейлинг ====================
+
+    def _get_current_price(self) -> Optional[float]:
+        """
+        Единый источник цены для логики — из конфига:
+        config.price_for_logic: "last" | "mark"
+        """
+        try:
+            if not self.api:
+                return None
+            src = str(getattr(self.config, "price_for_logic", "last")).lower()
+            # если есть унифицированный метод API — используем его
+            if hasattr(self.api, "get_price"):
+                return float(self.api.get_price(self.symbol, source=src))
+
+            # фолбэк: тикер
+            t = self.api.get_ticker(self.symbol) or {}
+            last = t.get("last_price") or t.get("lastPrice") or t.get("last")
+            mark = t.get("mark_price") or t.get("markPrice")
+            if src == "mark" and mark is not None:
+                return float(mark)
+            if last is not None:
+                return float(last)
+            if mark is not None:
+                return float(mark)
+        except Exception as e:
+            print(f"Error getting current price: {str(e) if e else 'Unknown error'}")
+        return None
+
+    def _calculate_position_size(self, entry_price: float, stop_loss: float, direction: str) -> Optional[float]:
+        try:
+            equity = self.state.get_equity()
+            if equity is None or equity <= 0:
+                return None
+            risk_amount = equity * (self.config.risk_pct / 100.0)
+            stop_size = (entry_price - stop_loss) if direction == "long" else (stop_loss - entry_price)
+            if stop_size <= 0:
+                return None
+            quantity = risk_amount / stop_size
+            quantity = qty_round(quantity, self.qty_step)
+            if getattr(self.config, "limit_qty_enabled", False):
+                quantity = min(quantity, getattr(self.config, "max_qty_manual", quantity))
+            if quantity < self.min_order_qty:
+                return None
+            return float(quantity)
+        except Exception as e:
+            print(f"Error calculating position size: {e}")
+            return None
+
+    def _validate_position_requirements(self, entry_price: float, stop_loss: float,
+                                        take_profit: float, quantity: float) -> bool:
+        try:
+            if quantity is None:
+                return False
+
+            qty = float(quantity)
+            if qty <= 0:
+                return False
+
+            min_order_qty = float(getattr(self.config, "min_order_qty", 0.01))
+            if qty < min_order_qty:
+                return False
+
+            taker = float(getattr(self.config, "taker_fee_rate", 0.00055))
+            gross = abs(float(take_profit) - float(entry_price)) * qty
+            fees  = float(entry_price) * qty * taker * 2.0  # entry + exit
+            net   = gross - fees
+
+            min_net_profit = float(getattr(self.config, "min_net_profit", 1.2))
+            return net >= min_net_profit
+        except Exception as e:
+            print(f"Error validating position: {e}")
+            return False
+
+    def _is_in_backtest_window(self, current_time: datetime) -> bool:
+        print("WARNING: Используется устаревший метод _is_in_backtest_window, нужен UTC вариант")
+        start_date = current_time - timedelta(days=self.config.days_back)
+        return current_time >= start_date
+
+    def _is_in_backtest_window_utc(self, current_timestamp: int) -> bool:
+        utc_now = datetime.utcnow().replace(tzinfo=timezone.utc)
+        utc_midnight = utc_now.replace(hour=0, minute=0, second=0, microsecond=0)
+        start_date = utc_midnight - timedelta(days=self.config.days_back)
+        current_time = datetime.utcfromtimestamp(current_timestamp / 1000)
+        return current_time >= start_date.replace(tzinfo=None)
+
+    def _get_bar_extremes_for_trailing(self, fallback_price: float) -> Tuple[float, float]:
+        try:
+            if getattr(self.config, "use_intrabar", True) and self.candles_1m:
+                last_bar = self.candles_1m[0]
+                return float(last_bar['high']), float(last_bar['low'])
+            elif self.candles_15m:
+                last_bar = self.candles_15m[0]
+                return float(last_bar['high']), float(last_bar['low'])
+        except Exception:
+            pass
+        return float(fallback_price), float(fallback_price)
+
+    def _update_smart_trailing(self, position: Dict):
+        """
+        Процентный Smart Trailing с ARM по RR.
+        """
+        try:
+            if not getattr(self.config, "enable_smart_trail", True):
+                return
+
+            direction = position.get('direction')
+            entry = float(position.get('entry_price') or 0)
+            sl = float(position.get('stop_loss') or 0)
+            if not direction or entry <= 0 or sl <= 0:
+                return
+
+            price = self._get_current_price()
+            if price is None:
+                return
+            price = float(price)
+
+            # ARM по RR (если включено)
+            armed = bool(position.get('armed', not getattr(self.config, 'use_arm_after_rr', True)))
+            if not armed and getattr(self.config, 'use_arm_after_rr', True):
+                risk = abs(entry - sl)
+                if risk > 0:
+                    rr = (price - entry) / risk if direction == 'long' else (entry - price) / risk
+                    if rr >= float(getattr(self.config, 'arm_rr', 0.5)):
+                        armed = True
+                        position['armed'] = True
+                        self.state.set_position(position)
+                        print(f"Position ARMED at {self.config.arm_rr}R")
+            if not armed:
+                return
+
+            # Якорь экстремума
+            anchor = float(position.get('trail_anchor') or entry)
+            bar_high, bar_low = self._get_bar_extremes_for_trailing(price)
+            anchor = max(anchor, bar_high) if direction == 'long' else min(anchor, bar_low)
+            if anchor != position.get('trail_anchor'):
+                position['trail_anchor'] = anchor
+                self.state.set_position(position)
+
+            # Процентный трейл от entry + offset
+            trail_perc  = float(getattr(self.config, 'trailing_perc', 0.5)) / 100.0
+            offset_perc = float(getattr(self.config, 'trailing_offset_perc', 0.4)) / 100.0
+            trail_dist  = entry * trail_perc
+            offset_dist = entry * offset_perc
+
+            if direction == 'long':
+                candidate = price_round(anchor - trail_dist - offset_dist, self.tick_size)
+                if candidate > sl:
+                    self._update_stop_loss(position, candidate)
+            else:
+                candidate = price_round(anchor + trail_dist + offset_dist, self.tick_size)
+                if candidate < sl:
+                    self._update_stop_loss(position, candidate)
+
+        except Exception as e:
+            print(f"Error in smart trailing: {e}")
+
+    def _update_stop_loss(self, position: Dict, new_sl: float):
+        try:
+            if not self.api:
+                return False
+            new_sl = price_round(float(new_sl), self.tick_size)
+
+            # сначала пробуем «правильный» v5-метод для деривативов
+            if hasattr(self.api, "update_position_stop_loss"):
+                ok = self.api.update_position_stop_loss(self.symbol, new_sl)
+                if ok:
+                    position['stop_loss'] = new_sl
+                    self.state.set_position(position)
+                    print(f"[TRAIL] SL -> {new_sl:.4f}")
+                    return True
+
+            # фолбэк — совместимость со старым интерфейсом
+            if hasattr(self.api, "modify_order"):
+                _ = self.api.modify_order(symbol=position['symbol'], stop_loss=new_sl)
+                position['stop_loss'] = new_sl
+                self.state.set_position(position)
+                print(f"[TRAIL] SL -> {new_sl:.4f}")
+                return True
+
+            return False
+        except Exception as e:
+            print(f"Error updating stop loss: {e}")
+            return False
+
+    def process_trailing(self):
+        """LEGACY метод для обратной совместимости"""
+        try:
+            current_position = self.state.get_current_position()
+            if current_position and current_position.get('status') == 'open':
+                self._update_smart_trailing(current_position)
+        except Exception as e:
+            print(f"Error processing trailing: {e}")
+
+    def run_cycle(self):
+        """
+        Основной цикл обработки (вызов из on_bar_close_15m).
+        Если позиции нет — ищем SFP и входим; иначе обновляем трейлинг.
+        """
+        try:
+            if not self.candles_15m:
+                return
+
+            current_position = self.state.get_current_position()
+            if current_position and current_position.get('status') == 'open':
+                self._update_smart_trailing(current_position)
+                return
+
+            if len(self.candles_15m) < int(getattr(self.config, "sfp_len", 2)) + 2:
+                return
+
+            current_ts = int(self.candles_15m[0]['timestamp'])
+            if not self._is_in_backtest_window_utc(current_ts):
+                return
+
+            if self._detect_bull_sfp() and self.can_enter_long:
+                self._process_long_entry()
+            elif self._detect_bear_sfp() and self.can_enter_short:
+                self._process_short_entry()
+
+        except Exception as e:
+            print(f"[run_cycle ERROR] {e}")
+
+    # ==================== Equity (live) ====================
+
+    def _update_equity(self):
+        try:
+            if not self.api:
+                return
+            wallet = self.api.get_wallet_balance()
+            if wallet and wallet.get("list"):
+                for account in wallet["list"]:
+                    if account.get("accountType") == "SPOT":
+                        for coin in account.get("coin", []):
+                            if coin.get("coin") == "USDT":
+                                equity = float(coin.get("equity", 0))
+                                self.state.set_equity(equity)
+                                self.db.save_equity_snapshot(equity)
+                                break
+        except Exception as e:
+            print(f"Error updating equity: {str(e) if e else 'Unknown error'}")
