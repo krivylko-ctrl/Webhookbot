@@ -590,16 +590,16 @@ class KWINStrategy:
             if not direction or entry <= 0 or sl <= 0:
                 return
 
-        # 1) Текущая цена для самой стратегии
+            # 1) Текущая цена для самой стратегии
             price = self._get_current_price()
             if price is None:
                 return
             price = float(price)
 
-        # 2) Экстремумы последнего бара — понадобятся и для якоря, и (опционально) для ARM
+            # 2) Экстремумы последнего бара — для якоря и (опционально) для ARM
             bar_high, bar_low = self._get_bar_extremes_for_trailing(price)
 
-        # 2a) ARM по RR с учётом базы: 'extremum' | 'last'
+            # 2a) ARM по RR с учётом базы: 'extremum' | 'last'
             armed = bool(position.get('armed', not getattr(self.config, 'use_arm_after_rr', True)))
             if not armed and getattr(self.config, 'use_arm_after_rr', True):
                 risk = abs(entry - sl)
@@ -615,14 +615,14 @@ class KWINStrategy:
             if not armed:
                 return
 
-        # 3) Якорь экстремума (как в Pine) — с момента входа
+            # 3) Якорь экстремума (как в Pine) — с момента входа
             anchor = float(position.get('trail_anchor') or entry)
             anchor = max(anchor, bar_high) if direction == 'long' else min(anchor, bar_low)
             if anchor != position.get('trail_anchor'):
                 position['trail_anchor'] = anchor
                 self.state.set_position(position)
 
-        # 4) Процентный трейл от entry + offset
+            # 4) Процентный трейл от entry + offset
             trail_perc  = float(getattr(self.config, 'trailing_perc', 0.5)) / 100.0
             offset_perc = float(getattr(self.config, 'trailing_offset_perc', 0.4)) / 100.0
             trail_dist  = entry * trail_perc
@@ -640,7 +640,6 @@ class KWINStrategy:
         except Exception as e:
             print(f"Error in smart trailing: {e}")
 
-    
     def _update_stop_loss(self, position: Dict, new_sl: float):
         try:
             if not self.api:
@@ -656,7 +655,7 @@ class KWINStrategy:
                     print(f"[TRAIL] SL -> {new_sl:.4f}")
                     return True
 
-            # фолбэк — modify_order
+            # фолбэк — modify_order (работает в paper API)
             if hasattr(self.api, "modify_order"):
                 _ = self.api.modify_order(symbol=position['symbol'], stop_loss=new_sl)
                 position['stop_loss'] = new_sl
