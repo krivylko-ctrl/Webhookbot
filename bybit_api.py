@@ -4,28 +4,26 @@ import time
 import hashlib
 import hmac
 from urllib.parse import urlencode
-import websocket
 import threading
 from typing import Dict, List, Optional, Callable
 
-# Необязательные хелперы (если используешь округления по тик-сайзу/степу)
+# Необязательные хелперы округления по тик-сайзу/шагу
 try:
     from utils_round import round_price, round_qty  # noqa: F401
 except Exception:
-    # библиотека опциональная — не ломаем импорт, если файла нет
     def round_price(x, *_args, **_kw): return x
     def round_qty(x, *_args, **_kw): return x
 
 
 class BybitAPI:
-    """Класс для работы с Bybit API v5"""
+    """Лёгкая обёртка над Bybit v5 (HTTP + паблик WS). Совместима с KWINStrategy."""
 
     def __init__(self, api_key: str, api_secret: str, testnet: bool = False):
         self.api_key = api_key
         self.api_secret = api_secret
         self.testnet = testnet
 
-        # По умолчанию "linear" (деривативы); можно сменить через set_market_type()
+        # По умолчанию деривативы ("linear"); можно сменить set_market_type("spot")
         self.market_type = "linear"
 
         if testnet:
@@ -42,27 +40,27 @@ class BybitAPI:
     # -------------------- общие утилиты --------------------
 
     def set_market_type(self, market_type: str):
-        """Установить тип рынка: 'linear' или 'spot'."""
+        """Установить тип рынка: 'linear' | 'inverse' | 'option' | 'spot'."""
         self.market_type = market_type
         if self.testnet:
             self.ws_url = f"wss://stream-testnet.bybit.com/v5/public/{market_type}"
         else:
             self.ws_url = f"wss://stream.bybit.com/v5/public/{market_type}"
 
-    def _generate_signature(self, params: str, timestamp: str) -> str:
+    def _generate_signature(self, payload: str, timestamp: str) -> str:
         """
-        Генерация подписи для v5.
-        Sign = HMAC_SHA256(secret, timestamp + apiKey + recvWindow + payload)
+        v5 HMAC: sign = HMAC_SHA256(secret, timestamp + apiKey + recvWindow + payload)
+        где payload = urlencode(params) для GET, json.dumps(params) для POST.
         """
-        param_str = timestamp + self.api_key + "5000" + params
+        prehash = timestamp + self.api_key + "5000" + payload
         return hmac.new(
             self.api_secret.encode("utf-8"),
-            param_str.encode("utf-8"),
+            prehash.encode("utf-8"),
             hashlib.sha256
         ).hexdigest()
 
     def _send_request(self, method: str, endpoint: str, params: Optional[Dict] = None) -> Dict:
-        """Отправка HTTP-запроса (подписываем всё — безопасно и просто)."""
+        """Отправка HTTP-запроса. Подписываем ВСЁ (GET/POST) — безопасно и стабильно."""
         params = params or {}
         url = f"{self.base_url}{endpoint}"
         timestamp = str(int(time.time() * 1000))
@@ -107,8 +105,8 @@ class BybitAPI:
         """Время сервера (секунды)."""
         resp = self._send_request("GET", "/v5/market/time")
         if resp.get("retCode") == 0:
-            # v5 возвращает миллисекунды/секунды в разных ключах; страхуемся
             result = resp.get("result") or {}
+            # timeSecond (сек), timeNano (нс) — встречаются оба варианта
             if "timeSecond" in result:
                 return int(result["timeSecond"])
             if "timeNano" in result:
@@ -116,7 +114,11 @@ class BybitAPI:
         return None
 
     def get_klines(self, symbol: str, interval: str, limit: int = 200) -> Optional[List[Dict]]:
-        """Исторические свечи (последней в списке будет *самая свежая закрытая*)."""
+        """
+        Исторические свечи.
+        Возвращает список в возрастающем порядке времени: out[0] — самая старая,
+        out[-1] — САМАЯ СВЕЖАЯ ЗАКРЫТАЯ (эквивалент TV).
+        """
         params = {
             "category": self.market_type,
             "symbol": symbol,
@@ -126,7 +128,7 @@ class BybitAPI:
         resp = self._send_request("GET", "/v5/market/kline", params)
         if resp.get("retCode") == 0:
             lst = (resp.get("result") or {}).get("list") or []
-            out = []
+            out: List[Dict] = []
             for it in lst:
                 out.append({
                     "timestamp": int(it[0]),
@@ -136,13 +138,12 @@ class BybitAPI:
                     "close": float(it[4]),
                     "volume": float(it[5]) if it[5] is not None else 0.0,
                 })
-            # хотим TV-эквивалент: последняя — самая свежая закрытая
-            out.sort(key=lambda x: x["timestamp"])
+            out.sort(key=lambda x: x["timestamp"])  # возрастающе
             return out
         return None
 
     def get_ticker(self, symbol: str) -> Dict:
-        """Тикер по символу (возвращаем и last, и mark, и bid/ask)."""
+        """Тикер по символу (last/mark + best bid/ask)."""
         params = {"category": self.market_type, "symbol": symbol}
         resp = self._send_request("GET", "/v5/market/tickers", params)
         if resp.get("retCode") == 0:
@@ -169,6 +170,15 @@ class BybitAPI:
         mark = float(t.get("markPrice", 0) or 0)
         return mark if (str(source).lower() == "mark" and mark > 0) else last
 
+    def get_instruments_info(self, symbol: str) -> Optional[Dict]:
+        """Информация об инструменте (тик-сайз, шаг количества и т.д.)."""
+        params = {"category": self.market_type, "symbol": symbol}
+        resp = self._send_request("GET", "/v5/market/instruments-info", params)
+        if resp.get("retCode") == 0:
+            lst = (resp.get("result") or {}).get("list") or []
+            return lst[0] if lst else None
+        return None
+
     # -------------------- аккаунт / ордера --------------------
 
     def get_wallet_balance(self, account_type: str = "UNIFIED") -> Optional[Dict]:
@@ -190,16 +200,16 @@ class BybitAPI:
         take_profit: Optional[float] = None,
         order_link_id: Optional[str] = None,
         reduce_only: bool = False,
-        trigger_by_source: str = "last",   # 'last' | 'mark' — важно для стопов
+        trigger_by_source: str = "last",   # 'last' | 'mark' — важно для стопов/условных
         time_in_force: Optional[str] = None,
         position_idx: Optional[int] = None,
     ) -> Optional[Dict]:
-        """Создать ордер."""
+        """Создать ордер (Market/Limit/Conditional/Stop)."""
         params: Dict[str, str] = {
             "category": self.market_type,
             "symbol": symbol,
-            "side": str(side).title(),          # Buy/Sell
-            "orderType": str(order_type).title(),  # Market/Limit/Conditional/Stop
+            "side": str(side).title(),            # Buy/Sell
+            "orderType": str(order_type).title(), # Market/Limit/Conditional/Stop
             "qty": str(qty),
         }
 
@@ -212,21 +222,79 @@ class BybitAPI:
         if position_idx is not None:
             params["positionIdx"] = str(position_idx)
 
-        # Цена для лимитных/условных
         if price is not None:
             params["price"] = str(price)
-
-        # Стопы
         if stop_loss is not None:
             params["stopLoss"] = str(stop_loss)
         if take_profit is not None:
             params["takeProfit"] = str(take_profit)
 
-        # Для условных/стоповых — источник триггера
+        # Для условных/стопов — источник триггера
         if order_type.lower() in {"stop", "conditional"}:
             params["triggerBy"] = self._map_trigger_by(trigger_by_source)
 
         resp = self._send_request("POST", "/v5/order/create", params)
+        if resp.get("retCode") == 0:
+            return resp.get("result")
+        return None
+
+    def modify_order(
+        self,
+        symbol: str,
+        order_id: Optional[str] = None,
+        order_link_id: Optional[str] = None,
+        price: Optional[float] = None,
+        qty: Optional[float] = None,
+        stop_loss: Optional[float] = None,
+        take_profit: Optional[float] = None,
+        trigger_by_source: str = "last",
+    ) -> Optional[Dict]:
+        """
+        Унифицированная правка:
+        - Если меняем SL/TP активной ПОЗИЦИИ (деривативы) -> /v5/position/trading-stop
+        - Если правим параметры конкретного ОРДЕРА (price/qty) -> /v5/order/amend
+        """
+        # 1) апдейт стоп-лосса/тейк-профита позиции (чаще всего используется в трейлинге)
+        if stop_loss is not None or take_profit is not None:
+            if self.market_type != "linear":
+                # для spot тут обычно не используется; можно расширить при необходимости
+                pass
+            params_ts: Dict[str, str] = {
+                "category": "linear",
+                "symbol": symbol,
+            }
+            if stop_loss is not None:
+                params_ts["stopLoss"] = str(stop_loss)
+                # можно указать источник триггера для SL
+                params_ts["slTriggerBy"] = self._map_trigger_by(trigger_by_source)
+            if take_profit is not None:
+                params_ts["takeProfit"] = str(take_profit)
+                params_ts["tpTriggerBy"] = self._map_trigger_by(trigger_by_source)
+
+            resp = self._send_request("POST", "/v5/position/trading-stop", params_ts)
+            if resp.get("retCode") == 0:
+                return resp.get("result")
+            return None
+
+        # 2) апдейт существующего ОРДЕРА (лимитники и т.п.)
+        if order_id is None and order_link_id is None:
+            # нечего менять — не знаем какой ордер
+            return None
+
+        params_amend: Dict[str, str] = {
+            "category": self.market_type,
+            "symbol": symbol,
+        }
+        if order_id:
+            params_amend["orderId"] = order_id
+        if order_link_id:
+            params_amend["orderLinkId"] = order_link_id
+        if price is not None:
+            params_amend["price"] = str(price)
+        if qty is not None:
+            params_amend["qty"] = str(qty)
+
+        resp = self._send_request("POST", "/v5/order/amend", params_amend)
         if resp.get("retCode") == 0:
             return resp.get("result")
         return None
@@ -262,7 +330,7 @@ class BybitAPI:
         return None
 
     def update_position_stop_loss(self, symbol: str, stop_loss: float) -> Optional[Dict]:
-        """Обновить стоп-лосс позиции (для деривативов)."""
+        """Старый интерфейс (деривативы): прокся на position/trading-stop."""
         if self.market_type != "linear":
             return None
         params = {"category": "linear", "symbol": symbol, "stopLoss": str(stop_loss)}
@@ -271,20 +339,10 @@ class BybitAPI:
             return resp.get("result")
         return None
 
-    def get_instruments_info(self, symbol: str) -> Optional[Dict]:
-        """Информация об инструменте (тик-сайз, шаг количества и т.д.)."""
-        params = {"category": self.market_type, "symbol": symbol}
-        resp = self._send_request("GET", "/v5/market/instruments-info", params)
-        if resp.get("retCode") == 0:
-            lst = (resp.get("result") or {}).get("list") or []
-            return lst[0] if lst else None
-        return None
-
-    # -------------------- WebSocket --------------------
+    # -------------------- WebSocket (паблик) --------------------
 
     def start_websocket(self, on_message: Optional[Callable] = None):
-        """Запустить WebSocket-соединение (паблик стрим)."""
-
+        """Запуск паблик WebSocket-соединения."""
         def on_ws_message(ws, message):
             try:
                 data = json.loads(message)
@@ -320,7 +378,7 @@ class BybitAPI:
             print("WebSocket library not available")
 
     def subscribe_kline(self, symbol: str, interval: str, callback: Callable):
-        """Подписка на свечи через WebSocket (паблик-стрим)."""
+        """Подписка на kline через паблик WebSocket."""
         if not self.ws:
             self.start_websocket()
         topic = f"kline.{interval}.{symbol}"
