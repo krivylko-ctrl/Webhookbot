@@ -1,4 +1,3 @@
-Kwin strategy base
 
 # kwin_strategy.py
 import pandas as pd
