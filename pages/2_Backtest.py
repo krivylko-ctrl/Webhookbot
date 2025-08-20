@@ -1,4 +1,7 @@
 import streamlit as st
+
+st.set_page_config(page_title="KWIN Backtest", page_icon="📈", layout="wide")
+
 import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
@@ -166,7 +169,7 @@ class PaperBybitAPI:
 
 # ========================================================================
 def main():
-    st.set_page_config(page_title="KWIN Backtest", page_icon="📈", layout="wide")
+    
 
     st.title("📊 KWIN Strategy Backtest")
     st.markdown("Тестирование стратегии на исторических данных.")
