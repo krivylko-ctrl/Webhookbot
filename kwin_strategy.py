@@ -1,3 +1,4 @@
+# kwin_strategy.py
 import pandas as pd
 import numpy as np
 from typing import Dict, List, Optional, Tuple
@@ -7,8 +8,10 @@ from config import Config
 from state_manager import StateManager
 from trail_engine import TrailEngine
 from analytics import TradingAnalytics
-from utils import price_round, qty_round
 from database import Database
+
+# округление цен/количеств по тик-сайзу и шагу
+from utils_round import round_price, round_qty
 
 
 class KWINStrategy:
@@ -81,11 +84,16 @@ class KWINStrategy:
                 if hasattr(self.api, 'get_instruments_info'):
                     info = self.api.get_instruments_info(self.symbol)
                     if info:
-                        if 'priceFilter' in info:
-                            self.tick_size = float(info['priceFilter']['tickSize'])
-                        if 'lotSizeFilter' in info:
-                            self.qty_step = float(info['lotSizeFilter']['qtyStep'])
-                            self.min_order_qty = float(info['lotSizeFilter']['minOrderQty'])
+                        # Bybit v5 формат может быть вложенным (строки); страхуемся
+                        pf = info.get('priceFilter') if isinstance(info, dict) else {}
+                        ls = info.get('lotSizeFilter') if isinstance(info, dict) else {}
+                        if pf and pf.get('tickSize') is not None:
+                            self.tick_size = float(pf['tickSize'])
+                        if ls:
+                            if ls.get('qtyStep') is not None:
+                                self.qty_step = float(ls['qtyStep'])
+                            if ls.get('minOrderQty') is not None:
+                                self.min_order_qty = float(ls['minOrderQty'])
         except Exception as e:
             print(f"Error initializing instrument info: {e}")
 
@@ -327,22 +335,25 @@ class KWINStrategy:
         side_up = "Buy" if direction == "long" else "Sell"
         side_lo = "buy" if direction == "long" else "sell"
         qty = float(quantity)
-        sl_send = price_round(stop_loss, self.tick_size) if stop_loss is not None else None
+        sl_send = round_price(stop_loss, self.tick_size) if stop_loss is not None else None
         try:
+            # современный v5-метод; прокидываем источник триггера из конфига
             return self.api.place_order(
                 symbol=self.symbol,
                 side=side_up,
                 orderType="Market",
                 qty=qty,
-                stop_loss=sl_send  # наш BybitAPI понимает camel/snake (мы обернём внутри)
+                stop_loss=sl_send,
+                trigger_by_source=getattr(self.config, "trigger_price_source", "last"),
             )
         except TypeError:
+            # совместимость со старым snake_case
             return self.api.place_order(
                 symbol=self.symbol,
                 side=side_lo,
                 order_type="market",
                 qty=qty,
-                stop_loss=sl_send
+                stop_loss=sl_send,
             )
 
     def _process_long_entry(self):
@@ -352,13 +363,13 @@ class KWINStrategy:
                 return
 
             raw_sl = float(self.candles_15m[1]['low'])
-            entry_price = price_round(float(current_price), self.tick_size)
-            stop_loss   = price_round(raw_sl, self.tick_size)
+            entry_price = round_price(float(current_price), self.tick_size)
+            stop_loss   = round_price(raw_sl, self.tick_size)
 
             stop_size = entry_price - stop_loss
             if stop_size <= 0:
                 return
-            take_profit = price_round(entry_price + stop_size * self.config.risk_reward, self.tick_size)
+            take_profit = round_price(entry_price + stop_size * self.config.risk_reward, self.tick_size)
 
             quantity = self._calculate_position_size(entry_price, stop_loss, "long")
             if not quantity:
@@ -393,7 +404,7 @@ class KWINStrategy:
                 'take_profit': take_profit,
                 'status': 'open',
                 'armed': not self.config.use_arm_after_rr,
-                'trail_anchor': entry_price,            # удобный старт для якоря
+                'trail_anchor': entry_price,            # стартовый якорь
                 'entry_time_ts': bar_ts_ms
             })
 
@@ -416,13 +427,13 @@ class KWINStrategy:
                 return
 
             raw_sl = float(self.candles_15m[1]['high'])
-            entry_price = price_round(float(current_price), self.tick_size)
-            stop_loss   = price_round(raw_sl, self.tick_size)
+            entry_price = round_price(float(current_price), self.tick_size)
+            stop_loss   = round_price(raw_sl, self.tick_size)
 
             stop_size = stop_loss - entry_price
             if stop_size <= 0:
                 return
-            take_profit = price_round(entry_price - stop_size * self.config.risk_reward, self.tick_size)
+            take_profit = round_price(entry_price - stop_size * self.config.risk_reward, self.tick_size)
 
             quantity = self._calculate_position_size(entry_price, stop_loss, "short")
             if not quantity:
@@ -483,7 +494,7 @@ class KWINStrategy:
             if not self.api:
                 return None
             src = str(getattr(self.config, "price_for_logic", "last")).lower()
-            # если есть унифицированный метод API — используем его
+            # унифицированный метод API (из bybit_api.py)
             if hasattr(self.api, "get_price"):
                 return float(self.api.get_price(self.symbol, source=src))
 
@@ -511,7 +522,7 @@ class KWINStrategy:
             if stop_size <= 0:
                 return None
             quantity = risk_amount / stop_size
-            quantity = qty_round(quantity, self.qty_step)
+            quantity = round_qty(quantity, self.qty_step)
             if getattr(self.config, "limit_qty_enabled", False):
                 quantity = min(quantity, getattr(self.config, "max_qty_manual", quantity))
             if quantity < self.min_order_qty:
@@ -618,11 +629,11 @@ class KWINStrategy:
             offset_dist = entry * offset_perc
 
             if direction == 'long':
-                candidate = price_round(anchor - trail_dist - offset_dist, self.tick_size)
+                candidate = round_price(anchor - trail_dist - offset_dist, self.tick_size)
                 if candidate > sl:
                     self._update_stop_loss(position, candidate)
             else:
-                candidate = price_round(anchor + trail_dist + offset_dist, self.tick_size)
+                candidate = round_price(anchor + trail_dist + offset_dist, self.tick_size)
                 if candidate < sl:
                     self._update_stop_loss(position, candidate)
 
@@ -633,9 +644,9 @@ class KWINStrategy:
         try:
             if not self.api:
                 return False
-            new_sl = price_round(float(new_sl), self.tick_size)
+            new_sl = round_price(float(new_sl), self.tick_size)
 
-            # сначала пробуем «правильный» v5-метод для деривативов
+            # сперва правильный v5-метод (деривативы)
             if hasattr(self.api, "update_position_stop_loss"):
                 ok = self.api.update_position_stop_loss(self.symbol, new_sl)
                 if ok:
@@ -644,7 +655,7 @@ class KWINStrategy:
                     print(f"[TRAIL] SL -> {new_sl:.4f}")
                     return True
 
-            # фолбэк — совместимость со старым интерфейсом
+            # фолбэк — modify_order
             if hasattr(self.api, "modify_order"):
                 _ = self.api.modify_order(symbol=position['symbol'], stop_loss=new_sl)
                 position['stop_loss'] = new_sl
@@ -702,9 +713,10 @@ class KWINStrategy:
             if not self.api:
                 return
             wallet = self.api.get_wallet_balance()
+            # формат зависит от accountType; примерная совместимость:
             if wallet and wallet.get("list"):
                 for account in wallet["list"]:
-                    if account.get("accountType") == "SPOT":
+                    if account.get("accountType") in ("SPOT", "UNIFIED"):
                         for coin in account.get("coin", []):
                             if coin.get("coin") == "USDT":
                                 equity = float(coin.get("equity", 0))
