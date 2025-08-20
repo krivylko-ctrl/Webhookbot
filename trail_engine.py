@@ -15,12 +15,13 @@ class _CfgView:
     arm_rr_basis: str = "extremum"        # "extremum" | "last" — база для RR при ARM
     epsilon: float = 1e-9                 # защита от дрожания сравнения
 
+
 class SmartTrailEngine:
     """
     Процентный Smart Trail:
       • дистанция трейла = % от цены входа (+ опциональный offset),
       • активация (ARM) по RR (если включено),
-      • без «bar-trail» — движение стопа зависит от поданной цены (или экстремума).
+      • без «bar-trail» — движение стопа зависит от поданной цены/экстремума.
     Совместим с прежним импортом (см. класс-обёртку TrailEngine внизу).
     """
 
@@ -55,34 +56,34 @@ class SmartTrailEngine:
         Обновление на закрытии бара/тика одной ценой.
         Возвращает текущее значение SL (возможно обновлённое).
         """
-        return self._update_internal(current_price=current_price,
-                                     hi=current_price, lo=current_price)
+        p = float(current_price)
+        return self._update_internal(current_price=p, hi=p, lo=p)
 
     def update_intrabar(self, high: float, low: float, last: float) -> float:
         """
         Интрабар-обновление: передай high/low/last — движок сам выберет базу
         для ARM (extremum/last) и новую точку для кандидата стопа.
         """
-        # На экстремумах логично «кандидата» считать от hi (long) / lo (short),
-        # но сам трейл у нас процентный от entry — значит используем last
-        # как «текущую» базу для позиционирования SL, а RR для ARM по выбору.
+        high = float(high)
+        low  = float(low)
+        last = float(last)
+
         if self.config.arm_rr_basis == "extremum":
-            rr_px = (float(high) if self.direction == "long" else float(low))
+            rr_px = (high if self.direction == "long" else low)
         else:
-            rr_px = float(last)
+            rr_px = last
 
-        # current для самого трейла — последняя цена
-        return self._update_internal(current_price=float(last),
-                                     hi=float(high), lo=float(low),
-                                     rr_basis_price=rr_px)
+        return self._update_internal(current_price=last, hi=high, lo=low, rr_basis_price=rr_px)
 
-    # ---------------- вспомогательная логика ----------------
+    # ---------------- внутренняя логика ----------------
 
-    def _update_internal(self,
-                         current_price: float,
-                         hi: float,
-                         lo: float,
-                         rr_basis_price: float | None = None) -> float:
+    def _update_internal(
+        self,
+        current_price: float,
+        hi: float,
+        lo: float,
+        rr_basis_price: float | None = None
+    ) -> float:
         """
         Единая точка обновления: ARM по RR + пересчёт кандидата SL.
         """
@@ -91,11 +92,7 @@ class SmartTrailEngine:
 
         # 1) ARM по RR (если требуется)
         if not self.active and self.config.use_arm_after_rr:
-            base = rr_basis_price
-            if base is None:
-                # по умолчанию — используем текущую цену
-                base = current_price
-
+            base = rr_basis_price if rr_basis_price is not None else current_price
             risk = abs(self.entry_price - self.stop_loss)
             if risk > self.config.epsilon:
                 if self.direction == "long":
@@ -111,18 +108,18 @@ class SmartTrailEngine:
 
         # 2) Процентный трейл от цены входа
         trail_dist = self.entry_price * (self.config.trailing_perc / 100.0)
-        offset = self.entry_price * (self.config.trailing_offset_perc / 100.0)
+        offset     = self.entry_price * (self.config.trailing_offset_perc / 100.0)
 
         if self.direction == "long":
             candidate = float(current_price) - trail_dist - offset
-            # Улучшаем только в сторону профита
+            # Улучшаем только в сторону профита (монотонность)
             if candidate > self.stop_loss + self.config.epsilon:
-                # Не позволяем стопу перейти через цену входа (безопасность)
-                self.stop_loss = max(candidate, min(self.entry_price, candidate))
+                # важно: разрешаем проходить выше entry (брейк-ивен/лок прибыли)
+                self.stop_loss = candidate
         else:  # short
             candidate = float(current_price) + trail_dist + offset
             if candidate < self.stop_loss - self.config.epsilon:
-                self.stop_loss = min(candidate, max(self.entry_price, candidate))
+                self.stop_loss = candidate
 
         return self.stop_loss
 
