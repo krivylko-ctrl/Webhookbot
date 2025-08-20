@@ -557,11 +557,6 @@ class KWINStrategy:
             print(f"Error validating position: {e}")
             return False
 
-    def _is_in_backtest_window(self, current_time: datetime) -> bool:
-        print("WARNING: Используется устаревший метод _is_in_backtest_window, нужен UTC вариант")
-        start_date = current_time - timedelta(days=self.config.days_back)
-        return current_time >= start_date
-
     def _is_in_backtest_window_utc(self, current_timestamp: int) -> bool:
         utc_now = datetime.utcnow().replace(tzinfo=timezone.utc)
         utc_midnight = utc_now.replace(hour=0, minute=0, second=0, microsecond=0)
@@ -581,10 +576,11 @@ class KWINStrategy:
             pass
         return float(fallback_price), float(fallback_price)
 
-        def _update_smart_trailing(self, position: Dict):
-        """
-        Процентный Smart Trailing с ARM по RR.
-        """
+    def _update_smart_trailing(self, position: Dict):
+            
+            """
+            Процентный Smart Trailing с ARM по RR.
+            """
         try:
             if not getattr(self.config, "enable_smart_trail", True):
                 return
