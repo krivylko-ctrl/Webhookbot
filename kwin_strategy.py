@@ -17,24 +17,17 @@ from database import Database
 from utils_round import round_price, round_qty
 
 class KWINStrategy:
-    """
-    Основная стратегия KWIN (с поддержкой смарт-трейла).
-    """
-
-    def __init__(self, config: Config, api=None, state_manager: StateManager=None, db: Database=None, **kwargs):
-    # обратная совместимость с вызовами вида bybit_api=...
-           api = api or kwargs.get("bybit_api")
-
-        self.config = config
-        self.api = api
-        self.state = state_manager
-        self.db = db
+    def __init__(self, config: Config, api=None, state_manager: StateManager=None, db: Database=None, **kwargs):  api = api or kwargs.get("bybit_api")
+    self.config = config
+    self.api = api
+    self.state = state_manager
+    self.db = db
 
         # тик для округлений
-        self.tick_size = getattr(config, "tick_size", 0.1)
+    self.tick_size = getattr(config, "tick_size", 0.1)
 
         # трейл-движок (smart) — поддерживаем разные версии сигнатур
-        self.trail_engine = None
+    self.trail_engine = None
         try:
             # Новая сигнатура: (config, state_manager, bybit_api)
             self.trail_engine = TrailEngine(config, state_manager, api)
@@ -49,9 +42,9 @@ class KWINStrategy:
                 except Exception:
                     self.trail_engine = None  # не критично для бэктеста
                     
-        self.symbol = getattr(config, "symbol", "ETHUSDT")
-        self.interval = str(getattr(config, "interval", "15"))
-        self.intrabar_tf = str(getattr(config, "intrabar_tf", "1"))
+    self.symbol = getattr(config, "symbol", "ETHUSDT")
+    self.interval = str(getattr(config, "interval", "15"))
+    self.intrabar_tf = str(getattr(config, "intrabar_tf", "1"))
 
     
 
