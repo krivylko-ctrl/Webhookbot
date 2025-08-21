@@ -14,7 +14,8 @@ from state_manager import StateManager
 from trail_engine import TrailEngine
 from analytics import TradingAnalytics
 from database import Database
-from utils_round import round_price, round_qty
+# ⬇️ ДОБАВЛЕНО: точные хелперы округления к тику (для 1:1 с Pine)
+from utils_round import round_price, round_qty, round_to_tick, floor_to_tick, ceil_to_tick
 
 
 class KWINStrategy:
@@ -302,7 +303,6 @@ class KWINStrategy:
         return (high - close) >= required
 
     # ---------- ОРДЕРА / ВХОД ----------
-
     def _get_current_price(self) -> Optional[float]:
         """Единый источник цены: config.price_for_logic = 'last'|'mark'."""
         try:
@@ -392,13 +392,16 @@ class KWINStrategy:
             price = self._get_current_price()
             if not price or len(self.candles_15m) < 2:
                 return
+
             raw_sl = float(self.candles_15m[1]["low"])
-            entry = round_price(float(price), self.tick_size)
-            sl = round_price(raw_sl, self.tick_size)
+
+            # ⬇️ ИЗМЕНЕНО: Pine-точное округление
+            entry = round_to_tick(float(price), self.tick_size)          # к ближайшему тику
+            sl    = floor_to_tick(raw_sl, self.tick_size)                # вниз (для long)
             stop_size = entry - sl
             if stop_size <= 0:
                 return
-            tp = round_price(entry + stop_size * float(self.config.risk_reward), self.tick_size)
+            tp = round_to_tick(entry + stop_size * float(self.config.risk_reward), self.tick_size)
 
             qty = self._calculate_position_size(entry, sl, "long")
             if not qty or not self._validate_position_requirements(entry, sl, tp, qty):
@@ -454,13 +457,16 @@ class KWINStrategy:
             price = self._get_current_price()
             if not price or len(self.candles_15m) < 2:
                 return
+
             raw_sl = float(self.candles_15m[1]["high"])
-            entry = round_price(float(price), self.tick_size)
-            sl = round_price(raw_sl, self.tick_size)
+
+            # ⬇️ ИЗМЕНЕНО: Pine-точное округление
+            entry = round_to_tick(float(price), self.tick_size)          # к ближайшему тику
+            sl    = ceil_to_tick(raw_sl, self.tick_size)                 # вверх (для short)
             stop_size = sl - entry
             if stop_size <= 0:
                 return
-            tp = round_price(entry - stop_size * float(self.config.risk_reward), self.tick_size)
+            tp = round_to_tick(entry - stop_size * float(self.config.risk_reward), self.tick_size)
 
             qty = self._calculate_position_size(entry, sl, "short")
             if not qty or not self._validate_position_requirements(entry, sl, tp, qty):
@@ -569,7 +575,6 @@ class KWINStrategy:
                         print(f"[ARM] enabled (hit {rr_need}R; used={basis}, rr_now={rr_now:.3f}, rr_alt={rr_alt:.3f})")
 
             if not armed:
-                # ещё рано — ждём условия ARM
                 return
 
             # -------- якорь от экстремума --------
@@ -587,7 +592,8 @@ class KWINStrategy:
             offset_dist = entry * offset_perc
 
             if direction == "long":
-                candidate = round_price(anchor - trail_dist - offset_dist, self.tick_size)
+                # ⬇️ ИЗМЕНЕНО: безопасное округление вниз для long
+                candidate = floor_to_tick(anchor - trail_dist - offset_dist, self.tick_size)
                 if candidate > sl:
                     self._update_stop_loss(position, candidate)
                 else:
@@ -597,7 +603,8 @@ class KWINStrategy:
                     except Exception:
                         pass
             else:
-                candidate = round_price(anchor + trail_dist + offset_dist, self.tick_size)
+                # ⬇️ ИЗМЕНЕНО: безопасное округление вверх для short
+                candidate = ceil_to_tick(anchor + trail_dist + offset_dist, self.tick_size)
                 if candidate < sl:
                     self._update_stop_loss(position, candidate)
                 else:
