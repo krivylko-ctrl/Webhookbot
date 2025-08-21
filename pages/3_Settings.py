@@ -2,8 +2,10 @@ import streamlit as st
 import sys
 import os
 
-# Добавляем путь к родительской директории
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+# Если запускаешь страницу из подпапки — добавим корень в PYTHONPATH
+ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if ROOT_DIR not in sys.path:
+    sys.path.append(ROOT_DIR)
 
 from config import Config
 
@@ -16,14 +18,14 @@ st.set_page_config(
 def main():
     st.title("⚙️ Настройки KWIN Trading Bot")
     st.markdown("---")
-    
+
+    # Загружаем текущую конфигурацию (внутри она подтягивает config.json, если есть)
     config = Config()
-    
-    # Основные настройки торговли
+
+    # ========================= Основные настройки торговли =========================
     st.subheader("🎯 Основные настройки торговли")
-    
+
     col1, col2 = st.columns(2)
-    
     with col1:
         risk_pct = st.number_input(
             "Риск на сделку (%)",
@@ -33,75 +35,81 @@ def main():
             step=0.1,
             help="Процент от капитала, рискуемый на одну сделку"
         )
-        
+
         risk_reward = st.number_input(
             "Risk/Reward соотношение",
             min_value=0.5,
             max_value=5.0,
             value=float(config.risk_reward),
             step=0.1,
-            help="Соотношение прибыли к убытку"
+            help="Соотношение прибыли к убытку (R:R)"
         )
-        
+
         max_qty = st.number_input(
-            "Максимальная позиция (ETH)",
-            min_value=0.01,
-            max_value=100.0,
+            "Максимальная позиция (в базовом активе)",
+            min_value=0.001,
+            max_value=1000.0,
             value=float(config.max_qty_manual),
-            step=0.01,
-            help="Максимальный размер позиции в ETH"
+            step=0.001,
+            help="Максимальный размер позиции (учитывается, если включено ограничение количества)"
         )
-    
+
     with col2:
         sfp_len = st.number_input(
             "SFP Length",
             min_value=1,
             max_value=10,
             value=int(getattr(config, 'sfp_len', 2)),
-            help="Длина поиска Swing Failure Pattern"
+            help="Длина для поиска Swing Failure Pattern (как в Pine)"
         )
-        
+
         use_sfp_quality = st.checkbox(
-            "Фильтр качества SFP",
-            value=getattr(config, 'use_sfp_quality', True),
-            help="Включить дополнительную фильтрацию SFP по качеству"
+            "Фильтр качества SFP (wick + close-back)",
+            value=bool(getattr(config, 'use_sfp_quality', True)),
+            help="Включить фильтры качества SFP"
         )
-        
+
         wick_min_ticks = st.number_input(
-            "Минимальная глубина фитиля (тики)",
+            "Минимальная глубина фитиля (в тиках)",
             min_value=0,
-            max_value=50,
+            max_value=100,
             value=int(getattr(config, 'wick_min_ticks', 7)),
-            help="Минимальная глубина фитиля для валидного SFP"
+            help="Минимальная глубина фитиля для валидного SFP (в тик-сайзах инструмента)"
         )
-    
-    # Smart Trailing настройки
+
+    # =============================== Smart Trailing ================================
     st.subheader("🎯 Smart Trailing")
-    
+
     col1, col2 = st.columns(2)
-    
     with col1:
         enable_smart_trail = st.checkbox(
             "Включить Smart Trailing",
-            value=getattr(config, 'enable_smart_trail', True),
-            help="Включить систему умного трейлинга стоп-лосса"
+            value=bool(getattr(config, 'enable_smart_trail', True)),
+            help="Умный трейлинг SL (аналог Pine-логики)"
         )
-        
+
         use_arm_after_rr = st.checkbox(
-            "Арминг после RR",
-            value=getattr(config, 'use_arm_after_rr', True),
-            help="Активировать трейлинг только после достижения определенного RR"
+            "Арминг трейла после достижения RR",
+            value=bool(getattr(config, 'use_arm_after_rr', True)),
+            help="Активировать трейлинг только после достижения заданного RR"
         )
-        
+
         arm_rr = st.number_input(
             "RR для арминга",
             min_value=0.1,
-            max_value=2.0,
+            max_value=5.0,
             value=float(getattr(config, 'arm_rr', 0.5)),
             step=0.1,
-            help="Risk/Reward для активации трейлинга"
+            help="Минимальное значение R, после которого включается трейл"
         )
-    
+
+        arm_rr_basis = st.selectbox(
+            "База расчёта RR для арминга",
+            options=["extremum", "last"],
+            index=0 if getattr(config, "arm_rr_basis", "extremum") == "extremum" else 1,
+            help="extremum — считаем от экстремума бара; last — от текущей цены"
+        )
+
     with col2:
         trailing_perc = st.number_input(
             "Процент трейлинга (%)",
@@ -109,117 +117,94 @@ def main():
             max_value=5.0,
             value=float(getattr(config, 'trailing_perc', 0.5)),
             step=0.1,
-            help="Процент от цены входа для трейлинга"
+            help="Процент от цены входа для вычисления дистанции трейла"
         )
-        
-        trailing_offset = st.number_input(
+
+        trailing_offset_perc = st.number_input(
             "Offset трейлинга (%)",
             min_value=0.0,
             max_value=5.0,
             value=float(getattr(config, 'trailing_offset_perc', 0.4)),
             step=0.1,
-            help="Дополнительный отступ для трейлинга"
+            help="Дополнительный отступ от дистанции трейла"
         )
-        
+
         use_bar_trail = st.checkbox(
-            "Баровый трейлинг",
-            value=getattr(config, 'use_bar_trail', True),
-            help="Использовать трейлинг по максимумам/минимумам баров"
+            "Баровый трейлинг (lowest/highest N закрытых баров)",
+            value=bool(getattr(config, 'use_bar_trail', True)),
+            help="Совместимость со старым режимом: lowest(low, N)[1] / highest(high, N)[1]"
         )
-    
-    # Фильтры и гварды
-    st.subheader("🛡️ Фильтры и защита")
-    
+
+    # =========================== Фильтры (из Pine) ===========================
+    st.subheader("🛡️ Фильтры SFP")
+
     col1, col2 = st.columns(2)
-    
     with col1:
-        use_stop_guards = st.checkbox(
-            "Гварды стоп-лосса",
-            value=getattr(config, 'use_stop_guards', False),
-            help="Включить дополнительную проверку корректности SL"
-        )
-        
-        max_stop_pct = st.number_input(
-            "Максимальный SL (%)",
-            min_value=1.0,
-            max_value=20.0,
-            value=float(getattr(config, 'max_stop_pct', 8.0)),
-            step=0.5,
-            help="Максимальный размер стоп-лосса в процентах"
-        )
-    
-    with col2:
         close_back_pct = st.number_input(
-            "Close-back процент",
+            "Close-back (0.0 … 1.0)",
             min_value=0.0,
             max_value=1.0,
             value=float(getattr(config, 'close_back_pct', 1.0)),
             step=0.05,
-            help="Процент возврата цены закрытия для SFP (0.0-1.0)"
+            help="Требуемая доля возврата закрытия относительно глубины фитиля (как в Pine)"
         )
-        
-        min_profit_usd = st.number_input(
-            "Минимальная прибыль ($)",
-            min_value=0.0,
-            max_value=100.0,
-            value=float(getattr(config, 'min_profit_usd', 0.0)),
-            step=1.0,
-            help="Минимальная ожидаемая прибыль в USD"
-        )
-    
-    # Кнопка сохранения
-    st.markdown("---")
-    
-    col1, col2, col3 = st.columns([1, 2, 1])
+
     with col2:
+        # опционально покажем текущие шаги инструмента (read-only)
+        st.text_input(
+            "Tick size (read-only)",
+            value=str(getattr(config, 'tick_size', 0.01)),
+            disabled=True
+        )
+
+    # ============================== Сохранение ==============================
+    st.markdown("---")
+    c1, c2, c3 = st.columns([1, 2, 1])
+    with c2:
         if st.button("💾 Сохранить настройки", type="primary", use_container_width=True):
             try:
-                # Обновляем конфигурацию
-                config.risk_pct = risk_pct
-                config.risk_reward = risk_reward
-                config.max_qty_manual = max_qty
-                config.sfp_len = sfp_len
-                config.use_sfp_quality = use_sfp_quality
-                config.wick_min_ticks = wick_min_ticks
-                config.enable_smart_trail = enable_smart_trail
-                config.use_arm_after_rr = use_arm_after_rr
-                config.arm_rr = arm_rr
-                config.trailing_perc = trailing_perc
-                config.trailing_offset_perc = trailing_offset
-                config.use_bar_trail = use_bar_trail
-                config.use_stop_guards = use_stop_guards
-                config.max_stop_pct = max_stop_pct
-                config.close_back_pct = close_back_pct
-                config.min_profit_usd = min_profit_usd
-                
-                # Сохраняем в файл
-                config.save_config()
-                
-                st.success("✅ Настройки успешно сохранены!")
-                
+                # Обновляем объект конфигурации
+                config.risk_pct = float(risk_pct)
+                config.risk_reward = float(risk_reward)
+                config.max_qty_manual = float(max_qty)
+
+                config.sfp_len = int(sfp_len)
+                config.use_sfp_quality = bool(use_sfp_quality)
+                config.wick_min_ticks = int(wick_min_ticks)
+                config.close_back_pct = float(close_back_pct)
+
+                config.enable_smart_trail = bool(enable_smart_trail)
+                config.use_arm_after_rr = bool(use_arm_after_rr)
+                config.arm_rr = float(arm_rr)
+                config.arm_rr_basis = str(arm_rr_basis)
+
+                config.trailing_perc = float(trailing_perc)
+                config.trailing_offset_perc = float(trailing_offset_perc)
+                # alias для обратной совместимости
+                config.trailing_offset = float(trailing_offset_perc)
+
+                config.use_bar_trail = bool(use_bar_trail)
+
+                # Нормализация и валидация перед сохранением
+                ok = config.validate()
+                if not ok:
+                    st.error("❌ Валидация конфигурации не пройдена. Проверь значения.")
+                else:
+                    config.save_config()
+                    st.success("✅ Настройки успешно сохранены!")
+
             except Exception as e:
                 st.error(f"❌ Ошибка сохранения: {e}")
-    
-    # Информация о текущих настройках
+
+    # ============================== Просмотр текущих ==============================
     st.markdown("---")
     st.subheader("📋 Текущая конфигурация")
-    
-    with st.expander("Показать все параметры"):
-        config_dict = {
-            "Риск на сделку": f"{risk_pct}%",
-            "Risk/Reward": risk_reward,
-            "Максимальная позиция": f"{max_qty} ETH",
-            "SFP Length": sfp_len,
-            "Фильтр качества SFP": "Включен" if use_sfp_quality else "Выключен",
-            "Smart Trailing": "Включен" if enable_smart_trail else "Выключен",
-            "Арминг после RR": "Включен" if use_arm_after_rr else "Выключен",
-            "RR для арминга": arm_rr,
-            "Процент трейлинга": f"{trailing_perc}%",
-            "Баровый трейлинг": "Включен" if use_bar_trail else "Выключен",
-        }
-        
-        for key, value in config_dict.items():
-            st.text(f"{key}: {value}")
+
+    with st.expander("Показать все параметры (config.json)"):
+        try:
+            st.json(config.to_dict())
+        except Exception:
+            st.write(config.to_dict())
 
 if __name__ == "__main__":
     main()
