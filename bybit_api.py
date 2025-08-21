@@ -48,6 +48,7 @@ class BybitAPI:
         return urlencode(items)
 
     def _generate_signature(self, payload: str, timestamp_ms: str) -> str:
+        # формула подписи v5: ts + api_key + recv_window + payload
         prehash = timestamp_ms + self.api_key + "5000" + payload
         return hmac.new(
             self.api_secret.encode("utf-8"),
@@ -137,6 +138,7 @@ class BybitAPI:
             lst = (resp.get("result") or {}).get("list") or []
             out: List[Dict] = []
             for it in lst:
+                # Bybit v5: [start(ms), open, high, low, close, volume, turnover]
                 out.append({
                     "timestamp": int(it[0]),
                     "open": float(it[1]),
@@ -156,13 +158,18 @@ class BybitAPI:
             lst = (resp.get("result") or {}).get("list") or []
             if lst:
                 t = lst[0]
+                def _f(x): 
+                    try:
+                        return float(x)
+                    except Exception:
+                        return 0.0
                 return {
                     "symbol": t.get("symbol"),
-                    "lastPrice": float(t.get("lastPrice", 0) or 0),
-                    "markPrice": float(t.get("markPrice", 0) or 0),
-                    "bid1Price": float(t.get("bid1Price", 0) or 0),
-                    "ask1Price": float(t.get("ask1Price", 0) or 0),
-                    "volume24h": float(t.get("volume24h", 0) or 0),
+                    "lastPrice": _f(t.get("lastPrice", 0)),
+                    "markPrice": _f(t.get("markPrice", 0)),
+                    "bid1Price": _f(t.get("bid1Price", 0)),
+                    "ask1Price": _f(t.get("ask1Price", 0)),
+                    "volume24h": _f(t.get("volume24h", 0)),
                 }
         return None
 
@@ -177,6 +184,7 @@ class BybitAPI:
         resp = self._send_request("GET", "/v5/market/instruments-info", params, requires_auth=False)
         if resp.get("retCode") == 0:
             lst = (resp.get("result") or {}).get("list") or []
+            # В ответе уже есть priceFilter/lotSizeFilter — стратегия ожидает именно их.
             return lst[0] if lst else None
         return None
 
@@ -240,6 +248,114 @@ class BybitAPI:
             return resp.get("result")
         return None
 
+    def update_position_stop_loss(
+        self,
+        symbol: str,
+        new_sl: float,
+        *,
+        trigger_by_source: str = "last",
+        position_idx: Optional[int] = None
+    ) -> bool:
+        """
+        Обновляет SL по открытой позиции (используется стратегией/трейлом).
+        По v5 это /v5/position/trading-stop (категория linear/inverse).
+        """
+        params: Dict[str, str] = {
+            "category": self.market_type,
+            "symbol": symbol,
+            "stopLoss": str(new_sl),
+            "slTriggerBy": self._map_trigger_by(trigger_by_source),
+        }
+        if position_idx is not None:
+            params["positionIdx"] = str(position_idx)
+
+        resp = self._send_request("POST", "/v5/position/trading-stop", params, requires_auth=True)
+        if resp.get("retCode") == 0:
+            return True
+        # Для безопасности — логируем ответ
+        try:
+            print(f"update_position_stop_loss failed: {resp.get('retMsg')}")
+        except Exception:
+            pass
+        return False
+
+    def modify_order(
+        self,
+        symbol: str,
+        *,
+        order_id: Optional[str] = None,
+        order_link_id: Optional[str] = None,
+        price: Optional[float] = None,
+        qty: Optional[float] = None,
+        stop_loss: Optional[float] = None,
+        take_profit: Optional[float] = None,
+        trigger_by_source: str = "last",
+    ) -> Optional[Dict]:
+        """
+        Изменение ордера. Если ID/LinkID не передан, а хотим поменять только SL/TP,
+        прозрачно фолбэкнемся на обновление SL/TP по позиции (trading-stop),
+        что соответствует тому, как стратегия пытается обновить SL.
+        """
+        # Если нет id/linkId и меняем только SL/TP — фолбэк на trading-stop
+        if (order_id is None and order_link_id is None) and (stop_loss is not None or take_profit is not None) and price is None and qty is None:
+            ok_sl = True
+            ok_tp = True
+            if stop_loss is not None:
+                ok_sl = self.update_position_stop_loss(symbol, float(stop_loss), trigger_by_source=trigger_by_source)
+            if take_profit is not None:
+                params_tp = {
+                    "category": self.market_type,
+                    "symbol": symbol,
+                    "takeProfit": str(take_profit),
+                    "tpTriggerBy": self._map_trigger_by(trigger_by_source),
+                }
+                resp_tp = self._send_request("POST", "/v5/position/trading-stop", params_tp, requires_auth=True)
+                ok_tp = (resp_tp.get("retCode") == 0)
+                if not ok_tp:
+                    try:
+                        print(f"modify_order TP fallback failed: {resp_tp.get('retMsg')}")
+                    except Exception:
+                        pass
+            return {"ok": (ok_sl and ok_tp)}
+
+        # Иначе — обычный amend ордера
+        params: Dict[str, str] = {
+            "category": self.market_type,
+            "symbol": symbol,
+        }
+        if order_id:
+            params["orderId"] = order_id
+        if order_link_id:
+            params["orderLinkId"] = order_link_id
+        if price is not None:
+            params["price"] = str(price)
+        if qty is not None:
+            params["qty"] = str(qty)
+
+        # В /order/amend нельзя прямо слать SL/TP, поэтому, если они пришли вместе с ID,
+        # сначала амендим ордер (цена/кол-во), затем через trading-stop обновим SL/TP.
+        resp = self._send_request("POST", "/v5/order/amend", params, requires_auth=True)
+        if resp.get("retCode") != 0:
+            return None
+
+        # Доп. шаг: SL/TP
+        if stop_loss is not None or take_profit is not None:
+            ok = True
+            if stop_loss is not None:
+                ok = ok and self.update_position_stop_loss(symbol, float(stop_loss), trigger_by_source=trigger_by_source)
+            if take_profit is not None:
+                params_tp = {
+                    "category": self.market_type,
+                    "symbol": symbol,
+                    "takeProfit": str(take_profit),
+                    "tpTriggerBy": self._map_trigger_by(trigger_by_source),
+                }
+                resp_tp = self._send_request("POST", "/v5/position/trading-stop", params_tp, requires_auth=True)
+                ok = ok and (resp_tp.get("retCode") == 0)
+            return {"ok": ok, "result": resp.get("result")}
+
+        return resp.get("result")
+
     # ==================== WebSocket ====================
 
     def start_websocket(self, on_message: Optional[Callable] = None):
@@ -283,7 +399,7 @@ class BybitAPI:
             self.start_websocket()
         topic = f"kline.{interval}.{symbol}"
         self.ws_callbacks[topic] = lambda data: (
-            callback(data) if data.get("data", [{}])[0].get("confirm", False) else None
+            callback(data) if (data.get("data", [{}])[0].get("confirm", False)) else None
         )
         msg = {"op": "subscribe", "args": [topic]}
         try:
