@@ -49,7 +49,7 @@ class StateManager:
                     "position": self._current_position,
                     "equity": float(self._equity),
                     "status": self._bot_status,
-                    "updated_at": datetime.utcnow().isoformat()
+                    "updated_at": datetime.utcnow().replace(microsecond=0).isoformat(),
                 }
             self.db.save_bot_state(payload)
         except Exception as e:
@@ -154,7 +154,7 @@ class StateManager:
             print(f"[StateManager] Error closing trade in DB: {e}")
             return
 
-        # Подтягиваем свежий PnL последней сделки и применяем его к equity (сложный процент)
+        # Применяем чистый PnL последней сделки к equity (сложный процент)
         try:
             trades = self.db.get_recent_trades(limit=1)
             if trades:
@@ -207,5 +207,5 @@ class StateManager:
                 "bot_status": self._bot_status,
                 "position_open": self._current_position is not None,
                 "position": None if self._current_position is None else dict(self._current_position),
-                "timestamp": datetime.utcnow().isoformat(),
+                "timestamp": datetime.utcnow().replace(microsecond=0).isoformat(),
             }
