@@ -271,7 +271,7 @@ class KWINStrategy:
         ref_high = float(self.candles_15m[L]["high"])
         cond_pivot = self._is_prev_pivot_high(L, 1)
         cond_break = float(curr["high"]) > ref_high
-        cond_close = float(curr["open"]) < ref_high и float(curr["close"]) < ref_high
+        cond_close = float(curr["open"]) < ref_high and float(curr["close"]) < ref_high
         if cond_pivot and cond_break and cond_close:
             return self._check_bear_sfp_quality(curr, {"high": ref_high}) if getattr(self.config, "use_sfp_quality", True) else True
         return False
