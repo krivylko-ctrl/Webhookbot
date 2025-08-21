@@ -409,18 +409,22 @@ class KWINStrategy:
             )
 
     def _calculate_position_size(self, entry_price: float, stop_loss: float, direction: str) -> Optional[float]:
+        """
+        Объём позиции в ETH, исходя из risk_pct * equity (USDT) и расстояния до SL (USDT/ETH).
+        Это даёт реинвест/сложный процент: после каждого закрытия equity обновляется в StateManager.
+        """
         try:
             equity = self.state.get_equity() if self.state else None
             if equity is None or equity <= 0:
                 return None
-            risk_amount = equity * (float(self.config.risk_pct) / 100.0)
+            risk_amount = float(equity) * (float(self.config.risk_pct) / 100.0)
             stop_size = (entry_price - stop_loss) if direction == "long" else (stop_loss - entry_price)
             if stop_size <= 0:
                 return None
-            quantity = risk_amount / stop_size
+            quantity = risk_amount / stop_size  # в ETH
             quantity = round_qty(quantity, self.qty_step)
             if getattr(self.config, "limit_qty_enabled", False):
-                quantity = min(quantity, getattr(self.config, "max_qty_manual", quantity))
+                quantity = min(quantity, float(getattr(self.config, "max_qty_manual", quantity)))
             if quantity < float(self.min_order_qty):
                 return None
             return float(quantity)
@@ -497,7 +501,7 @@ class KWINStrategy:
             pos = {
                 "symbol": self.symbol,
                 "direction": "long",
-                "size": float(qty),
+                "quantity": float(qty),
                 "entry_price": entry,
                 "stop_loss": sl,
                 "status": "open",
@@ -566,7 +570,7 @@ class KWINStrategy:
             pos = {
                 "symbol": self.symbol,
                 "direction": "short",
-                "size": float(qty),
+                "quantity": float(qty),
                 "entry_price": entry,
                 "stop_loss": sl,
                 "status": "open",
