@@ -25,7 +25,7 @@ def _to_iso(ts) -> Optional[str]:
         return str(ts)
 
 
-def _f(x, default=None):
+def _f(x, default: float = 0.0) -> float:
     try:
         return float(x)
     except Exception:
@@ -157,18 +157,21 @@ class Database:
                 tr = dict(row)
                 entry_price = _f(tr.get("entry_price"), 0.0)
                 stop_loss   = _f(tr.get("stop_loss"))
-                qty         = _f(tr.get("quantity"), None) or _f(tr.get("qty"), 0.0)
+                qty         = _f(tr.get("quantity")) or _f(tr.get("qty"), 0.0)
                 side        = tr.get("direction")
                 exit_price  = _f(trade_data.get("exit_price"), entry_price)
+
                 gross = (exit_price - entry_price) * qty if side == "long" else (entry_price - exit_price) * qty
                 fee_in  = entry_price * qty * fee_rate
                 fee_out = exit_price * qty * fee_rate
                 net_pnl = gross - (fee_in + fee_out)
+
                 rr = None
-                if stop_loss is not None:
+                if stop_loss is not None and stop_loss != 0:
                     risk = abs(entry_price - stop_loss)
                     if risk > 0:
                         rr = abs(exit_price - entry_price) / risk
+
                 c.execute("""
                     UPDATE trades
                        SET exit_price  = ?,
@@ -205,14 +208,23 @@ class Database:
             c.execute("SELECT * FROM trades ORDER BY entry_time DESC LIMIT ?", (int(limit),))
             return [dict(r) for r in c.fetchall()]
 
+    def get_all_trades(self) -> List[Dict]:
+        with self._lock:
+            c = self.conn.cursor()
+            c.execute("SELECT * FROM trades ORDER BY entry_time ASC")
+            return [dict(r) for r in c.fetchall()]
+
     # -------------------------- Equity --------------------------
     def save_equity_snapshot(self, equity: float):
         def _worker(eq):
-            with self._lock:
-                c = self.conn.cursor()
-                c.execute("INSERT INTO equity_history (equity, timestamp) VALUES (?, ?)",
-                          (_f(eq, 0.0), _to_iso(datetime.utcnow())))
-                self.conn.commit()
+            try:
+                with self._lock:
+                    c = self.conn.cursor()
+                    c.execute("INSERT INTO equity_history (equity, timestamp) VALUES (?, ?)",
+                              (_f(eq, 0.0), _to_iso(datetime.utcnow())))
+                    self.conn.commit()
+            except Exception:
+                pass
         threading.Thread(target=_worker, args=(equity,), daemon=True).start()
 
     def get_equity_history(self, days: int = 30) -> List[Dict]:
@@ -235,10 +247,45 @@ class Database:
             )
             self.conn.commit()
 
+    def get_logs(self, limit: int = 500) -> List[Dict]:
+        with self._lock:
+            c = self.conn.cursor()
+            c.execute("SELECT * FROM logs ORDER BY id DESC LIMIT ?", (int(limit),))
+            return [dict(r) for r in c.fetchall()]
+
     def purge_old_logs(self, keep: int = 1000):
         with self._lock:
             c = self.conn.cursor()
             c.execute("DELETE FROM logs WHERE id NOT IN (SELECT id FROM logs ORDER BY id DESC LIMIT ?)", (keep,))
+            self.conn.commit()
+
+    # --------------------- Bot State / Config ---------------------
+    def get_bot_state(self) -> Dict[str, Any]:
+        with self._lock:
+            c = self.conn.cursor()
+            c.execute("SELECT state_data FROM bot_state WHERE id = 1")
+            row = c.fetchone()
+            return json.loads(row[0]) if row else {}
+
+    def save_bot_state(self, state: Dict[str, Any]):
+        with self._lock:
+            c = self.conn.cursor()
+            c.execute("INSERT OR REPLACE INTO bot_state (id, state_data, updated_at) VALUES (1, ?, ?)",
+                      (json.dumps(_normalize_json(state)), _to_iso(datetime.utcnow())))
+            self.conn.commit()
+
+    def get_config(self) -> Dict[str, Any]:
+        with self._lock:
+            c = self.conn.cursor()
+            c.execute("SELECT config_data FROM config WHERE id = 1")
+            row = c.fetchone()
+            return json.loads(row[0]) if row else {}
+
+    def save_config(self, cfg: Dict[str, Any]):
+        with self._lock:
+            c = self.conn.cursor()
+            c.execute("INSERT OR REPLACE INTO config (id, config_data, updated_at) VALUES (1, ?, ?)",
+                      (json.dumps(_normalize_json(cfg)), _to_iso(datetime.utcnow())))
             self.conn.commit()
 
     # --------------------- Экспорт/Импорт ---------------------
@@ -261,3 +308,16 @@ class Database:
         self.save_config(dump.get("config", {}))
         for lg in dump.get("logs", []):
             self.save_log(lg["level"], lg["message"], lg.get("module"))
+
+    def drop_and_recreate(self):
+        with self._lock:
+            c = self.conn.cursor()
+            c.executescript("""
+                DROP TABLE IF EXISTS trades;
+                DROP TABLE IF EXISTS equity_history;
+                DROP TABLE IF EXISTS bot_state;
+                DROP TABLE IF EXISTS config;
+                DROP TABLE IF EXISTS logs;
+            """)
+            self.conn.commit()
+        self._init_schema()
