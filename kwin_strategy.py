@@ -34,13 +34,27 @@ class KWINStrategy:
         # тик для округлений
         self.tick_size = getattr(config, "tick_size", 0.1)
 
-        # трейл-движок (смарт)
-        self.trail_engine = TrailEngine(config)
-
-        # для логики
+        # трейл-движок (smart) — поддерживаем разные версии сигнатур
+        self.trail_engine = None
+        try:
+            # Новая сигнатура: (config, state_manager, bybit_api)
+            self.trail_engine = TrailEngine(config, state_manager, api)
+        except TypeError:
+            try:
+                # Альтернатива, если автор использовал именованные аргументы
+                self.trail_engine = TrailEngine(config, state_manager=state_manager, bybit_api=api)
+            except TypeError:
+                try:
+                    # Старая простая сигнатура
+                    self.trail_engine = TrailEngine(config)
+                except Exception:
+                    self.trail_engine = None  # не критично для бэктеста
+                    
         self.symbol = getattr(config, "symbol", "ETHUSDT")
         self.interval = str(getattr(config, "interval", "15"))
         self.intrabar_tf = str(getattr(config, "intrabar_tf", "1"))
+
+    
 
     # ============ ВСПОМОГАТЕЛЬНОЕ ============
 
