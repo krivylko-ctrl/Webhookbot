@@ -1,7 +1,5 @@
-# kwin_strategy.py
 from __future__ import annotations
 
-import math
 import time
 from typing import Any, Dict, List, Optional, Tuple
 from datetime import datetime, timedelta, timezone
@@ -15,11 +13,14 @@ from trail_engine import TrailEngine
 from analytics import TradingAnalytics
 from database import Database
 # точные хелперы округления к тику (1:1 с Pine)
-from utils_round import round_price, round_qty, round_to_tick, floor_to_tick, ceil_to_tick
+from utils_round import (
+    round_price, round_qty, round_to_tick,
+    floor_to_tick, ceil_to_tick
+)
 
 
 class KWINStrategy:
-    """Основная логика стратегии KWIN (ARM + Smart trailing)."""
+    """Основная логика стратегии KWIN (SFP + ARM + Smart trailing с bar-trail приоритетом)."""
 
     # ---------- ИНИЦИАЛИЗАЦИЯ ----------
 
@@ -39,6 +40,7 @@ class KWINStrategy:
         self.api = api
         self.state = state_manager
         self.db = db
+
         # смарт-трейл движок: поддерживаем несколько сигнатур
         self.trail_engine: Optional[TrailEngine] = None
         try:
@@ -95,7 +97,7 @@ class KWINStrategy:
         return int(self.last_processed_bar_ts or 0)
 
     def _init_instrument_info(self):
-        """Попробовать подтянуть tick_size/qty_step/min_order_qty из API (если доступно)."""
+        """Подтягиваем tick_size/qty_step/min_order_qty из API (если доступно)."""
         try:
             if not self.api or not hasattr(self.api, "get_instruments_info"):
                 return
@@ -120,7 +122,7 @@ class KWINStrategy:
     # ---------- ОБРАБОТКА БАРОВ ----------
 
     def on_bar_close_15m(self, candle: Dict):
-        """Обработка закрытого 15m бара (входы, первичный трейлинг)."""
+        """Обработка закрытого 15m бара (входы на закрытии)."""
         try:
             self.candles_15m.insert(0, candle)
             if len(self.candles_15m) > 200:
@@ -138,6 +140,7 @@ class KWINStrategy:
             self.can_enter_long = True
             self.can_enter_short = True
 
+            # Единый вход: строго как на Pine — обработка при закрытии бара
             self.run_cycle()
         except Exception as e:
             print(f"[on_bar_close_15m] {e}")
@@ -193,7 +196,7 @@ class KWINStrategy:
             kl1.sort(key=lambda x: x.get("timestamp", 0), reverse=True)
             self.candles_1m = kl1[:lim]
 
-            # единичная обработка закрытого 15m
+            # единичная обработка закрытого 15m — строго через run_cycle()
             if self.candles_15m:
                 ts = int(self.candles_15m[0].get("timestamp") or 0)
                 aligned = self._align_15m_ms(ts)
@@ -201,7 +204,7 @@ class KWINStrategy:
                     self.last_processed_bar_ts = aligned
                     self.can_enter_long = True
                     self.can_enter_short = True
-                    self.on_bar_close()
+                    self.run_cycle()
                 else:
                     pos = self.state.get_current_position() if self.state else None
                     if pos and pos.get("status") == "open" and getattr(self.config, "use_intrabar", True):
@@ -212,6 +215,7 @@ class KWINStrategy:
     # ---------- ЛОГИКА ВХОДОВ ----------
 
     def on_bar_close(self):
+        """ОСТАВЛЕНО ДЛЯ СОВМЕСТИМОСТИ. Новая точка входа — run_cycle()."""
         if len(self.candles_15m) < int(getattr(self.config, "sfp_len", 2)) + 2:
             return
 
@@ -331,7 +335,16 @@ class KWINStrategy:
         side_up = "Buy" if direction == "long" else "Sell"
         side_lo = "buy" if direction == "long" else "sell"
         qty = float(quantity)
-        sl_send = round_price(stop_loss, self.tick_size) if stop_loss is not None else None
+
+        # SL округляем к тику по направлению
+        if stop_loss is not None:
+            if direction == "long":
+                sl_send = floor_to_tick(stop_loss, self.tick_size)
+            else:
+                sl_send = ceil_to_tick(stop_loss, self.tick_size)
+        else:
+            sl_send = None
+
         try:
             return self.api.place_order(
                 symbol=self.symbol,
@@ -372,7 +385,7 @@ class KWINStrategy:
 
     def _validate_position_requirements(self, entry_price: float, stop_loss: float,
                                         take_profit: Optional[float], quantity: float) -> bool:
-        """Если TP выключен — не требуем min_net_profit, оставляем базовые проверки."""
+        """Если TP выключен — не требуем min_net_profit; иначе считаем net как в Pine."""
         try:
             if quantity is None or float(quantity) <= 0:
                 return False
@@ -380,10 +393,8 @@ class KWINStrategy:
                 return False
 
             if not getattr(self.config, "use_take_profit", True):
-                # Без TP: проверяем только лоты/мин. размер.
                 return True
 
-            # С TP: проверяем ожидаемую чистую прибыль
             taker = float(getattr(self.config, "taker_fee_rate", 0.00055))
             if take_profit is None:
                 return False
@@ -411,7 +422,6 @@ class KWINStrategy:
             if stop_size <= 0:
                 return
 
-            # TP рассчитываем только если включён
             tp = None
             if getattr(self.config, "use_take_profit", True):
                 tp = round_to_tick(entry + stop_size * float(self.config.risk_reward), self.tick_size)
@@ -463,10 +473,7 @@ class KWINStrategy:
 
             self.can_enter_long = False
             self.can_enter_short = False
-            if tp is not None:
-                print(f"[ENTRY LONG] {qty} @ {entry}, SL={sl}, TP={tp}")
-            else:
-                print(f"[ENTRY LONG] {qty} @ {entry}, SL={sl} (TP disabled)")
+            print(f"[ENTRY LONG] {qty} @ {entry}, SL={sl}" + (f", TP={tp}" if tp is not None else " (TP disabled)"))
         except Exception as e:
             print(f"[process_long_entry] {e}")
 
@@ -478,14 +485,12 @@ class KWINStrategy:
 
             raw_sl = float(self.candles_15m[1]["high"])
 
-            # Pine-точное округление
             entry = round_to_tick(float(price), self.tick_size)
             sl    = ceil_to_tick(raw_sl, self.tick_size)
             stop_size = sl - entry
             if stop_size <= 0:
                 return
 
-            # TP рассчитываем только если включён
             tp = None
             if getattr(self.config, "use_take_profit", True):
                 tp = round_to_tick(entry - stop_size * float(self.config.risk_reward), self.tick_size)
@@ -537,10 +542,7 @@ class KWINStrategy:
 
             self.can_enter_short = False
             self.can_enter_long = False
-            if tp is not None:
-                print(f"[ENTRY SHORT] {qty} @ {entry}, SL={sl}, TP={tp}")
-            else:
-                print(f"[ENTRY SHORT] {qty} @ {entry}, SL={sl} (TP disabled)")
+            print(f"[ENTRY SHORT] {qty} @ {entry}, SL={sl}" + (f", TP={tp}" if tp is not None else " (TP disabled)"))
         except Exception as e:
             print(f"[process_short_entry] {e}")
 
@@ -560,7 +562,12 @@ class KWINStrategy:
         return float(current_price), float(current_price)
 
     def _update_smart_trailing(self, position: Dict):
-        """Smart trailing: ARM по RR, затем якорь-экстремум и % трейл от entry + offset."""
+        """
+        Smart trailing, Pine-like:
+        1) ARM по RR (extremum|last),
+        2) BAR-TRAIL (lookback, буфер в тиках, [1] смещение),
+        3) Процентный трейл от entry + offset (монотонно).
+        """
         try:
             if not getattr(self.config, "enable_smart_trail", True):
                 return
@@ -590,22 +597,45 @@ class KWINStrategy:
                     rr_now  = rr_ext if basis == "extremum" else rr_last
                     rr_alt  = rr_last if basis == "extremum" else rr_ext
 
-                    try:
-                        print(f"[ARM CHECK] risk={risk:.4f} rr_ext={rr_ext:.3f} rr_last={rr_last:.3f} need={rr_need} basis={basis}")
-                    except Exception:
-                        pass
-
                     if rr_now >= rr_need or rr_alt >= rr_need:
                         armed = True
                         position["armed"] = True
                         if self.state:
                             self.state.set_position(position)
-                        print(f"[ARM] enabled (hit {rr_need}R; used={basis}, rr_now={rr_now:.3f}, rr_alt={rr_alt:.3f})")
+                        print(f"[ARM] enabled at ≥{rr_need:.2f}R (basis={basis}, rr_now={rr_now:.3f}, rr_alt={rr_alt:.3f})")
 
             if not armed:
                 return
 
-            # --- Anchor (экстремум) ---
+            # === BAR TRAIL (приоритетнее процентного), 1:1 с Pine lowest/highest(...)[1] ===
+            if bool(getattr(self.config, "use_bar_trail", True)):
+                lookback = int(getattr(self.config, "trail_lookback", 50))
+                buf_ticks = int(getattr(self.config, "trail_buf_ticks", 40))
+                buf = float(buf_ticks) * float(self.tick_size)
+
+                src = self.candles_1m if (getattr(self.config, "use_intrabar", True) and self.candles_1m) else self.candles_15m
+                # На Pine: lowest(low, N)[1] — минимум N баров, оканчивающихся на предыдущем баре
+                if src and len(src) >= lookback + 1:
+                    lows  = [float(b["low"])  for b in src[1:lookback+1]]
+                    highs = [float(b["high"]) for b in src[1:lookback+1]]
+
+                    if direction == "long" and lows:
+                        lb_low = min(lows)
+                        barTS  = max(lb_low - buf, sl)
+                        barTS  = floor_to_tick(barTS, self.tick_size)
+                        if barTS > sl:
+                            if self._update_stop_loss(position, barTS):
+                                return  # bar-trail победил
+
+                    elif direction == "short" and highs:
+                        lb_high = max(highs)
+                        barTS   = min(lb_high + buf, sl)
+                        barTS   = ceil_to_tick(barTS, self.tick_size)
+                        if barTS < sl:
+                            if self._update_stop_loss(position, barTS):
+                                return  # bar-trail победил
+
+            # --- Anchor (экстремум) для процентного трейла ---
             anchor = float(position.get("trail_anchor") or entry)
             anchor = max(anchor, bar_high) if direction == "long" else min(anchor, bar_low)
             if anchor != position.get("trail_anchor"):
@@ -623,49 +653,50 @@ class KWINStrategy:
                 candidate = floor_to_tick(anchor - trail_dist - offset_dist, self.tick_size)
                 if candidate > sl:
                     self._update_stop_loss(position, candidate)
-                else:
-                    try:
-                        print(f"[TRAIL SKIP] long: candidate={candidate:.4f} <= sl={sl:.4f} (anchor={anchor:.4f}, trail%={trail_perc*100:.2f}, off%={offset_perc*100:.2f})")
-                    except Exception:
-                        pass
             else:
                 candidate = ceil_to_tick(anchor + trail_dist + offset_dist, self.tick_size)
                 if candidate < sl:
                     self._update_stop_loss(position, candidate)
-                else:
-                    try:
-                        print(f"[TRAIL SKIP] short: candidate={candidate:.4f} >= sl={sl:.4f} (anchor={anchor:.4f}, trail%={trail_perc*100:.2f}, off%={offset_perc*100:.2f})")
-                    except Exception:
-                        pass
+
         except Exception as e:
             print(f"[smart_trailing] {e}")
 
     def _update_stop_loss(self, position: Dict, new_sl: float) -> bool:
-        """Апдейт SL с округлением к тику и синхронизацией state."""
+        """Апдейт SL с корректным округлением (long=floor, short=ceil) и синхронизацией state."""
         try:
-            new_sl = round_price(float(new_sl), self.tick_size)
+            direction = position.get("direction")
+            if direction == "long":
+                new_sl = floor_to_tick(float(new_sl), self.tick_size)
+            else:
+                new_sl = ceil_to_tick(float(new_sl), self.tick_size)
+
             if not self.api:
-                return False
+                # локальный режим (bt)
+                position["stop_loss"] = float(new_sl)
+                if self.state:
+                    self.state.set_position(position)
+                print(f"[TRAIL-LOCAL] SL -> {new_sl:.4f}")
+                return True
 
             if hasattr(self.api, "update_position_stop_loss"):
                 ok = self.api.update_position_stop_loss(self.symbol, new_sl)
                 if ok:
-                    position["stop_loss"] = new_sl
+                    position["stop_loss"] = float(new_sl)
                     if self.state:
                         self.state.set_position(position)
                     print(f"[TRAIL] SL -> {new_sl:.4f}")
                     return True
 
             if hasattr(self.api, "modify_order"):
-                _ = self.api.modify_order(symbol=position.get("symbol", self.symbol), stop_loss=new_sl)
-                position["stop_loss"] = new_sl
+                _ = self.api.modify_order(symbol=position.get("symbol", self.symbol), stop_loss=float(new_sl))
+                position["stop_loss"] = float(new_sl)
                 if self.state:
                     self.state.set_position(position)
                 print(f"[TRAIL] SL -> {new_sl:.4f}")
                 return True
 
-            # Фолбэк: локально
-            position["stop_loss"] = new_sl
+            # Фолбэк
+            position["stop_loss"] = float(new_sl)
             if self.state:
                 self.state.set_position(position)
             print(f"[TRAIL-LOCAL] SL -> {new_sl:.4f}")
