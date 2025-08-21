@@ -34,19 +34,18 @@ class Config:
         # === ОСНОВНЫЕ ПАРАМЕТРЫ СТРАТЕГИИ ===
         self.symbol       = SYMBOL
         self.market_type  = BYBIT_ACCOUNT_TYPE or "linear"   # синхронизируем с env (по умолч. linear)
-        self.interval     = "15"                              # добавлено: базовой ТФ для сигналов/графика
+        self.interval     = "15"                              # базовой ТФ для сигналов/графика (строка)
 
-        # Риск/TP
-        # допускаем переопределение через ENV
+        # Риск/TP (допускаем переопределение через ENV)
         self.risk_reward  = float(env("RISK_REWARD", "1.3"))
         self.sfp_len      = 2
         self.risk_pct     = float(env("RISK_PCT", "3.0"))
 
         # === SMART TRAILING ===
         self.enable_smart_trail     = env("ENABLE_SMART_TRAIL", "true").lower() not in ("0", "false", "no")
-        self.trailing_perc          = float(env("TRAILING_PERC", "0.5"))    # в процентах
-        self.trailing_offset_perc   = float(env("TRAILING_OFFSET_PERC", "0.4"))  # в процентах (ИСПОЛЬЗУЕМ ЭТО)
-        # оставили trailing_offset для обратной совместимости, но не используем
+        self.trailing_perc          = float(env("TRAILING_PERC", "0.5"))            # %
+        self.trailing_offset_perc   = float(env("TRAILING_OFFSET_PERC", "0.4"))     # %
+        # совместимость со старым именем
         self.trailing_offset        = self.trailing_offset_perc
 
         # ARM (активация трейла после достижения RR)
@@ -60,7 +59,7 @@ class Config:
 
         # === ИНТРАБАР (для bt и/или live обработчика минуток) ===
         self.use_intrabar        = True
-        self.intrabar_tf         = "1"
+        self.intrabar_tf         = "1"     # строка: "1" | "3" | "5"
         self.intrabar_pull_limit = 1500
         self.smooth_intrabar     = True
         self.intrabar_steps      = 6
@@ -132,10 +131,9 @@ class Config:
         except Exception:
             self.close_back_pct = 1.0
 
-        # trailing_offset_perc — берем из совместимого поля, если UI прислал старое имя
+        # trailing_offset_perc — берём из совместимого поля, если UI прислал старое имя
         try:
             if self.trailing_offset is not None:
-                # если кто-то обновил только trailing_offset — синхронизируем
                 self.trailing_offset_perc = float(self.trailing_offset)
         except Exception:
             pass
@@ -173,6 +171,12 @@ class Config:
             self.interval = str(self.interval)
         except Exception:
             self.interval = "15"
+
+        # intrabar_tf — тоже строка
+        try:
+            self.intrabar_tf = str(self.intrabar_tf)
+        except Exception:
+            self.intrabar_tf = "1"
 
     # ---------- load/save ----------
 
