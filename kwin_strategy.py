@@ -21,7 +21,7 @@ class KWINStrategy:
     Основная стратегия KWIN (с поддержкой смарт-трейла).
     """
 
-    def __init__(self, config: Config, api, state_manager: StateManager, db: Database, **kwargs):
+    def __init__(self, config: Config, api=None, state_manager: StateManager=None, db: Database=None, **kwargs):
     # обратная совместимость с вызовами вида bybit_api=...
         if api is None and "bybit_api" in kwargs:
             api = kwargs.get("bybit_api")
