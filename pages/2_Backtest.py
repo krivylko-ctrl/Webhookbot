@@ -32,45 +32,45 @@ st.set_page_config(
 st.title("📈 Бэктест KWIN Strategy")
 
 
-# =============== Прокси для реального бэктеста на данных Bybit ===============
-class BybitDataProxy:
+# ======================= Брокер под БЭКТЕСТ =======================
+class BacktestBroker:
     """
-    Прокси над реальным BybitAPI:
-      • Все рыночные данные (klines, instruments) — из BybitAPI (реальные исторические бары).
-      • "Текущая цена" для стратегии (_get_current_price) — берётся из текущего
-        исторического бара, который проигрывается в бэктесте (set_sim_price).
-      • Торговые методы возвращают успех локально (мы НЕ посылаем ордера на биржу).
+    Брокер для бэктеста без «paper»-терминологии:
+      • отдает РЕАЛЬНЫЕ бары Bybit (HTTP v5)
+      • хранит «текущую» цену, которую стратегия читает через get_price()
+      • методы place_order / update_position_stop_loss / modify_order — безопасные заглушки,
+        чтобы стратегия и трейлинг работали, НО без реальных ордеров.
     """
+    def __init__(self, market: BybitAPI):
+        self.market = market
+        self._last_price: Dict[str, float] = {}
 
-    def __init__(self, real_market_api: BybitAPI):
-        self.real = real_market_api
-        self._sim_price: Dict[str, float] = {}
-
-    # ---- маркет-данные (РЕАЛЬНЫЕ) ----
+    # ---- маркет-данные (реальные) ----
     def get_klines(self, symbol: str, interval: str, limit: int = 200):
-        return self.real.get_klines(symbol, interval, limit)
+        return self.market.get_klines(symbol, interval, limit) or []
 
     def get_instruments_info(self, symbol: str):
-        return self.real.get_instruments_info(symbol)
-
-    # ---- цена (из текущего исторического бара) ----
-    def set_sim_price(self, symbol: str, price: float):
-        self._sim_price[symbol] = float(price)
-
-    def get_price(self, symbol: str, source: str = "last") -> float:
-        # Стратегия будет звать это как "текущую цену".
-        # Мы возвращаем close текущего бара, который проигрывается сейчас.
-        return float(self._sim_price.get(symbol, 0.0))
+        return self.market.get_instruments_info(symbol)
 
     def get_ticker(self, symbol: str) -> Dict:
-        p = float(self._sim_price.get(symbol, 0.0))
+        # Используется только как фолбэк. Для бэктеста стратегию кормим set_current_price().
+        p = float(self._last_price.get(symbol, 0.0))
         return {"symbol": symbol, "lastPrice": p, "markPrice": p}
 
-    # ---- "торговые" методы — локальные no-op (чтобы НЕ отправлять на биржу) ----
+    def set_current_price(self, symbol: str, price: float):
+        self._last_price[symbol] = float(price)
+
+    def get_price(self, symbol: str, source: str = "last") -> float:
+        # Стратегия берёт текущую цену из бэктестового фида (клоуз бара)
+        return float(self._last_price.get(symbol, 0.0))
+
+    # ---- методы для совместимости со стратегией/трейлом ----
     def place_order(self, **_kwargs):
-        return {"ok": True, "msg": "bt filled"}
+        # Никаких реальных ордеров. Возвращаем успех, чтобы стратегия сохранила сделку в БД.
+        return {"ok": True, "filled": True, "msg": "backtest fill"}
 
     def update_position_stop_loss(self, symbol: str, new_sl: float):
+        # В бэктесте SL обновляем локально (через state), но возвращаем True для логики.
         return True
 
     def modify_order(self, **_kwargs):
@@ -85,14 +85,14 @@ class BtData:
 
 
 @st.cache_data(show_spinner=False)
-def load_history(_api: BybitDataProxy, symbol: str, m15_limit: int, m1_limit: int, intrabar_tf: str = "1") -> BtData:
-    """Грузим историю с рынка (Bybit API). Возвращаем датафреймы в возрастающем порядке времени."""
+def load_history(_api: BacktestBroker, symbol: str, m15_limit: int, m1_limit: int, intrabar_tf: str = "1") -> BtData:
+    """Грузим историю с рынка (Bybit API)."""
     m15_raw = _api.get_klines(symbol, "15", m15_limit) or []
     df15 = pd.DataFrame(m15_raw)
     if not df15.empty:
         df15 = df15.sort_values("timestamp").reset_index(drop=True)
     else:
-        df15 = pd.DataFrame(columns=["timestamp", "open", "high", "low", "close", "volume"])
+        df15 = pd.DataFrame(columns=["timestamp","open","high","low","close","volume"])
 
     df1 = pd.DataFrame()
     if m1_limit > 0:
@@ -101,13 +101,13 @@ def load_history(_api: BybitDataProxy, symbol: str, m15_limit: int, m1_limit: in
         if not df1.empty:
             df1 = df1.sort_values("timestamp").reset_index(drop=True)
         else:
-            df1 = pd.DataFrame(columns=["timestamp", "open", "high", "low", "close", "volume"])
+            df1 = pd.DataFrame(columns=["timestamp","open","high","low","close","volume"])
 
     return BtData(m15=df15, m1=df1 if not df1.empty else None)
 
 
 def iter_m1_between(df1: Optional[pd.DataFrame], t_from: int, t_to: int) -> List[Dict]:
-    """1m свечи строго в (t_from, t_to]. На входе и выходе — ms."""
+    """1m свечи строго в (t_from, t_to]."""
     if df1 is None or df1.empty:
         return []
     mask = (df1["timestamp"] > t_from) & (df1["timestamp"] <= t_to)
@@ -117,27 +117,34 @@ def iter_m1_between(df1: Optional[pd.DataFrame], t_from: int, t_to: int) -> List
     return sub.to_dict("records")
 
 
-def _apply_equity_on_close(state: StateManager, db: Database):
-    """
-    После закрытия позиции поднимаем свежую закрытую сделку из БД,
-    прибавляем её PnL к equity и сохраняем снапшот в equity_history.
-    """
-    recent = db.get_recent_trades(1)
-    if not recent:
-        return
-    last = recent[0]
-    pnl = float(last.get("pnl") or 0.0)
-    # актуальный equity до закрытия
-    curr_eq = float(state.get_equity() or 0.0)
-    new_eq = curr_eq + pnl
-    state.set_equity(new_eq)          # сохранит и снапшот в БД через StateManager -> Database.save_bot_state
-    db.save_equity_snapshot(new_eq)   # явный снапшот для графика equity
+def _compute_net_pnl(pos: Dict, exit_price: float, fee_rate: float) -> float:
+    """Тот же расчёт, что в Database.update_trade_exit: gross - (fee_in + fee_out)."""
+    entry = float(pos.get("entry_price") or 0.0)
+    qty   = float(pos.get("size") or pos.get("quantity") or 0.0)
+    if qty <= 0:
+        return 0.0
+    direction = str(pos.get("direction"))
+    gross = (exit_price - entry) * qty if direction == "long" else (entry - exit_price) * qty
+    fee_in  = entry * qty * fee_rate
+    fee_out = exit_price * qty * fee_rate
+    return float(gross - fee_in - fee_out)
+
+
+def _book_close_and_update_equity(state: StateManager, db: Database, cfg: Config, pos: Dict, exit_px: float, reason: str):
+    """Закрыть позицию, обновить equity и записать снапшот."""
+    # 1) Закрываем в БД (там посчитается PnL и статус)
+    state.close_position(exit_price=float(exit_px), exit_reason=reason)
+    # 2) Синхронизируем equity локально (чтобы была кривая/ДД немедленно)
+    net = _compute_net_pnl(pos, exit_px, float(getattr(cfg, "taker_fee_rate", 0.00055)))
+    new_eq = float(state.get_equity()) + net
+    state.set_equity(new_eq)
+    db.save_equity_snapshot(new_eq)
 
 
 def simulate_exits_on_m1(state: StateManager, db: Database, cfg: Config, m1: Dict):
     """
-    Проверка срабатывания SL/TP на минутках (биржевой приоритет: SL > TP).
-    Если закрыли — обновим equity.
+    Биржевой приоритет: сначала SL, потом TP.
+    При срабатывании — закрываем позицию, обновляем equity (кривая/DD).
     """
     pos = state.get_current_position()
     if not pos or pos.get("status") != "open":
@@ -145,27 +152,19 @@ def simulate_exits_on_m1(state: StateManager, db: Database, cfg: Config, m1: Dic
 
     direction = pos.get("direction")
     sl = float(pos.get("stop_loss") or 0.0)
-    tp = float(pos.get("take_profit") or 0.0) if cfg.use_take_profit else 0.0
+    tp = float(pos.get("take_profit") or 0.0) if getattr(cfg, "use_take_profit", True) else 0.0
     hi, lo = float(m1["high"]), float(m1["low"])
 
     if direction == "long":
         if sl and lo <= sl:
-            state.close_position(exit_price=sl, exit_reason="SL")
-            _apply_equity_on_close(state, db)
-            return
+            _book_close_and_update_equity(state, db, cfg, pos, sl, "SL"); return
         if tp and hi >= tp:
-            state.close_position(exit_price=tp, exit_reason="TP")
-            _apply_equity_on_close(state, db)
-            return
+            _book_close_and_update_equity(state, db, cfg, pos, tp, "TP"); return
     else:
         if sl and hi >= sl:
-            state.close_position(exit_price=sl, exit_reason="SL")
-            _apply_equity_on_close(state, db)
-            return
+            _book_close_and_update_equity(state, db, cfg, pos, sl, "SL"); return
         if tp and lo <= tp:
-            state.close_position(exit_price=tp, exit_reason="TP")
-            _apply_equity_on_close(state, db)
-            return
+            _book_close_and_update_equity(state, db, cfg, pos, tp, "TP"); return
 
 
 def run_backtest(symbol: str,
@@ -174,40 +173,38 @@ def run_backtest(symbol: str,
                  init_equity: float,
                  cfg: Config,
                  price_source_for_logic: str = "last") -> Tuple[Database, StateManager, KWINStrategy]:
-    """
-    Ядро бэктеста: 15m + 1m интрабары, Pine-точная механика входов/SL/TP/SmartTrail.
-    Данные — реальные (Bybit). Цена для логики стратегии — цена текущего исторического бара.
-    Торговые вызовы в биржу НЕ отправляются.
-    """
+    """Ядро бэктеста: 15m + 1m интрабары, Pine-точное поведение входов/трейлинга, реальные бары Bybit."""
+
     # отдельная БД под бэктест
     bt_db_path = f"kwin_backtest_{symbol}.db"
     db = Database(db_path=bt_db_path)
     state = StateManager(db)
     state.set_equity(float(init_equity))
+    db.save_equity_snapshot(float(init_equity))  # стартовый снимок для кривой
 
+    # реальный маркет-источник + брокер для бэктеста
     real_market = BybitAPI(api_key="", api_secret="", testnet=False)
-    proxy_api = BybitDataProxy(real_market_api=real_market)
+    broker = BacktestBroker(market=real_market)
 
-    # важно: стратегия будет брать цену через api.get_price() — даём ей прокси
+    # стратегия
     cfg.price_for_logic = str(price_source_for_logic).lower()
-    strat = KWINStrategy(cfg, api=proxy_api, state_manager=state, db=db)
+    strat = KWINStrategy(cfg, api=broker, state_manager=state, db=db)
 
+    # история
     intrabar_tf = str(getattr(cfg, "intrabar_tf", "1"))
-    data = load_history(proxy_api, symbol, m15_limit, m1_limit, intrabar_tf)
+    data = load_history(broker, symbol, m15_limit, m1_limit, intrabar_tf)
     if data.m15.empty:
         st.error("Не удалось загрузить 15m историю.")
         return db, state, strat
 
     m15 = data.m15.reset_index(drop=True)
-
-    # Основной цикл: проигрываем 15m закрытия; между ними — 1m бары
     for i in range(0, len(m15) - 1):
         bar = m15.iloc[i].to_dict()
         t_curr = int(bar["timestamp"])
         t_next = int(m15.iloc[i + 1]["timestamp"])
 
-        # "Текущая" цена на момент закрытия 15m — close этого бара
-        proxy_api.set_sim_price(symbol, float(bar["close"]))
+        # Кормим стратегии «текущую» цену — клоуз 15m-бара
+        broker.set_current_price(symbol, float(bar["close"]))
 
         strat.on_bar_close_15m({
             "timestamp": t_curr,
@@ -217,11 +214,10 @@ def run_backtest(symbol: str,
             "close": float(bar["close"]),
         })
 
-        # Прокручиваем интрабары (минутки) до следующего 15m
+        # Прогоним внутри-барный трейлинг/выходы по минуткам
         m1_set = iter_m1_between(data.m1, t_curr, t_next)
         for m1 in m1_set:
-            proxy_api.set_sim_price(symbol, float(m1["close"]))
-
+            broker.set_current_price(symbol, float(m1["close"]))
             strat.on_bar_close_1m({
                 "timestamp": int(m1["timestamp"]),
                 "open":  float(m1["open"]),
@@ -229,8 +225,13 @@ def run_backtest(symbol: str,
                 "low":   float(m1["low"]),
                 "close": float(m1["close"]),
             })
-
             simulate_exits_on_m1(state, db, cfg, m1)
+
+    # Если под конец позиция осталась открыта — закроем по последнему close 15m (консервативно)
+    pos = state.get_current_position()
+    if pos and pos.get("status") == "open":
+        last_close = float(m15.iloc[-1]["close"])
+        _book_close_and_update_equity(state, db, cfg, pos, last_close, "bt_end")
 
     return db, state, strat
 
@@ -238,115 +239,120 @@ def run_backtest(symbol: str,
 # ========================= UI: центральная форма =========================
 st.markdown("## ⚙️ Настройки бэктеста")
 
-# Сделаем область настроек визуально уже: узкий левый столбец с формой
-form_col, _, _ = st.columns([1.1, 0.2, 2.7])
-with form_col:
-    with st.form("backtest_form"):
-        cfg = Config()
+with st.form("backtest_form"):
+    cfg = Config()
 
-        # ----- верхняя строка (символ/капитал/источник цены/период) -----
-        c0a, c0b, c0c, c0d, c0e = st.columns([1.2, 1.2, 1.0, 1.0, 0.01])
-        with c0a:
-            symbol = st.text_input("Символ", value=str(getattr(cfg, "symbol", "ETHUSDT"))).strip().upper()
-        with c0b:
-            init_eq = st.number_input("Начальный equity ($)", min_value=10.0, max_value=1_000_000.0, value=1000.0, step=10.0)
-        with c0c:
-            price_src = st.selectbox("Источник цены", options=["last", "mark"], index=0)
-        with c0d:
-            bt_days = st.selectbox("Период (дней)", [7, 14, 30, 60], index=2)
+    # ----- верхняя строка (символ/капитал/источник цены/период) -----
+    c0a, c0b, c0c, c0d = st.columns(4)
+    with c0a:
+        symbol = st.text_input("Символ", value=str(getattr(cfg, "symbol", "ETHUSDT")))
+    with c0b:
+        init_eq = st.number_input("Начальный equity ($)", min_value=10.0, max_value=1_000_000.0, value=1000.0, step=10.0)
+    with c0c:
+        price_src = st.selectbox("Источник цены", options=["last", "mark"], index=0)
+    with c0d:
+        bt_days = st.selectbox("Период бэктеста (дней)", [7, 14, 30, 60], index=2)
 
-        st.markdown("---")
+    st.markdown("---")
 
-        # ====== Группа: Основные ======
-        st.subheader("📌 Основные параметры")
-        c1, c2, c3 = st.columns(3)
-        with c1:
-            risk_reward = st.number_input("TP Risk/Reward", min_value=0.5, max_value=5.0,
-                                          value=float(getattr(cfg, "risk_reward", 1.3)), step=0.1)
-        with c2:
-            sfp_len = st.number_input("SFP length", min_value=1, max_value=10,
-                                      value=int(getattr(cfg, "sfp_len", 2)), step=1)
-        with c3:
-            risk_pct = st.number_input("Risk % / trade", min_value=0.1, max_value=10.0,
-                                       value=float(getattr(cfg, "risk_pct", 3.0)), step=0.1)
+    # ====== Группа: Основные ======
+    st.subheader("📌 Основные параметры")
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        risk_reward = st.number_input("TP Risk/Reward Ratio", min_value=0.5, max_value=5.0,
+                                      value=float(getattr(cfg, "risk_reward", 1.3)), step=0.1)
+    with c2:
+        sfp_len = st.number_input("Swing Length (SFP length)", min_value=1, max_value=10,
+                                  value=int(getattr(cfg, "sfp_len", 2)), step=1)
+    with c3:
+        risk_pct = st.number_input("Risk % per trade", min_value=0.1, max_value=10.0,
+                                   value=float(getattr(cfg, "risk_pct", 3.0)), step=0.1)
 
-        st.markdown("---")
+    st.markdown("---")
 
-        # ====== Группа: Smart Trailing TP ======
-        st.subheader("📌 Smart Trailing TP")
-        c4, c5, c6 = st.columns(3)
-        with c4:
-            enable_smart_trail = st.checkbox("💚 Enable Smart Trail",
-                                             value=bool(getattr(cfg, "enable_smart_trail", True)))
-        with c5:
-            trailing_perc = st.number_input("Trailing %", min_value=0.0, max_value=5.0,
-                                            value=float(getattr(cfg, "trailing_perc", 0.5)), step=0.1)
-        with c6:
-            trailing_offset_perc = st.number_input("Offset %", min_value=0.0, max_value=5.0,
-                                                   value=float(getattr(cfg, "trailing_offset_perc", 0.4)), step=0.1)
+    # ====== Группа: Smart Trailing TP ======
+    st.subheader("📌 Smart Trailing TP")
+    c4, c5, c6 = st.columns(3)
+    with c4:
+        enable_smart_trail = st.checkbox("💚 Enable Smart Trailing TP",
+                                         value=bool(getattr(cfg, "enable_smart_trail", True)))
+    with c5:
+        trailing_perc = st.number_input("Trailing %", min_value=0.0, max_value=5.0,
+                                        value=float(getattr(cfg, "trailing_perc", 0.5)), step=0.1)
+    with c6:
+        trailing_offset_perc = st.number_input("Trailing Offset %", min_value=0.0, max_value=5.0,
+                                               value=float(getattr(cfg, "trailing_offset_perc", 0.4)), step=0.1)
 
-        st.markdown("---")
+    st.markdown("---")
 
-        # ====== Группа: ARM RR ======
-        st.subheader("📌 ARM RR")
-        c7, c8 = st.columns(2)
-        with c7:
-            use_arm_after_rr = st.checkbox("💚 Arm after RR≥X",
-                                           value=bool(getattr(cfg, "use_arm_after_rr", True)))
-        with c8:
-            arm_rr = st.number_input("Arm RR (R)", min_value=0.1, max_value=5.0,
-                                     value=float(getattr(cfg, "arm_rr", 0.5)), step=0.1)
+    # ====== Группа: ARM RR ======
+    st.subheader("📌 ARM RR")
+    c7, c8 = st.columns(2)
+    with c7:
+        use_arm_after_rr = st.checkbox("💚 Enable Arm after RR≥X",
+                                       value=bool(getattr(cfg, "use_arm_after_rr", True)))
+    with c8:
+        arm_rr = st.number_input("Arm RR (R)", min_value=0.1, max_value=5.0,
+                                 value=float(getattr(cfg, "arm_rr", 0.5)), step=0.1)
 
-        st.markdown("---")
+    st.markdown("---")
 
-        # ====== Группа: Bar-Low/High Smart Trail ======
-        st.subheader("📌 Bar-Low/High Trail")
-        c9, c10, c11 = st.columns(3)
-        with c9:
-            use_bar_trail = st.checkbox("💚 Use Bar-L/H Trail",
-                                        value=bool(getattr(cfg, "use_bar_trail", True)))
-        with c10:
-            trail_lookback = st.number_input("Lookback bars", min_value=1, max_value=300,
-                                             value=int(getattr(cfg, "trail_lookback", 50)), step=1)
-        with c11:
-            trail_buf_ticks = st.number_input("Buffer (ticks)", min_value=0, max_value=500,
-                                              value=int(getattr(cfg, "trail_buf_ticks", 40)), step=1)
+    # ====== Группа: Bar-Low/High Smart Trail ======
+    st.subheader("📌 Use Bar-Low/High Smart Trail")
+    c9, c10, c11 = st.columns(3)
+    with c9:
+        use_bar_trail = st.checkbox("💚 Use Bar-Low/High Smart Trail",
+                                    value=bool(getattr(cfg, "use_bar_trail", True)))
+    with c10:
+        trail_lookback = st.number_input("Trail lookback bars", min_value=1, max_value=300,
+                                         value=int(getattr(cfg, "trail_lookback", 50)), step=1)
+    with c11:
+        trail_buf_ticks = st.number_input("Trail buffer (ticks)", min_value=0, max_value=500,
+                                          value=int(getattr(cfg, "trail_buf_ticks", 40)), step=1)
 
-        st.markdown("---")
+    st.markdown("---")
 
-        # ====== Группа: Лимиты позиции ======
-        st.subheader("📌 Лимиты позиции")
-        c12, c13 = st.columns(2)
-        with c12:
-            limit_qty_enabled = st.checkbox("💚 Limit Max Qty",
-                                            value=bool(getattr(cfg, "limit_qty_enabled", True)))
-        with c13:
-            max_qty_manual = st.number_input("Max Qty (ETH)", min_value=0.001, max_value=10_000.0,
-                                             value=float(getattr(cfg, "max_qty_manual", 50.0)), step=0.001)
+    # ====== Группа: Лимиты позиции ======
+    st.subheader("📌 Лимиты позиции")
+    c12, c13 = st.columns(2)
+    with c12:
+        limit_qty_enabled = st.checkbox("💚 Limit Max Position Qty",
+                                        value=bool(getattr(cfg, "limit_qty_enabled", True)))
+    with c13:
+        max_qty_manual = st.number_input("Max Qty (ETH)", min_value=0.001, max_value=10_000.0,
+                                         value=float(getattr(cfg, "max_qty_manual", 50.0)), step=0.001)
 
-        st.markdown("---")
+    st.markdown("---")
 
-        # ====== Группа: Фильтры SFP ======
-        st.subheader("📌 Фильтр SFP (wick + closeback)")
-        c14, c15, c16 = st.columns(3)
-        with c14:
-            use_sfp_quality = st.checkbox("Filter: SFP quality",
-                                          value=bool(getattr(cfg, "use_sfp_quality", True)))
-        with c15:
-            wick_min_ticks = st.number_input("Min wick (ticks)", min_value=0, max_value=100,
-                                             value=int(getattr(cfg, "wick_min_ticks", 7)), step=1)
-        with c16:
-            close_back_pct = st.number_input("Close-back % of wick", min_value=0.0, max_value=1.0,
-                                             value=float(getattr(cfg, "close_back_pct", 1.0)), step=0.05)
+    # ====== Группа: Фильтры SFP ======
+    st.subheader("📌 Фильтр SFP (wick + closeback)")
+    c14, c15, c16 = st.columns(3)
+    with c14:
+        use_sfp_quality = st.checkbox("Filter: SFP quality (wick+closeback)",
+                                      value=bool(getattr(cfg, "use_sfp_quality", True)))
+    with c15:
+        wick_min_ticks = st.number_input("SFP: min wick depth (ticks)", min_value=0, max_value=100,
+                                         value=int(getattr(cfg, "wick_min_ticks", 7)), step=1)
+    with c16:
+        close_back_pct = st.number_input("SFP: min close-back % of wick", min_value=0.0, max_value=1.0,
+                                         value=float(getattr(cfg, "close_back_pct", 1.0)), step=0.05)
 
-        st.markdown("---")
+    st.markdown("---")
 
-        submitted = st.form_submit_button("🚀 Запустить бэктест", use_container_width=True)
+    # ====== Доп. управление TP ======
+    c17, c18 = st.columns(2)
+    with c17:
+        use_take_profit = st.checkbox("Use Take Profit", value=bool(getattr(cfg, "use_take_profit", True)))
+    with c18:
+        taker_fee = st.number_input("Taker fee (decimal)", min_value=0.0, max_value=0.01,
+                                    value=float(getattr(cfg, "taker_fee_rate", 0.00055)), step=0.00005)
+
+    submitted = st.form_submit_button("🚀 Запустить бэктест", use_container_width=True)
 
 
 # ========================= запуск бэктеста =========================
 def _compute_limits_from_days(days: int) -> Tuple[int, int]:
-    """Конвертируем дни в лимиты баров (ограничим верхние лимиты API)."""
+    """конвертируем дни в лимиты баров (ограничим верхние лимиты API)."""
     m15_per_day = 24 * 4         # 96
     m1_per_day  = 24 * 60        # 1440
     m15_limit = min(5000, days * m15_per_day + 2)
@@ -354,7 +360,7 @@ def _compute_limits_from_days(days: int) -> Tuple[int, int]:
     return m15_limit, m1_limit
 
 
-if 'submitted' in locals() and submitted:
+if submitted:
     # применяем значения в конфиг (строго без изменения механики)
     cfg.symbol = symbol.strip().upper()
     cfg.risk_reward = float(risk_reward)
@@ -380,8 +386,12 @@ if 'submitted' in locals() and submitted:
     cfg.wick_min_ticks = int(wick_min_ticks)
     cfg.close_back_pct = float(close_back_pct)
 
+    cfg.use_take_profit = bool(use_take_profit)
+    cfg.taker_fee_rate = float(taker_fee)
+
     cfg.price_for_logic = str(price_src).lower()
-    cfg.intrabar_tf = "1"  # интрабар — минутки, как и раньше
+    cfg.intrabar_tf = "1"                  # минутки
+    cfg.days_back = int(bt_days)           # фильтр окна бэктеста
 
     # лимиты истории из выбора периода
     m15_limit, m1_limit = _compute_limits_from_days(int(bt_days))
@@ -398,7 +408,7 @@ if 'submitted' in locals() and submitted:
 
     st.success("Готово ✅")
 
-    # ====== Статистика ======
+    # ---------- Статистика ----------
     st.markdown("### 📊 Статистика")
     def show_stats(db_path: str, days: int = 365):
         analytics = TradingAnalytics(db_path=db_path)
@@ -422,7 +432,7 @@ if 'submitted' in locals() and submitted:
         st.caption(f"Обновлено: {stats.get('updated_at','—')}")
     show_stats(db_path=db.db_path, days=365)
 
-    # ====== Equity Curve ======
+    # ---------- Кривая капитала ----------
     st.markdown("### 💰 Equity Curve")
     def show_equity_curve(db: Database):
         eq = db.get_equity_history(days=365)
@@ -436,16 +446,16 @@ if 'submitted' in locals() and submitted:
         st.plotly_chart(fig, use_container_width=True)
     show_equity_curve(db)
 
-    # ====== Таблица сделок ======
+    # ---------- Таблица сделок ----------
     st.markdown("### 📋 Сделки")
     def show_trades_table(db: Database):
         trades = db.get_recent_trades(500)
         if not trades:
             st.info("Сделок нет."); return
         df = pd.DataFrame(trades)
-        for col in ("entry_time", "exit_time"):
+        for col in ("entry_time","exit_time"):
             if col in df.columns: df[col] = pd.to_datetime(df[col], errors="coerce")
-        for col in ("pnl", "rr", "entry_price", "exit_price", "quantity", "qty"):
+        for col in ("pnl","rr","entry_price","exit_price","quantity","qty"):
             if col in df.columns: df[col] = pd.to_numeric(df[col], errors="coerce")
         if "quantity" not in df.columns and "qty" in df.columns:
             df["quantity"] = df["qty"]
