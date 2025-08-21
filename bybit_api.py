@@ -5,7 +5,7 @@ import hashlib
 import hmac
 from urllib.parse import urlencode
 import threading
-from typing import Dict, List, Optional, Callable, Tuple, Any
+from typing import Dict, List, Optional, Callable, Any
 
 # Необязательные хелперы округления по тик-сайзу/шагу
 try:
@@ -23,7 +23,7 @@ class BybitAPI:
         self.api_secret = api_secret or ""
         self.testnet = bool(testnet)
 
-        # По умолчанию — деривативы ("linear"); меняется через set_market_type()
+        # По умолчанию — деривативы ("linear")
         self.market_type = "linear"
 
         if self.testnet:
@@ -41,22 +41,13 @@ class BybitAPI:
 
     @staticmethod
     def _sorted_qs(params: Dict[str, Any]) -> str:
-        """Стабильный querystring: ключи в алф. порядке (требование v5 для подписи)."""
         if not params:
             return ""
-        # Преобразуем все значения к строкам
         items = [(k, "" if v is None else str(v)) for k, v in params.items()]
         items.sort(key=lambda kv: kv[0])
         return urlencode(items)
 
     def _generate_signature(self, payload: str, timestamp_ms: str) -> str:
-        """
-        v5 HMAC:
-        sign = HMAC_SHA256(secret, timestamp + apiKey + recvWindow + payload)
-        payload:
-          - GET: querystring (без '?'), ключи отсортированы
-          - POST: json.dumps(...) без лишних пробелов
-        """
         prehash = timestamp_ms + self.api_key + "5000" + payload
         return hmac.new(
             self.api_secret.encode("utf-8"),
@@ -73,14 +64,8 @@ class BybitAPI:
         requires_auth: bool = False,
         timeout: int = 30
     ) -> Dict:
-        """
-        Отправка HTTP-запроса к Bybit v5.
-        - Публичные эндпоинты (market/*) — без подписи (устойчивее).
-        - Приватные (account/order/position) — с HMAC-подписью v5.
-        """
         params = params or {}
         url = f"{self.base_url}{endpoint}"
-
         headers: Dict[str, str] = {"Content-Type": "application/json"}
 
         try:
@@ -100,10 +85,8 @@ class BybitAPI:
                 })
 
             if method.upper() == "GET":
-                # Для GET публичных: не подписываем, просто передаём params
                 r = self.session.get(url, params=params, headers=headers, timeout=timeout)
             elif method.upper() == "POST":
-                # Для POST подписываем (когда requires_auth=True)
                 data = json.dumps(params, separators=(',', ':'), ensure_ascii=False) if params else None
                 r = self.session.post(url, data=data, headers=headers, timeout=timeout)
             else:
@@ -120,22 +103,19 @@ class BybitAPI:
 
     @staticmethod
     def _map_trigger_by(source: str) -> str:
-        """'last'|'mark' -> Bybit triggerBy/..TriggerBy значение."""
         return "MarkPrice" if str(source).lower() == "mark" else "LastPrice"
 
-    # ==================== конфиг WS/market type ====================
+    # ==================== конфиг ====================
 
     def set_market_type(self, market_type: str):
-        """Установить тип рынка: 'linear' | 'inverse' | 'option' | 'spot'."""
         m = (market_type or "linear").lower()
         self.market_type = m
         base = "stream-testnet" if self.testnet else "stream"
         self.ws_url = f"wss://{base}.bybit.com/v5/public/{m}"
 
-    # ==================== публичные маркет-данные ====================
+    # ==================== публичные ====================
 
     def get_server_time(self) -> Optional[int]:
-        """Время сервера (секунды)."""
         resp = self._send_request("GET", "/v5/market/time", requires_auth=False)
         if resp.get("retCode") == 0:
             result = resp.get("result") or {}
@@ -146,12 +126,6 @@ class BybitAPI:
         return None
 
     def get_klines(self, symbol: str, interval: str, limit: int = 200) -> Optional[List[Dict]]:
-        """
-        Исторические свечи.
-        Возвращает список в возрастающем порядке времени:
-          out[0] — самая старая, out[-1] — последняя ЗАКРЫТАЯ.
-        Поля: timestamp(ms), open, high, low, close, volume.
-        """
         params = {
             "category": self.market_type,
             "symbol": symbol,
@@ -163,9 +137,8 @@ class BybitAPI:
             lst = (resp.get("result") or {}).get("list") or []
             out: List[Dict] = []
             for it in lst:
-                # Bybit v5: [start, open, high, low, close, volume, turnover]
                 out.append({
-                    "timestamp": int(it[0]),  # уже в миллисекундах
+                    "timestamp": int(it[0]),
                     "open": float(it[1]),
                     "high": float(it[2]),
                     "low": float(it[3]),
@@ -176,15 +149,13 @@ class BybitAPI:
             return out
         return None
 
-    def get_ticker(self, symbol: str) -> Dict:
-        """Тикер по символу (last/mark + best bid/ask). Совместимо со стратегией."""
+    def get_ticker(self, symbol: str) -> Optional[Dict]:
         params = {"category": self.market_type, "symbol": symbol}
         resp = self._send_request("GET", "/v5/market/tickers", params, requires_auth=False)
         if resp.get("retCode") == 0:
             lst = (resp.get("result") or {}).get("list") or []
             if lst:
                 t = lst[0]
-                # Возвращаем ключи в стиле TV/бота (lastPrice/markPrice и пр.)
                 return {
                     "symbol": t.get("symbol"),
                     "lastPrice": float(t.get("lastPrice", 0) or 0),
@@ -193,20 +164,15 @@ class BybitAPI:
                     "ask1Price": float(t.get("ask1Price", 0) or 0),
                     "volume24h": float(t.get("volume24h", 0) or 0),
                 }
-        return {}
+        return None
 
     def get_price(self, symbol: str, source: str = "last") -> float:
-        """Унифицированный доступ к цене: source: 'last' | 'mark'."""
-        t = self.get_ticker(symbol)
+        t = self.get_ticker(symbol) or {}
         last = float(t.get("lastPrice", 0) or 0)
         mark = float(t.get("markPrice", 0) or 0)
         return mark if (str(source).lower() == "mark" and mark > 0) else last
 
     def get_instruments_info(self, symbol: str) -> Optional[Dict]:
-        """
-        Информация об инструменте, включая priceFilter/lotSizeFilter.
-        Совместимо с логикой стратегии (tickSize/qtyStep/minOrderQty).
-        """
         params = {"category": self.market_type, "symbol": symbol}
         resp = self._send_request("GET", "/v5/market/instruments-info", params, requires_auth=False)
         if resp.get("retCode") == 0:
@@ -214,10 +180,9 @@ class BybitAPI:
             return lst[0] if lst else None
         return None
 
-    # ==================== приватные: аккаунт/ордера/позиции ====================
+    # ==================== приватные ====================
 
     def get_wallet_balance(self, account_type: str = "UNIFIED") -> Optional[Dict]:
-        """Баланс кошелька (по умолчанию UNIFIED для деривативов)."""
         params = {"accountType": account_type}
         resp = self._send_request("GET", "/v5/account/wallet-balance", params, requires_auth=True)
         if resp.get("retCode") == 0:
@@ -235,23 +200,18 @@ class BybitAPI:
         take_profit: Optional[float] = None,
         order_link_id: Optional[str] = None,
         reduce_only: bool = False,
-        trigger_by_source: str = "last",   # 'last' | 'mark' — важно для стопов/условных
+        trigger_by_source: str = "last",
         time_in_force: Optional[str] = None,
         position_idx: Optional[int] = None,
-        tpsl_mode: Optional[str] = None,   # "Full"|"Partial" (опц.)
+        tpsl_mode: Optional[str] = None,
     ) -> Optional[Dict]:
-        """
-        Создать ордер (Market/Limit/Conditional/Stop).
-        Примечание: у Bybit v5 для прикрепления SL/TP к позиции можно передавать stopLoss/takeProfit.
-        """
         params: Dict[str, str] = {
             "category": self.market_type,
             "symbol": symbol,
-            "side": str(side).title(),             # Buy/Sell
-            "orderType": str(orderType).title(),   # Market/Limit/Conditional/Stop
+            "side": str(side).title(),
+            "orderType": str(orderType).title(),
             "qty": str(qty),
         }
-
         if price is not None:
             params["price"] = str(price)
         if reduce_only:
@@ -265,16 +225,13 @@ class BybitAPI:
         if tpsl_mode:
             params["tpslMode"] = str(tpsl_mode)
 
-        # Встроенные SL/TP
         if stop_loss is not None:
             params["stopLoss"] = str(stop_loss)
-            # В create-ордере можно указать slTriggerBy (необяз.)
             params["slTriggerBy"] = self._map_trigger_by(trigger_by_source)
         if take_profit is not None:
             params["takeProfit"] = str(take_profit)
             params["tpTriggerBy"] = self._map_trigger_by(trigger_by_source)
 
-        # Для условных/стоп-ордеров — основное поле 'triggerBy'
         if orderType.lower() in {"stop", "conditional"}:
             params["triggerBy"] = self._map_trigger_by(trigger_by_source)
 
@@ -283,122 +240,12 @@ class BybitAPI:
             return resp.get("result")
         return None
 
-    def modify_order(
-        self,
-        symbol: str,
-        order_id: Optional[str] = None,
-        order_link_id: Optional[str] = None,
-        price: Optional[float] = None,
-        qty: Optional[float] = None,
-        stop_loss: Optional[float] = None,
-        take_profit: Optional[float] = None,
-        trigger_by_source: str = "last",
-        position_idx: Optional[int] = None,
-    ) -> Optional[Dict]:
-        """
-        Унифицированная правка:
-        - SL/TP активной ПОЗИЦИИ -> /v5/position/trading-stop
-        - параметры конкретного ОРДЕРА (price/qty) -> /v5/order/amend
-        """
-        # 1) апдейт SL/TP позиции (чаще используется в трейлинге)
-        if stop_loss is not None or take_profit is not None:
-            cat = self.market_type if self.market_type in ("linear", "inverse") else "linear"
-            params_ts: Dict[str, str] = {
-                "category": cat,
-                "symbol": symbol,
-            }
-            if position_idx is not None:
-                params_ts["positionIdx"] = str(position_idx)
-
-            if stop_loss is not None:
-                params_ts["stopLoss"] = str(stop_loss)
-                params_ts["slTriggerBy"] = self._map_trigger_by(trigger_by_source)
-            if take_profit is not None:
-                params_ts["takeProfit"] = str(take_profit)
-                params_ts["tpTriggerBy"] = self._map_trigger_by(trigger_by_source)
-
-            resp = self._send_request("POST", "/v5/position/trading-stop", params_ts, requires_auth=True)
-            if resp.get("retCode") == 0:
-                return resp.get("result")
-            return None
-
-        # 2) апдейт существующего ОРДЕРА
-        if order_id is None and order_link_id is None and price is None and qty is None:
-            return None
-
-        params_amend: Dict[str, str] = {
-            "category": self.market_type,
-            "symbol": symbol,
-        }
-        if order_id:
-            params_amend["orderId"] = order_id
-        if order_link_id:
-            params_amend["orderLinkId"] = order_link_id
-        if price is not None:
-            params_amend["price"] = str(price)
-        if qty is not None:
-            params_amend["qty"] = str(qty)
-
-        resp = self._send_request("POST", "/v5/order/amend", params_amend, requires_auth=True)
-        if resp.get("retCode") == 0:
-            return resp.get("result")
-        return None
-
-    def cancel_order(self, symbol: str, order_id: Optional[str] = None, order_link_id: Optional[str] = None) -> bool:
-        """Отменить ордер по orderId или orderLinkId."""
-        params: Dict[str, str] = {"category": self.market_type, "symbol": symbol}
-        if order_id:
-            params["orderId"] = order_id
-        if order_link_id:
-            params["orderLinkId"] = order_link_id
-        resp = self._send_request("POST", "/v5/order/cancel", params, requires_auth=True)
-        return resp.get("retCode") == 0
-
-    def get_open_orders(self, symbol: Optional[str] = None) -> Optional[List[Dict]]:
-        """Открытые ордера."""
-        params: Dict[str, str] = {"category": self.market_type}
-        if symbol:
-            params["symbol"] = symbol
-        resp = self._send_request("GET", "/v5/order/realtime", params, requires_auth=True)
-        if resp.get("retCode") == 0:
-            return (resp.get("result") or {}).get("list")
-        return None
-
-    def get_order_history(self, symbol: Optional[str] = None, limit: int = 50) -> Optional[List[Dict]]:
-        """История ордеров."""
-        params: Dict[str, str] = {"category": self.market_type, "limit": str(limit)}
-        if symbol:
-            params["symbol"] = symbol
-        resp = self._send_request("GET", "/v5/order/history", params, requires_auth=True)
-        if resp.get("retCode") == 0:
-            return (resp.get("result") or {}).get("list")
-        return None
-
-    def update_position_stop_loss(self, symbol: str, stop_loss: float, trigger_by_source: str = "last",
-                                  position_idx: Optional[int] = None) -> Optional[Dict]:
-        """
-        Старый интерфейс из стратегии: прокся на /v5/position/trading-stop.
-        Совместимо с KWINStrategy._update_stop_loss().
-        """
-        cat = self.market_type if self.market_type in ("linear", "inverse") else "linear"
-        params = {
-            "category": cat,
-            "symbol": symbol,
-            "stopLoss": str(stop_loss),
-            "slTriggerBy": self._map_trigger_by(trigger_by_source),
-        }
-        if position_idx is not None:
-            params["positionIdx"] = str(position_idx)
-
-        resp = self._send_request("POST", "/v5/position/trading-stop", params, requires_auth=True)
-        if resp.get("retCode") == 0:
-            return resp.get("result")
-        return None
-
-    # ==================== WebSocket (паблик) ====================
+    # ==================== WebSocket ====================
 
     def start_websocket(self, on_message: Optional[Callable] = None):
-        """Запуск паблик WebSocket-соединения (market streams)."""
+        """Запуск WS с авто-переподключением."""
+        from websocket import WebSocketApp
+
         def on_ws_message(ws, message):
             try:
                 data = json.loads(message)
@@ -408,40 +255,39 @@ class BybitAPI:
                 if topic and topic in self.ws_callbacks:
                     self.ws_callbacks[topic](data)
             except Exception as e:
-                print(f"WebSocket message error: {e}")
+                print(f"WS message error: {e}")
 
         def on_ws_error(ws, error):
-            print(f"WebSocket error: {error}")
+            print(f"WS error: {error}")
 
-        def on_ws_close(ws, close_status_code, close_msg):
-            print("WebSocket connection closed")
+        def on_ws_close(ws, *_):
+            print("WS closed — reconnecting...")
+            time.sleep(2)
+            self.start_websocket(on_message)
 
         def on_ws_open(ws):
-            print("WebSocket connection opened")
+            print("WS connection opened")
 
-        try:
-            from websocket import WebSocketApp  # type: ignore
-            self.ws = WebSocketApp(
-                self.ws_url,
-                on_open=on_ws_open,
-                on_message=on_ws_message,
-                on_error=on_ws_error,
-                on_close=on_ws_close,
-            )
-            th = threading.Thread(target=self.ws.run_forever, daemon=True)
-            th.start()
-        except ImportError:
-            print("WebSocket library not available")
+        self.ws = WebSocketApp(
+            self.ws_url,
+            on_open=on_ws_open,
+            on_message=on_ws_message,
+            on_error=on_ws_error,
+            on_close=on_ws_close,
+        )
+        threading.Thread(target=self.ws.run_forever, daemon=True).start()
 
     def subscribe_kline(self, symbol: str, interval: str, callback: Callable):
-        """Подписка на kline через паблик WebSocket."""
+        """Подписка на kline (возвращаются только закрытые бары)."""
         if not self.ws:
             self.start_websocket()
         topic = f"kline.{interval}.{symbol}"
-        self.ws_callbacks[topic] = callback
+        self.ws_callbacks[topic] = lambda data: (
+            callback(data) if data.get("data", [{}])[0].get("confirm", False) else None
+        )
         msg = {"op": "subscribe", "args": [topic]}
         try:
             if self.ws:
                 self.ws.send(json.dumps(msg))
         except Exception as e:
-            print(f"WebSocket send error: {e}")
+            print(f"WS send error: {e}")
