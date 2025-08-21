@@ -203,6 +203,8 @@ def main():
         sfp_len     = st.number_input("SFP Length", min_value=1, max_value=10, value=2, step=1)
         risk_pct    = st.number_input("Risk %", min_value=0.5, max_value=10.0, value=3.0, step=0.5)
     with c2:
+        # ⬇️ Новый переключатель TP
+        use_take_profit   = st.checkbox("Use Take Profit (RR target)", value=True)
         enable_smart_trail = st.checkbox("Smart Trailing", value=True)
         trailing_perc      = st.number_input("Trailing % (of entry)", min_value=0.0, max_value=5.0, value=0.5, step=0.1)
         trailing_offset    = st.number_input("Trailing Offset %",   min_value=0.0, max_value=2.0, value=0.4, step=0.1)
@@ -232,10 +234,13 @@ def main():
                 config.sfp_len = int(sfp_len)
                 config.risk_pct = float(risk_pct)
 
+                # новый флаг TP
+                config.use_take_profit = bool(use_take_profit)
+
                 config.enable_smart_trail = bool(enable_smart_trail)
                 config.trailing_perc = float(trailing_perc)  # в %
                 config.trailing_offset_perc = float(trailing_offset)
-                config.trailing_offset = float(trailing_offset)
+                config.trailing_offset = float(trailing_offset)  # совместимость
 
                 # ARM
                 config.use_arm_after_rr = bool(arm_after_rr)
@@ -302,7 +307,6 @@ def main():
             except Exception as e:
                 st.error(f"Ошибка выполнения бэктеста: {e}")
                 st.exception(e)
-
 # ========================================================================
 def run_backtest(strategy: KWINStrategy, period_days: int, start_capital: float):
     """
@@ -310,6 +314,7 @@ def run_backtest(strategy: KWINStrategy, period_days: int, start_capital: float)
     Все параметры стратегии из UI реально влияют на вход/SL/TP.
     """
     state = strategy.state
+    cfg   = strategy.config
 
     # ===== 1) Сгенерим синтетические свечи (UTC, 15m), timestamp в МИЛЛИСЕКУНДАХ =====
     end_date = datetime.utcnow()
@@ -355,7 +360,7 @@ def run_backtest(strategy: KWINStrategy, period_days: int, start_capital: float)
     bt_trades: List[Dict] = []
     equity_points: List[Dict] = []
 
-    def _close(exit_price: float, ts_ms: int):
+    def _close(exit_price: float, ts_ms: int, reason: str = "MKT"):
         """Вспомогательное закрытие позиции с PnL и комиссиями"""
         pos = state.get_current_position()
         if not pos or pos.get("status") != "open":
@@ -381,6 +386,7 @@ def run_backtest(strategy: KWINStrategy, period_days: int, start_capital: float)
             "rr": None,
             "entry_time": datetime.utcfromtimestamp(int(pos.get("entry_time_ts", ts_ms))/1000),
             "exit_time":  datetime.utcfromtimestamp(int(ts_ms)/1000),
+            "exit_reason": reason,
             "status": "closed",
         })
         pos["status"] = "closed"
@@ -458,12 +464,13 @@ def run_backtest(strategy: KWINStrategy, period_days: int, start_capital: float)
         if pos and pos.get("status") == "open":
             sl = float(pos.get("stop_loss") or 0)
             tp = pos.get("take_profit")
+            use_tp = bool(getattr(cfg, "use_take_profit", True))
             if pos["direction"] == "long":
-                if sl > 0 and l <= sl: _close(sl, ts_ms)
-                elif tp is not None and h >= float(tp): _close(float(tp), ts_ms)
+                if sl > 0 and l <= sl: _close(sl, ts_ms, reason="SL")
+                elif use_tp and tp is not None and h >= float(tp): _close(float(tp), ts_ms, reason="TP")
             else:
-                if sl > 0 and h >= sl: _close(sl, ts_ms)
-                elif tp is not None and l <= float(tp): _close(float(tp), ts_ms)
+                if sl > 0 and h >= sl: _close(sl, ts_ms, reason="SL")
+                elif use_tp and tp is not None and l <= float(tp): _close(float(tp), ts_ms, reason="TP")
 
         # 4) закрытие 15m бара -> возможен вход
         before_pos = state.get_current_position()
@@ -482,7 +489,7 @@ def run_backtest(strategy: KWINStrategy, period_days: int, start_capital: float)
     pos = state.get_current_position()
     if pos and pos.get("status") == "open":
         last = candles[-1]
-        _close(float(last["close"]), int(last["timestamp"]))
+        _close(float(last["close"]), int(last["timestamp"]), reason="EOD")
 
     trades_df = pd.DataFrame(bt_trades)
     equity_df = pd.DataFrame(equity_points)
@@ -660,15 +667,16 @@ def run_backtest_real(strategy: KWINStrategy, candles: List[Dict], start_capital
         if pos and pos.get("status") == "open":
             sl = float(pos.get("stop_loss") or 0)
             tp = pos.get("take_profit")
+            use_tp = bool(getattr(cfg, "use_take_profit", True))
             if pos["direction"] == "long":
                 if sl > 0 and l <= sl:
                     _close_position(sl, ts_ms, reason="SL")
-                elif tp is not None and h >= float(tp):
+                elif use_tp and tp is not None and h >= float(tp):
                     _close_position(float(tp), ts_ms, reason="TP")
             else:
                 if sl > 0 and h >= sl:
                     _close_position(sl, ts_ms, reason="SL")
-                elif tp is not None and l <= float(tp):
+                elif use_tp and tp is not None and l <= float(tp):
                     _close_position(float(tp), ts_ms, reason="TP")
 
         # (C) отдать закрытый бар стратегии (возможны новые входы)
@@ -716,7 +724,7 @@ def run_backtest_real_intrabar(strategy: KWINStrategy,
       - config.trigger_price_source: 'last'|'mark' — по какой цене срабатывает SL/TP (в bt оба = px микрошагов).
       - config.arm_rr_basis: 'extremum'|'last' — чем считаем RR для ARM (high/low или текущий px).
       - config.slippage_pct: проскальзывание при закрытии.
-      - config.latency_ms: для моделирования задержки (оставлено заглушкой — на 1m обычно 0).
+      - config.latency_ms: заглушка для задержки.
     """
     import pandas as pd
     import numpy as np
@@ -728,6 +736,7 @@ def run_backtest_real_intrabar(strategy: KWINStrategy,
     arm_basis       = (getattr(cfg, "arm_rr_basis", "extremum") or "extremum").lower()
     slippage_pct    = float(getattr(cfg, "slippage_pct", 0.0) or 0.0)
     latency_ms      = int(getattr(cfg, "latency_ms", 0) or 0)
+    use_tp          = bool(getattr(cfg, "use_take_profit", True))  # ← ключевой флаг TP
 
     # --- нормализация 15m (по возрастанию времени, ts в мс) ---
     n15: List[Dict] = []
@@ -802,7 +811,6 @@ def run_backtest_real_intrabar(strategy: KWINStrategy,
         qty         = float(pos["size"])
         fee_rate    = float(getattr(cfg, "taker_fee_rate", 0.00055))
 
-        # проскальзывание (процент от цены исполнения)
         ep = float(exit_price)
         if slippage_pct > 0:
             slip = abs(ep) * slippage_pct
@@ -913,21 +921,20 @@ def run_backtest_real_intrabar(strategy: KWINStrategy,
                     # 2.2 — проверяем SL/TP на микрошаге по источнику триггера
                     trig_px = {"last": px, "mark": px}.get(trigger_src, px)
 
-                    # имитация латентности (на 1m обычно не нужна; оставлено как задел)
                     if latency_ms:
-                        pass
+                        pass  # оставлено как задел
 
                     sl = float(pos.get("stop_loss") or 0.0)
                     tp = pos.get("take_profit")
                     if direction == "long":
                         if sl > 0 and trig_px <= sl:
                             _close_position(sl, m_ts, reason="SLi"); break
-                        if tp is not None and trig_px >= float(tp):
+                        if use_tp and tp is not None and trig_px >= float(tp):
                             _close_position(float(tp), m_ts, reason="TPi"); break
                     else:
                         if sl > 0 and trig_px >= sl:
                             _close_position(sl, m_ts, reason="SLi"); break
-                        if tp is not None and trig_px <= float(tp):
+                        if use_tp and tp is not None and trig_px <= float(tp):
                             _close_position(float(tp), m_ts, reason="TPi"); break
 
                     # кормим стратегию «логической» ценой (для консистентности логов)
@@ -1066,3 +1073,4 @@ def display_backtest_results(results: Dict):
 # ========================================================================
 if __name__ == "__main__":
     main()
+
