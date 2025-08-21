@@ -543,7 +543,8 @@ class KWINStrategy:
                 print(f"[ENTRY SHORT] {qty} @ {entry}, SL={sl} (TP disabled)")
         except Exception as e:
             print(f"[process_short_entry] {e}")
-     # ---------- ТРЕЙЛИНГ ----------
+
+    # ---------- ТРЕЙЛИНГ ----------
 
     def _get_bar_extremes_for_trailing(self, current_price: float) -> Tuple[float, float]:
         """Возвращает high/low для расчёта якоря: сначала 1м (если включено), иначе 15м."""
