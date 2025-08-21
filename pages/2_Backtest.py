@@ -191,82 +191,156 @@ def run_backtest(symbol: str,
     return db, state, strat
 
 
-# =============== UI ===============
-with st.sidebar:
-    st.header("⚙️ Параметры бэктеста")
+# ========================= UI: центральная форма =========================
+st.markdown("## ⚙️ Настройки бэктеста")
+
+with st.form("backtest_form"):
     cfg = Config()
 
-    # Общие
-    symbol = st.text_input("Символ", value=str(getattr(cfg, "symbol", "ETHUSDT")))
-    init_eq = st.number_input("Начальный equity ($)", min_value=10.0, max_value=1_000_000.0, value=1000.0, step=10.0)
-    m15_limit = st.slider("15m бары (limit)", min_value=200, max_value=5000, value=1500, step=100)
-    m1_limit  = st.slider("Intrabar 1m (limit)", min_value=0, max_value=5000, value=int(getattr(cfg, "intrabar_pull_limit", 1500)), step=100)
-    price_src = st.selectbox("Источник цены", options=["last", "mark"], index=0)
+    # ----- верхняя строка (символ/капитал/источник цены/период) -----
+    c0a, c0b, c0c, c0d = st.columns(4)
+    with c0a:
+        symbol = st.text_input("Символ", value=str(getattr(cfg, "symbol", "ETHUSDT")))
+    with c0b:
+        init_eq = st.number_input("Начальный equity ($)", min_value=10.0, max_value=1_000_000.0, value=1000.0, step=10.0)
+    with c0c:
+        price_src = st.selectbox("Источник цены", options=["last", "mark"], index=0)
+    with c0d:
+        bt_days = st.selectbox("Период бэктеста (дней)", [7, 14, 30, 60], index=2)
 
-    # Настройки стратегии
-    cfg.sfp_len = st.slider("SFP Length", min_value=1, max_value=10, value=int(getattr(cfg, "sfp_len", 2)))
-    cfg.arm_rr = st.number_input("Arm RR", min_value=0.5, max_value=10.0, value=float(getattr(cfg, "arm_rr", 1.5)), step=0.1)
-    cfg.use_take_profit = st.checkbox("Использовать TP", value=bool(getattr(cfg, "use_take_profit", True)))
-    cfg.trailing_perc = st.number_input("Smart Trailing %", min_value=0.1, max_value=10.0, value=float(getattr(cfg, "trailing_perc", 0.5)), step=0.1)
-    cfg.risk_pct = st.number_input("Risk % per trade", min_value=0.1, max_value=10.0, value=float(getattr(cfg, "risk_pct", 2.0)), step=0.1)
+    st.markdown("---")
 
-    run_btn = st.button("🚀 Запустить бэктест", use_container_width=True)
-
-
-def show_equity_curve(db: Database):
-    eq = db.get_equity_history(days=365)
-    if not eq:
-        st.info("Нет истории equity."); return
-    df = pd.DataFrame(eq)
-    df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(x=df["timestamp"], y=df["equity"], mode="lines", name="Equity"))
-    fig.update_layout(height=340, margin=dict(l=10, r=10, t=30, b=10))
-    st.plotly_chart(fig, use_container_width=True)
-
-
-def show_trades_table(db: Database):
-    trades = db.get_recent_trades(500)
-    if not trades:
-        st.info("Сделок нет."); return
-    df = pd.DataFrame(trades)
-    for col in ("entry_time","exit_time"):
-        if col in df.columns: df[col] = pd.to_datetime(df[col], errors="coerce")
-    for col in ("pnl","rr","entry_price","exit_price","quantity","qty"):
-        if col in df.columns: df[col] = pd.to_numeric(df[col], errors="coerce")
-    if "quantity" not in df.columns and "qty" in df.columns:
-        df["quantity"] = df["qty"]
-    cols = [c for c in ["entry_time","direction","entry_price","exit_price","quantity","pnl","rr","status","exit_reason"] if c in df.columns]
-    st.dataframe(df[cols].round(6), use_container_width=True)
-
-
-def show_stats(db_path: str, days: int = 365):
-    analytics = TradingAnalytics(db_path=db_path)
-    stats = analytics.get_comprehensive_stats(days_back=days) or {}
-    c1, c2, c3, c4 = st.columns(4)
+    # ====== Группа: Основные ======
+    st.subheader("📌 Основные параметры")
+    c1, c2, c3 = st.columns(3)
     with c1:
-        st.metric("Total Trades", stats.get("total_trades", 0))
-        st.metric("WinRate", f"{(stats.get('winrate') or {}).get('total', 0)}%")
+        risk_reward = st.number_input("TP Risk/Reward Ratio", min_value=0.5, max_value=5.0,
+                                      value=float(getattr(cfg, "risk_reward", 1.3)), step=0.1)
     with c2:
-        pnl = stats.get("pnl") or {}
-        st.metric("Net PnL", f"{pnl.get('total_pnl', 0):.2f}")
-        st.metric("Profit Factor", f"{pnl.get('profit_factor', 0):.2f}")
+        sfp_len = st.number_input("Swing Length (SFP length)", min_value=1, max_value=10,
+                                  value=int(getattr(cfg, "sfp_len", 2)), step=1)
     with c3:
-        rr = stats.get("risk_reward") or {}
-        st.metric("Avg R:R", f"{rr.get('avg_rr', 0):.2f}")
-        st.metric("Max R", f"{rr.get('max_rr', 0):.2f}")
+        risk_pct = st.number_input("Risk % per trade", min_value=0.1, max_value=10.0,
+                                   value=float(getattr(cfg, "risk_pct", 3.0)), step=0.1)
+
+    st.markdown("---")
+
+    # ====== Группа: Smart Trailing TP ======
+    st.subheader("📌 Smart Trailing TP")
+    c4, c5, c6 = st.columns(3)
     with c4:
-        dd = stats.get("drawdown") or {}
-        st.metric("Max DD", f"{dd.get('max_drawdown', 0):.2f}%")
-        st.metric("Curr DD", f"{dd.get('current_drawdown', 0):.2f}%")
-    st.caption(f"Обновлено: {stats.get('updated_at','—')}")
+        enable_smart_trail = st.checkbox("💚 Enable Smart Trailing TP",
+                                         value=bool(getattr(cfg, "enable_smart_trail", True)))
+    with c5:
+        trailing_perc = st.number_input("Trailing %", min_value=0.0, max_value=5.0,
+                                        value=float(getattr(cfg, "trailing_perc", 0.5)), step=0.1)
+    with c6:
+        trailing_offset_perc = st.number_input("Trailing Offset %", min_value=0.0, max_value=5.0,
+                                               value=float(getattr(cfg, "trailing_offset_perc", 0.4)), step=0.1)
+
+    st.markdown("---")
+
+    # ====== Группа: ARM RR ======
+    st.subheader("📌 ARM RR")
+    c7, c8 = st.columns(2)
+    with c7:
+        use_arm_after_rr = st.checkbox("💚 Enable Arm after RR≥X",
+                                       value=bool(getattr(cfg, "use_arm_after_rr", True)))
+    with c8:
+        arm_rr = st.number_input("Arm RR (R)", min_value=0.1, max_value=5.0,
+                                 value=float(getattr(cfg, "arm_rr", 0.5)), step=0.1)
+
+    st.markdown("---")
+
+    # ====== Группа: Bar-Low/High Smart Trail ======
+    st.subheader("📌 Use Bar-Low/High Smart Trail")
+    c9, c10, c11 = st.columns(3)
+    with c9:
+        use_bar_trail = st.checkbox("💚 Use Bar-Low/High Smart Trail",
+                                    value=bool(getattr(cfg, "use_bar_trail", True)))
+    with c10:
+        trail_lookback = st.number_input("Trail lookback bars", min_value=1, max_value=300,
+                                         value=int(getattr(cfg, "trail_lookback", 50)), step=1)
+    with c11:
+        trail_buf_ticks = st.number_input("Trail buffer (ticks)", min_value=0, max_value=500,
+                                          value=int(getattr(cfg, "trail_buf_ticks", 40)), step=1)
+
+    st.markdown("---")
+
+    # ====== Группа: Лимиты позиции ======
+    st.subheader("📌 Лимиты позиции")
+    c12, c13 = st.columns(2)
+    with c12:
+        limit_qty_enabled = st.checkbox("💚 Limit Max Position Qty",
+                                        value=bool(getattr(cfg, "limit_qty_enabled", True)))
+    with c13:
+        max_qty_manual = st.number_input("Max Qty (ETH)", min_value=0.001, max_value=10_000.0,
+                                         value=float(getattr(cfg, "max_qty_manual", 50.0)), step=0.001)
+
+    st.markdown("---")
+
+    # ====== Группа: Фильтры SFP ======
+    st.subheader("📌 Фильтр SFP (wick + closeback)")
+    c14, c15, c16 = st.columns(3)
+    with c14:
+        use_sfp_quality = st.checkbox("Filter: SFP quality (wick+closeback)",
+                                      value=bool(getattr(cfg, "use_sfp_quality", True)))
+    with c15:
+        wick_min_ticks = st.number_input("SFP: min wick depth (ticks)", min_value=0, max_value=100,
+                                         value=int(getattr(cfg, "wick_min_ticks", 7)), step=1)
+    with c16:
+        close_back_pct = st.number_input("SFP: min close-back % of wick", min_value=0.0, max_value=1.0,
+                                         value=float(getattr(cfg, "close_back_pct", 1.0)), step=0.05)
+
+    st.markdown("---")
+
+    submitted = st.form_submit_button("🚀 Запустить бэктест", use_container_width=True)
 
 
-# =============== RUN ===============
-if run_btn:
+# ========================= запуск бэктеста =========================
+def _compute_limits_from_days(days: int) -> Tuple[int, int]:
+    """конвертируем дни в лимиты баров (ограничим верхние лимиты API)."""
+    m15_per_day = 24 * 4         # 96
+    m1_per_day  = 24 * 60        # 1440
+    m15_limit = min(5000, days * m15_per_day + 2)
+    m1_limit  = min(5000, days * m1_per_day + 2)
+    return m15_limit, m1_limit
+
+
+if submitted:
+    # применяем значения в конфиг (строго без изменения механики)
+    cfg.symbol = symbol.strip().upper()
+    cfg.risk_reward = float(risk_reward)
+    cfg.sfp_len = int(sfp_len)
+    cfg.risk_pct = float(risk_pct)
+
+    cfg.enable_smart_trail = bool(enable_smart_trail)
+    cfg.trailing_perc = float(trailing_perc)
+    cfg.trailing_offset_perc = float(trailing_offset_perc)
+    cfg.trailing_offset = float(trailing_offset_perc)  # alias
+
+    cfg.use_arm_after_rr = bool(use_arm_after_rr)
+    cfg.arm_rr = float(arm_rr)
+
+    cfg.use_bar_trail = bool(use_bar_trail)
+    cfg.trail_lookback = int(trail_lookback)
+    cfg.trail_buf_ticks = int(trail_buf_ticks)
+
+    cfg.limit_qty_enabled = bool(limit_qty_enabled)
+    cfg.max_qty_manual = float(max_qty_manual)
+
+    cfg.use_sfp_quality = bool(use_sfp_quality)
+    cfg.wick_min_ticks = int(wick_min_ticks)
+    cfg.close_back_pct = float(close_back_pct)
+
+    cfg.price_for_logic = str(price_src).lower()
+    cfg.intrabar_tf = "1"  # интрабар — минутки, как и раньше
+    # лимиты истории из выбора периода
+    m15_limit, m1_limit = _compute_limits_from_days(int(bt_days))
+
     with st.spinner("Грузим историю и запускаем бэктест…"):
         db, state, strat = run_backtest(
-            symbol=symbol.strip().upper(),
+            symbol=cfg.symbol,
             m15_limit=int(m15_limit),
             m1_limit=int(m1_limit),
             init_equity=float(init_eq),
@@ -275,8 +349,57 @@ if run_btn:
         )
 
     st.success("Готово ✅")
-    st.markdown("### 📊 Статистика"); show_stats(db_path=db.db_path, days=365)
-    st.markdown("### 💰 Equity Curve"); show_equity_curve(db)
-    st.markdown("### 📋 Сделки"); show_trades_table(db)
+    st.markdown("### 📊 Статистика")
+    def show_stats(db_path: str, days: int = 365):
+        analytics = TradingAnalytics(db_path=db_path)
+        stats = analytics.get_comprehensive_stats(days_back=days) or {}
+        c1, c2, c3, c4 = st.columns(4)
+        with c1:
+            st.metric("Total Trades", stats.get("total_trades", 0))
+            st.metric("WinRate", f"{(stats.get('winrate') or {}).get('total', 0)}%")
+        with c2:
+            pnl = stats.get("pnl") or {}
+            st.metric("Net PnL", f"{pnl.get('total_pnl', 0):.2f}")
+            st.metric("Profit Factor", f"{pnl.get('profit_factor', 0):.2f}")
+        with c3:
+            rr = stats.get("risk_reward") or {}
+            st.metric("Avg R:R", f"{rr.get('avg_rr', 0):.2f}")
+            st.metric("Max R", f"{rr.get('max_rr', 0):.2f}")
+        with c4:
+            dd = stats.get("drawdown") or {}
+            st.metric("Max DD", f"{dd.get('max_drawdown', 0):.2f}%")
+            st.metric("Curr DD", f"{dd.get('current_drawdown', 0):.2f}%")
+        st.caption(f"Обновлено: {stats.get('updated_at','—')}")
+    show_stats(db_path=db.db_path, days=365)
+
+    st.markdown("### 💰 Equity Curve")
+    def show_equity_curve(db: Database):
+        eq = db.get_equity_history(days=365)
+        if not eq:
+            st.info("Нет истории equity."); return
+        df = pd.DataFrame(eq)
+        df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(x=df["timestamp"], y=df["equity"], mode="lines", name="Equity"))
+        fig.update_layout(height=340, margin=dict(l=10, r=10, t=30, b=10))
+        st.plotly_chart(fig, use_container_width=True)
+    show_equity_curve(db)
+
+    st.markdown("### 📋 Сделки")
+    def show_trades_table(db: Database):
+        trades = db.get_recent_trades(500)
+        if not trades:
+            st.info("Сделок нет."); return
+        df = pd.DataFrame(trades)
+        for col in ("entry_time","exit_time"):
+            if col in df.columns: df[col] = pd.to_datetime(df[col], errors="coerce")
+        for col in ("pnl","rr","entry_price","exit_price","quantity","qty"):
+            if col in df.columns: df[col] = pd.to_numeric(df[col], errors="coerce")
+        if "quantity" not in df.columns and "qty" in df.columns:
+            df["quantity"] = df["qty"]
+        cols = [c for c in ["entry_time","direction","entry_price","exit_price","quantity","pnl","rr","status","exit_reason"] if c in df.columns]
+        st.dataframe(df[cols].round(6), use_container_width=True)
+    show_trades_table(db)
+
 else:
-    st.info("Задай параметры слева и нажми **«Запустить бэктест»**.")
+    st.info("Заполни параметры и нажми **«🚀 Запустить бэктест»**.")
