@@ -78,9 +78,9 @@ class BtData:
 
 
 @st.cache_data(show_spinner=False)
-def load_history(api: PaperAPI, symbol: str, m15_limit: int, m1_limit: int, intrabar_tf: str = "1") -> BtData:
+def load_history(_api: PaperAPI, symbol: str, m15_limit: int, m1_limit: int, intrabar_tf: str = "1") -> BtData:
     """Грузим историю с рынка (Bybit API)."""
-    m15_raw = api.get_klines(symbol, "15", m15_limit) or []
+    m15_raw = _api.get_klines(symbol, "15", m15_limit) or []
     df15 = pd.DataFrame(m15_raw)
     if not df15.empty:
         df15 = df15.sort_values("timestamp").reset_index(drop=True)
@@ -89,7 +89,7 @@ def load_history(api: PaperAPI, symbol: str, m15_limit: int, m1_limit: int, intr
 
     df1 = pd.DataFrame()
     if m1_limit > 0:
-        m1_raw = api.get_klines(symbol, intrabar_tf, m1_limit) or []
+        m1_raw = _api.get_klines(symbol, intrabar_tf, m1_limit) or []
         df1 = pd.DataFrame(m1_raw)
         if not df1.empty:
             df1 = df1.sort_values("timestamp").reset_index(drop=True)
