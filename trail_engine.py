@@ -1,3 +1,4 @@
+# trail_engine.py
 import math
 from typing import Dict, Optional
 from datetime import datetime
@@ -6,12 +7,12 @@ from config import Config
 from state_manager import StateManager
 from analytics import TrailingLogger
 
-# ⬇️ те же тик-хелперы, что и в стратегии
-from utils_round import round_price, round_to_tick, floor_to_tick, ceil_to_tick
+# ⬇️ тик-хелперы
+from utils_round import round_price, floor_to_tick, ceil_to_tick
 
 
 class TrailEngine:
-    """Движок Smart Trailing для управления стоп-лоссами"""
+    """Движок Smart Trailing для управления стоп-лоссами (адаптирован под Pine)"""
 
     def __init__(self, config: Config, state_manager: StateManager, bybit_api):
         self.config = config
@@ -58,7 +59,6 @@ class TrailEngine:
                     if moved >= need:
                         position['armed'] = True
                         armed = True
-                        # обновим состояние через state_manager, если есть метод
                         if hasattr(self.state, "update_position_armed"):
                             self.state.update_position_armed(True)
                         print(f"[TrailEngine ARM] long armed at RR={moved / risk:.2f}")
@@ -68,7 +68,6 @@ class TrailEngine:
 
             # === Anchor (экстремум) ===
             anchor = float(position.get("trail_anchor") or entry)
-            # для long якорь — максимум из старого якоря и текущего high/price
             if current_price > anchor:
                 anchor = current_price
                 position["trail_anchor"] = anchor
@@ -77,25 +76,26 @@ class TrailEngine:
 
             new_sl = current_sl
 
-            # === BarTrail (опционально, совместимость) ===
+            # === BarTrail (lowest N bars, без текущего бара) ===
             if getattr(self.config, "use_bar_trail", False):
                 bt_sl = self._calculate_bar_trail_long(current_sl)
                 new_sl = max(new_sl, bt_sl)
 
-            # === % трейл от entry + offset (как в стратегии) ===
+            # === Smart Trailing ===
             trail_perc = float(getattr(self.config, "trailing_perc", 0.5)) / 100.0
             off_perc = float(getattr(self.config, "trailing_offset_perc", 0.4)) / 100.0
             if trail_perc > 0.0:
                 trail_dist = entry * trail_perc
                 off_dist = entry * off_perc
+                # ⬅️ Pine логика: всегда через anchor, не через current
                 candidate = floor_to_tick(anchor - trail_dist - off_dist, self._tick_size())
                 new_sl = max(new_sl, candidate)
 
-            # (устар.) обычный offset — больше не используем, но оставим совместимость
+            # === Совместимость со старым offset ===
             legacy_off = float(getattr(self.config, "trailing_offset", 0.0))
             if legacy_off > 0:
                 legacy_dist = entry * (legacy_off / 100.0)
-                candidate = floor_to_tick(current_price - legacy_dist, self._tick_size())
+                candidate = floor_to_tick(anchor - legacy_dist, self._tick_size())
                 new_sl = max(new_sl, candidate)
 
             # === Обновление SL ===
@@ -118,7 +118,6 @@ class TrailEngine:
         try:
             entry = float(position.get('entry_price') or 0)
             current_sl = float(position.get('stop_loss') or 0)
-            # ⬅️ ИСПРАВЛЕНО: отступ строки с проверкой
             if entry <= 0 or current_sl <= 0:
                 return
 
@@ -142,7 +141,6 @@ class TrailEngine:
 
             # === Anchor (экстремум) ===
             anchor = float(position.get("trail_anchor") or entry)
-            # для short якорь — минимум из старого якоря и текущей цены
             if current_price < anchor:
                 anchor = current_price
                 position["trail_anchor"] = anchor
@@ -151,12 +149,12 @@ class TrailEngine:
 
             new_sl = current_sl
 
-            # === BarTrail (опционально, совместимость) ===
+            # === BarTrail (highest N bars, без текущего бара) ===
             if getattr(self.config, "use_bar_trail", False):
                 bt_sl = self._calculate_bar_trail_short(current_sl)
                 new_sl = min(new_sl, bt_sl)
 
-            # === % трейл от entry + offset (как в стратегии) ===
+            # === Smart Trailing ===
             trail_perc = float(getattr(self.config, "trailing_perc", 0.5)) / 100.0
             off_perc = float(getattr(self.config, "trailing_offset_perc", 0.4)) / 100.0
             if trail_perc > 0.0:
@@ -165,11 +163,11 @@ class TrailEngine:
                 candidate = ceil_to_tick(anchor + trail_dist + off_dist, self._tick_size())
                 new_sl = min(new_sl, candidate)
 
-            # (устар.) обычный offset — поддержка совместимости
+            # === Совместимость со старым offset ===
             legacy_off = float(getattr(self.config, "trailing_offset", 0.0))
             if legacy_off > 0:
                 legacy_dist = entry * (legacy_off / 100.0)
-                candidate = ceil_to_tick(current_price + legacy_dist, self._tick_size())
+                candidate = ceil_to_tick(anchor + legacy_dist, self._tick_size())
                 new_sl = min(new_sl, candidate)
 
             # === Обновление SL ===
@@ -185,10 +183,10 @@ class TrailEngine:
         except Exception as e:
             print(f"Error in short trailing: {e}")
 
-    # ---------- Вспомогательные расчёты ----------
+    # ---------- BarTrail Helpers ----------
 
     def _calculate_bar_trail_long(self, current_sl: float) -> float:
-        """BarTrail: lowest(low, N)[1] — по закрытым барам, без текущего."""
+        """BarTrail: lowest(low, N)[1]"""
         try:
             lb = int(getattr(self.config, "trail_lookback", 50))
             if lb <= 0 or not hasattr(self.api, "get_klines"):
@@ -197,18 +195,17 @@ class TrailEngine:
             kl = self.api.get_klines(self.config.symbol, tf, lb + 2) or []
             if len(kl) < lb + 1:
                 return current_sl
-            lows = [float(c["low"]) for c in kl[1:lb+1]]  # исключаем текущий бар [0]
+            lows = [float(c["low"]) for c in kl[1:lb+1]]
             min_low = min(lows) if lows else current_sl
             buf = float(getattr(self.config, "trail_buf_ticks", 40)) * self._tick_size()
             bar_sl = min_low - buf
-            # стоп не опускаем
             return max(bar_sl, current_sl)
         except Exception as e:
             print(f"Error calculating bar trail long: {e}")
             return current_sl
 
     def _calculate_bar_trail_short(self, current_sl: float) -> float:
-        """BarTrail: highest(high, N)[1] — по закрытым барам, без текущего."""
+        """BarTrail: highest(high, N)[1]"""
         try:
             lb = int(getattr(self.config, "trail_lookback", 50))
             if lb <= 0 or not hasattr(self.api, "get_klines"):
@@ -217,18 +214,19 @@ class TrailEngine:
             kl = self.api.get_klines(self.config.symbol, tf, lb + 2) or []
             if len(kl) < lb + 1:
                 return current_sl
-            highs = [float(c["high"]) for c in kl[1:lb+1]]  # исключаем текущий бар [0]
+            highs = [float(c["high"]) for c in kl[1:lb+1]]
             max_high = max(highs) if highs else current_sl
             buf = float(getattr(self.config, "trail_buf_ticks", 40)) * self._tick_size()
             bar_sl = max_high + buf
-            # стоп не поднимаем
             return min(bar_sl, current_sl)
         except Exception as e:
             print(f"Error calculating bar trail short: {e}")
             return current_sl
 
+    # ---------- Общие ----------
+
     def _update_stop_loss(self, position: Dict, new_sl: float) -> bool:
-        """Единый апдейт SL c округлением к тику и синхронизацией state."""
+        """Апдейт SL c округлением к тику"""
         try:
             tick = self._tick_size()
             new_sl = round_price(float(new_sl), tick)
@@ -236,7 +234,6 @@ class TrailEngine:
             if not self.api:
                 return False
 
-            # приоритетный путь: позиционный апдейт SL
             if hasattr(self.api, "update_position_stop_loss"):
                 ok = self.api.update_position_stop_loss(self.config.symbol, new_sl)
                 if ok:
@@ -246,7 +243,6 @@ class TrailEngine:
                     print(f"[TRAIL] SL -> {new_sl:.4f}")
                     return True
 
-            # запасной путь: модификация ордера/условного
             if hasattr(self.api, "modify_order"):
                 _ = self.api.modify_order(symbol=position.get("symbol", self.config.symbol), stop_loss=new_sl)
                 position["stop_loss"] = new_sl
@@ -255,7 +251,6 @@ class TrailEngine:
                 print(f"[TRAIL] SL -> {new_sl:.4f}")
                 return True
 
-            # если вообще ничего нет — обновим локально
             position["stop_loss"] = new_sl
             if hasattr(self.state, "set_position"):
                 self.state.set_position(position)
@@ -267,29 +262,13 @@ class TrailEngine:
             return False
 
     def _tick_size(self) -> float:
-        """Единый источник размера тика."""
         try:
             return float(getattr(self.config, "tick_size", 0.01) or 0.01)
         except Exception:
             return 0.01
 
     def _tf(self) -> str:
-        """Единый источник таймфрейма для bar-trail (совместимо с Config.interval)."""
         try:
             return str(getattr(self.config, "interval", "15") or "15")
         except Exception:
             return "15"
-
-    # (необязательный консольный лог для отладки)
-    def _log_trailing_update(self, position: Dict, new_sl: float):
-        try:
-            print({
-                "ts": datetime.utcnow().isoformat(),
-                "symbol": position.get("symbol", self.config.symbol),
-                "dir": position.get("direction"),
-                "old_sl": position.get("stop_loss"),
-                "new_sl": new_sl,
-                "action": "trailing_update"
-            })
-        except Exception:
-            pass
