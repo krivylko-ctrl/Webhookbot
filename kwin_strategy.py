@@ -14,7 +14,7 @@ from state_manager import StateManager
 from trail_engine import TrailEngine
 from analytics import TradingAnalytics
 from database import Database
-# ⬇️ ДОБАВЛЕНО: точные хелперы округления к тику (для 1:1 с Pine)
+# точные хелперы округления к тику (1:1 с Pine)
 from utils_round import round_price, round_qty, round_to_tick, floor_to_tick, ceil_to_tick
 
 
@@ -271,8 +271,8 @@ class KWINStrategy:
         ref_high = float(self.candles_15m[L]["high"])
         cond_pivot = self._is_prev_pivot_high(L, 1)
         cond_break = float(curr["high"]) > ref_high
-        cond_close = float(curr["open"]) < ref_high and float(curr["close"]) < ref_high
-        if cond_pivot and cond_break and cond_close:
+        cond_close = float(curr["open"]) < ref_high и float(curr["close"]) < ref_high
+        if cond_pivot и cond_break и cond_close:
             return self._check_bear_sfp_quality(curr, {"high": ref_high}) if getattr(self.config, "use_sfp_quality", True) else True
         return False
 
@@ -395,9 +395,9 @@ class KWINStrategy:
 
             raw_sl = float(self.candles_15m[1]["low"])
 
-            # ⬇️ ИЗМЕНЕНО: Pine-точное округление
-            entry = round_to_tick(float(price), self.tick_size)          # к ближайшему тику
-            sl    = floor_to_tick(raw_sl, self.tick_size)                # вниз (для long)
+            # Pine-точное округление
+            entry = round_to_tick(float(price), self.tick_size)
+            sl    = floor_to_tick(raw_sl, self.tick_size)
             stop_size = entry - sl
             if stop_size <= 0:
                 return
@@ -460,9 +460,9 @@ class KWINStrategy:
 
             raw_sl = float(self.candles_15m[1]["high"])
 
-            # ⬇️ ИЗМЕНЕНО: Pine-точное округление
-            entry = round_to_tick(float(price), self.tick_size)          # к ближайшему тику
-            sl    = ceil_to_tick(raw_sl, self.tick_size)                 # вверх (для short)
+            # Pine-точное округление
+            entry = round_to_tick(float(price), self.tick_size)
+            sl    = ceil_to_tick(raw_sl, self.tick_size)
             stop_size = sl - entry
             if stop_size <= 0:
                 return
@@ -519,6 +519,8 @@ class KWINStrategy:
 
     # ---------- ТРЕЙЛИНГ ----------
 
+    # ---------- ТРЕЙЛИНГ ----------
+
     def _get_bar_extremes_for_trailing(self, current_price: float) -> Tuple[float, float]:
         try:
             if getattr(self.config, "use_intrabar", True) and self.candles_1m:
@@ -563,7 +565,10 @@ class KWINStrategy:
                     rr_alt = rr_last if basis == "extremum" else rr_ext
 
                     try:
-                        print(f"[ARM CHECK] risk={risk:.4f} rr_ext={rr_ext:.3f} rr_last={rr_last:.3f} need={rr_need} basis={basis}")
+                        print(
+                            f"[ARM CHECK] risk={risk:.4f} rr_ext={rr_ext:.3f} rr_last={rr_last:.3f} "
+                            f"need={rr_need} basis={basis}"
+                        )
                     except Exception:
                         pass
 
@@ -572,9 +577,13 @@ class KWINStrategy:
                         position["armed"] = True
                         if self.state:
                             self.state.set_position(position)
-                        print(f"[ARM] enabled (hit {rr_need}R; used={basis}, rr_now={rr_now:.3f}, rr_alt={rr_alt:.3f})")
+                        print(
+                            f"[ARM] enabled (hit {rr_need}R; used={basis}, "
+                            f"rr_now={rr_now:.3f}, rr_alt={rr_alt:.3f})"
+                        )
 
             if not armed:
+                # ещё рано — ждём условия ARM
                 return
 
             # -------- якорь от экстремума --------
@@ -592,25 +601,29 @@ class KWINStrategy:
             offset_dist = entry * offset_perc
 
             if direction == "long":
-                # ⬇️ ИЗМЕНЕНО: безопасное округление вниз для long
+                # безопасное округление вниз для long
                 candidate = floor_to_tick(anchor - trail_dist - offset_dist, self.tick_size)
                 if candidate > sl:
                     self._update_stop_loss(position, candidate)
                 else:
                     try:
-                        print(f"[TRAIL SKIP] long: candidate={candidate:.4f} <= sl={sl:.4f} "
-                              f"(anchor={anchor:.4f}, trail%={trail_perc*100:.2f}, off%={offset_perc*100:.2f})")
+                        print(
+                            f"[TRAIL SKIP] long: candidate={candidate:.4f} <= sl={sl:.4f} "
+                            f"(anchor={anchor:.4f}, trail%={trail_perc*100:.2f}, off%={offset_perc*100:.2f})"
+                        )
                     except Exception:
                         pass
             else:
-                # ⬇️ ИЗМЕНЕНО: безопасное округление вверх для short
+                # безопасное округление вверх для short
                 candidate = ceil_to_tick(anchor + trail_dist + offset_dist, self.tick_size)
                 if candidate < sl:
                     self._update_stop_loss(position, candidate)
                 else:
                     try:
-                        print(f"[TRAIL SKIP] short: candidate={candidate:.4f} >= sl={sl:.4f} "
-                              f"(anchor={anchor:.4f}, trail%={trail_perc*100:.2f}, off%={offset_perc*100:.2f})")
+                        print(
+                            f"[TRAIL SKIP] short: candidate={candidate:.4f} >= sl={sl:.4f} "
+                            f"(anchor={anchor:.4f}, trail%={trail_perc*100:.2f}, off%={offset_perc*100:.2f})"
+                        )
                     except Exception:
                         pass
         except Exception as e:
@@ -622,6 +635,7 @@ class KWINStrategy:
             if not self.api:
                 return False
 
+            # современный v5-хук (позиционный SL)
             if hasattr(self.api, "update_position_stop_loss"):
                 ok = self.api.update_position_stop_loss(self.symbol, new_sl)
                 if ok:
@@ -631,6 +645,7 @@ class KWINStrategy:
                     print(f"[TRAIL] SL -> {new_sl:.4f}")
                     return True
 
+            # фолбэк — модификация ордера (paper / совместимость)
             if hasattr(self.api, "modify_order"):
                 _ = self.api.modify_order(symbol=position["symbol"], stop_loss=new_sl)
                 position["stop_loss"] = new_sl
@@ -638,6 +653,7 @@ class KWINStrategy:
                     self.state.set_position(position)
                 print(f"[TRAIL] SL -> {new_sl:.4f}")
                 return True
+
             return False
         except Exception as e:
             print(f"[update_stop_loss] {e}")
