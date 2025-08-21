@@ -2,6 +2,8 @@ from typing import Dict, Any
 import json
 import os
 
+# -------------------- ENV helpers --------------------
+
 def env(name: str, default: str | None = None) -> str:
     v = os.getenv(name, default)
     return v if v is not None else ""
@@ -20,6 +22,11 @@ def must_have():
     if missing:
         raise RuntimeError("Missing/invalid env: " + ", ".join(missing))
 
+
+# =====================================================
+#                    CONFIG CLASS
+# =====================================================
+
 class Config:
     """Конфигурация стратегии KWIN (эквивалент TV inputs)"""
 
@@ -27,20 +34,24 @@ class Config:
         # === ОСНОВНЫЕ ПАРАМЕТРЫ СТРАТЕГИИ ===
         self.symbol       = SYMBOL
         self.market_type  = BYBIT_ACCOUNT_TYPE or "linear"   # синхронизируем с env (по умолч. linear)
-        self.risk_reward  = 1.3
+        self.interval     = "15"                              # добавлено: базовой ТФ для сигналов/графика
+
+        # Риск/TP
+        # допускаем переопределение через ENV
+        self.risk_reward  = float(env("RISK_REWARD", "1.3"))
         self.sfp_len      = 2
-        self.risk_pct     = 3.0
+        self.risk_pct     = float(env("RISK_PCT", "3.0"))
 
         # === SMART TRAILING ===
-        self.enable_smart_trail     = True
-        self.trailing_perc          = 0.5    # в процентах
-        self.trailing_offset_perc   = 0.4    # в процентах (ИСПОЛЬЗУЕМ ЭТО)
+        self.enable_smart_trail     = env("ENABLE_SMART_TRAIL", "true").lower() not in ("0", "false", "no")
+        self.trailing_perc          = float(env("TRAILING_PERC", "0.5"))    # в процентах
+        self.trailing_offset_perc   = float(env("TRAILING_OFFSET_PERC", "0.4"))  # в процентах (ИСПОЛЬЗУЕМ ЭТО)
         # оставили trailing_offset для обратной совместимости, но не используем
         self.trailing_offset        = self.trailing_offset_perc
 
         # ARM (активация трейла после достижения RR)
-        self.use_arm_after_rr = True
-        self.arm_rr           = 0.5          # в R
+        self.use_arm_after_rr = env("USE_ARM_AFTER_RR", "true").lower() not in ("0", "false", "no")
+        self.arm_rr           = float(env("ARM_RR", "0.5"))      # в R
         self.arm_rr_basis     = "extremum"   # "extremum" | "last"
 
         # Источники цены (для логики и для триггера SL/TP в bt/live)
@@ -95,15 +106,19 @@ class Config:
     # ---------- нормализация и зависимости ----------
 
     def _update_days_back(self):
-        if str(self.period_choice) == "30":
+        pc = str(self.period_choice)
+        if pc == "30":
             self.days_back = 30
-        elif str(self.period_choice) == "60":
+        elif pc == "60":
             self.days_back = 60
-        elif str(self.period_choice) == "180":
+        elif pc == "180":
             self.days_back = 180
         else:
             # дефолт
-            self.days_back = int(self.days_back or 30)
+            try:
+                self.days_back = int(self.days_back or 30)
+            except Exception:
+                self.days_back = 30
 
     def _normalize_derived(self):
         # close_back_pct в [0..1]
@@ -118,33 +133,46 @@ class Config:
             self.close_back_pct = 1.0
 
         # trailing_offset_perc — берем из совместимого поля, если UI прислал старое имя
-        if self.trailing_offset is not None:
-            # если кто-то обновил только trailing_offset — синхронизируем
-            self.trailing_offset_perc = float(self.trailing_offset)
+        try:
+            if self.trailing_offset is not None:
+                # если кто-то обновил только trailing_offset — синхронизируем
+                self.trailing_offset_perc = float(self.trailing_offset)
+        except Exception:
+            pass
 
         # здравые дефолты шагов для ETH/BTC (чтобы не залипать на округлениях)
         sym = (self.symbol or "").upper()
-        if sym in ("ETHUSDT","BTCUSDT"):
+        if sym in ("ETHUSDT", "BTCUSDT"):
             self.qty_step = 0.001
             self.min_order_qty = 0.001
             self.tick_size = 0.01
 
         # строковые поля к нижнему регистру + вайтлист
         self.price_for_logic      = (self.price_for_logic or "last").lower()
-        if self.price_for_logic not in ("last","mark"):
+        if self.price_for_logic not in ("last", "mark"):
             self.price_for_logic = "last"
         self.trigger_price_source = (self.trigger_price_source or "last").lower()
-        if self.trigger_price_source not in ("last","mark"):
+        if self.trigger_price_source not in ("last", "mark"):
             self.trigger_price_source = "last"
         self.arm_rr_basis = (self.arm_rr_basis or "extremum").lower()
-        if self.arm_rr_basis not in ("extremum","last"):
+        if self.arm_rr_basis not in ("extremum", "last"):
             self.arm_rr_basis = "extremum"
 
-        # числа
-        try: self.trailing_perc = float(self.trailing_perc)
-        except: self.trailing_perc = 0.5
-        try: self.trailing_offset_perc = float(self.trailing_offset_perc)
-        except: self.trailing_offset_perc = 0.4
+        # числа (страхуемся от строк)
+        try:
+            self.trailing_perc = float(self.trailing_perc)
+        except Exception:
+            self.trailing_perc = 0.5
+        try:
+            self.trailing_offset_perc = float(self.trailing_offset_perc)
+        except Exception:
+            self.trailing_offset_perc = 0.4
+
+        # interval — строка
+        try:
+            self.interval = str(self.interval)
+        except Exception:
+            self.interval = "15"
 
     # ---------- load/save ----------
 
@@ -165,6 +193,7 @@ class Config:
             print(f"Error saving config: {e}")
 
     def _apply_config_data(self, data: Dict[str, Any]):
+        # аккуратно обновляем только известные атрибуты
         for key, value in data.items():
             if hasattr(self, key):
                 setattr(self, key, value)
@@ -178,10 +207,12 @@ class Config:
     # ---------- экспорт ----------
 
     def to_dict(self) -> Dict[str, Any]:
+        """Экспорт полного набора настроек для UI/сохранения в JSON."""
         return {
             # базовые
             "symbol": self.symbol,
             "market_type": self.market_type,
+            "interval": str(self.interval),
             "risk_reward": self.risk_reward,
             "sfp_len": self.sfp_len,
             "risk_pct": self.risk_pct,
@@ -190,6 +221,7 @@ class Config:
             "enable_smart_trail": self.enable_smart_trail,
             "trailing_perc": self.trailing_perc,
             "trailing_offset_perc": self.trailing_offset_perc,
+            "trailing_offset": self.trailing_offset,  # совместимость
             "use_arm_after_rr": self.use_arm_after_rr,
             "arm_rr": self.arm_rr,
             "arm_rr_basis": self.arm_rr_basis,
@@ -200,7 +232,7 @@ class Config:
 
             # интрабар
             "use_intrabar": self.use_intrabar,
-            "intrabar_tf": self.intrabar_tf,
+            "intrabar_tf": str(self.intrabar_tf),
             "intrabar_pull_limit": self.intrabar_pull_limit,
             "smooth_intrabar": self.smooth_intrabar,
             "intrabar_steps": self.intrabar_steps,
@@ -217,6 +249,8 @@ class Config:
             "latency_ms": self.latency_ms,
 
             # маркет/ограничения
+            "limit_qty_enabled": self.limit_qty_enabled,
+            "max_qty_manual": self.max_qty_manual,
             "taker_fee_rate": self.taker_fee_rate,
             "min_net_profit": self.min_net_profit,
             "min_order_qty": self.min_order_qty,
@@ -227,8 +261,6 @@ class Config:
             "use_bar_trail": self.use_bar_trail,
             "trail_lookback": self.trail_lookback,
             "trail_buf_ticks": self.trail_buf_ticks,
-            "limit_qty_enabled": self.limit_qty_enabled,
-            "max_qty_manual": self.max_qty_manual,
         }
 
     # ---------- UI definitions (по желанию дополни в своём стеке) ----------
@@ -250,6 +282,7 @@ class Config:
             "trigger_price_source": {"type":"select","label":"Trigger price source","options":["last","mark"],"value":self.trigger_price_source},
 
             "use_intrabar":        {"type":"bool","label":"Use 1m intrabar trailing","value":self.use_intrabar},
+            "intrabar_tf":         {"type":"select","label":"Intrabar TF","options":["1","3","5"],"value":str(self.intrabar_tf)},
             "intrabar_pull_limit": {"type":"int","label":"1m history limit","min":200,"max":2000,"step":100,"value":self.intrabar_pull_limit},
             "smooth_intrabar":     {"type":"bool","label":"Smooth intrabar (micro-steps)","value":self.smooth_intrabar},
             "intrabar_steps":      {"type":"int","label":"Micro-steps per 1m","min":1,"max":12,"step":1,"value":self.intrabar_steps},
