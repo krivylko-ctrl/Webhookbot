@@ -23,8 +23,7 @@ class KWINStrategy:
 
     def __init__(self, config: Config, api=None, state_manager: StateManager=None, db: Database=None, **kwargs):
     # обратная совместимость с вызовами вида bybit_api=...
-        if api is None and "bybit_api" in kwargs:
-            api = kwargs.get("bybit_api")
+           api = api or kwargs.get("bybit_api")
 
         self.config = config
         self.api = api
