@@ -235,75 +235,120 @@ class KWINStrategy:
         elif bear and self.can_enter_short:
             self._process_short_entry()
 
-    # --- SFP (pine-exact) ---
+    # --- SFP (pine-exact) -------------------------------------------------
 
+    def _pivot_low_value(self, left: int, right: int = 1) -> Optional[float]:
+        """
+        Pine-эквивалент ta.pivotlow(low, left, right) на баре 0.
+        Пивот находится на баре [right] и должен быть минимумом окна из (left+right+1) баров.
+        Порядок свечей у нас DESC: 0=текущий, 1=предыдущий, ...
+        Окно -> индексы [0 .. left+right]; центр -> индекс 'right'.
+        """
+        n = int(left) + int(right) + 1
+        if len(self.candles_15m) < n:
+            return None
+        lows = [float(self.candles_15m[i]["low"]) for i in range(0, n)]
+        center = lows[int(right)]
+        return center if center == min(lows) else None
+
+    def _pivot_high_value(self, left: int, right: int = 1) -> Optional[float]:
+        """Pine-эквивалент ta.pivothigh(high, left, right) на баре 0 (см. комментарий выше)."""
+        n = int(left) + int(right) + 1
+        if len(self.candles_15m) < n:
+            return None
+        highs = [float(self.candles_15m[i]["high"]) for i in range(0, n)]
+        center = highs[int(right)]
+        return center if center == max(highs) else None
+
+    # legacy-хелперы (на случай вызовов из другого кода)
     def _is_prev_pivot_low(self, left: int, right: int = 1) -> bool:
-        need = left + right + 1
-        if len(self.candles_15m) < (need + 1):
-            return False
-        lows = [float(self.candles_15m[i]["low"]) for i in range(0, 1 + left + 1)]
-        pivot = float(self.candles_15m[1]["low"])
-        return pivot == min(lows)
+        return self._pivot_low_value(left, right) is not None
 
     def _is_prev_pivot_high(self, left: int, right: int = 1) -> bool:
-        need = left + right + 1
-        if len(self.candles_15m) < (need + 1):
-            return False
-        highs = [float(self.candles_15m[i]["high"]) for i in range(0, 1 + left + 1)]
-        pivot = float(self.candles_15m[1]["high"])
-        return pivot == max(highs)
+        return self._pivot_high_value(left, right) is not None
 
     def _detect_bull_sfp(self) -> bool:
+        """
+        Бычий SFP: текущий бар (0) пробивает вниз уровень LOW пивота (пивот на баре [1])
+        и закрывается выше этого уровня.
+        """
         L = int(getattr(self.config, "sfp_len", 2))
-        if len(self.candles_15m) < (L + 2):
+        if len(self.candles_15m) < (L + 2):  # left + right + 1
             return False
+
         curr = self.candles_15m[0]
-        ref_low = float(self.candles_15m[L]["low"])
-        cond_pivot = self._is_prev_pivot_low(L, 1)
-        cond_break = float(curr["low"]) < ref_low
-        cond_close = float(curr["open"]) > ref_low and float(curr["close"]) > ref_low
-        if cond_pivot and cond_break and cond_close:
-            return self._check_bull_sfp_quality(curr, {"low": ref_low}) if getattr(self.config, "use_sfp_quality", True) else True
+        ref_low = self._pivot_low_value(L, 1)
+        if ref_low is None:
+            return False
+
+        cond_break = float(curr["low"]) < float(ref_low)
+        cond_close = float(curr["close"]) > float(ref_low)   # важное ослабление: open>ref не требуем
+        if cond_break and cond_close:
+            return self._check_bull_sfp_quality(curr, ref_low) if getattr(self.config, "use_sfp_quality", True) else True
         return False
 
     def _detect_bear_sfp(self) -> bool:
+        """
+        Медвежий SFP: текущий бар (0) пробивает вверх уровень HIGH пивота (пивот на баре [1])
+        и закрывается ниже этого уровня.
+        """
         L = int(getattr(self.config, "sfp_len", 2))
         if len(self.candles_15m) < (L + 2):
             return False
+
         curr = self.candles_15m[0]
-        ref_high = float(self.candles_15m[L]["high"])
-        cond_pivot = self._is_prev_pivot_high(L, 1)
-        cond_break = float(curr["high"]) > ref_high
-        cond_close = float(curr["open"]) < ref_high and float(curr["close"]) < ref_high
-        if cond_pivot and cond_break and cond_close:
-            return self._check_bear_sfp_quality(curr, {"high": ref_high}) if getattr(self.config, "use_sfp_quality", True) else True
+        ref_high = self._pivot_high_value(L, 1)
+        if ref_high is None:
+            return False
+
+        cond_break = float(curr["high"]) > float(ref_high)
+        cond_close = float(curr["close"]) < float(ref_high)
+        if cond_break and cond_close:
+            return self._check_bear_sfp_quality(curr, ref_high) if getattr(self.config, "use_sfp_quality", True) else True
         return False
 
-    def _check_bull_sfp_quality(self, current: dict, pivot: dict) -> bool:
-        ref_low = float(pivot["low"])
-        low = float(current["low"])
-        close = float(current["close"])
-        wick_depth = max(ref_low - low, 0.0)
-        m_tick = float(self.tick_size or 0.01)
-        wick_ticks = wick_depth / m_tick
-        if wick_ticks < float(getattr(self.config, "wick_min_ticks", 7)):
+    def _check_bull_sfp_quality(self, current: dict, pivot_ref) -> bool:
+        """
+        Качество бычьего SFP:
+          • глубина «прокола» в тиках >= wick_min_ticks
+          • закрытие вернулось не меньше, чем на close_back_pct долю от глубины
+        pivot_ref — число (уровень low пивота) или dict с ключом 'low'.
+        """
+        try:
+            ref_low = float(pivot_ref["low"]) if isinstance(pivot_ref, dict) else float(pivot_ref)
+            low = float(current["low"])
+            close = float(current["close"])
+            wick_depth = max(ref_low - low, 0.0)
+            if wick_depth <= 0:
+                return False
+            m_tick = float(self.tick_size or 0.01)
+            wick_ticks = wick_depth / m_tick
+            if wick_ticks < float(getattr(self.config, "wick_min_ticks", 7)):
+                return False
+            cb = float(getattr(self.config, "close_back_pct", 1.0))
+            required = wick_depth * cb
+            return (close - low) >= required
+        except Exception:
             return False
-        cb = float(getattr(self.config, "close_back_pct", 1.0))
-        required = wick_depth * cb
-        return (close - low) >= required
 
-    def _check_bear_sfp_quality(self, current: dict, pivot: dict) -> bool:
-        ref_high = float(pivot["high"])
-        high = float(current["high"])
-        close = float(current["close"])
-        wick_depth = max(high - ref_high, 0.0)
-        m_tick = float(self.tick_size or 0.01)
-        wick_ticks = wick_depth / m_tick
-        if wick_ticks < float(getattr(self.config, "wick_min_ticks", 7)):
+    def _check_bear_sfp_quality(self, current: dict, pivot_ref) -> bool:
+        """Качество медвежьего SFP — зеркально бычьему."""
+        try:
+            ref_high = float(pivot_ref["high"]) if isinstance(pivot_ref, dict) else float(pivot_ref)
+            high = float(current["high"])
+            close = float(current["close"])
+            wick_depth = max(high - ref_high, 0.0)
+            if wick_depth <= 0:
+                return False
+            m_tick = float(self.tick_size or 0.01)
+            wick_ticks = wick_depth / m_tick
+            if wick_ticks < float(getattr(self.config, "wick_min_ticks", 7)):
+                return False
+            cb = float(getattr(self.config, "close_back_pct", 1.0))
+            required = wick_depth * cb
+            return (high - close) >= required
+        except Exception:
             return False
-        cb = float(getattr(self.config, "close_back_pct", 1.0))
-        required = wick_depth * cb
-        return (high - close) >= required
 
     # ---------- ОРДЕРА / ВХОД ----------
 
