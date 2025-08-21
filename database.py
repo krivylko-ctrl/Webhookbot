@@ -321,3 +321,17 @@ class Database:
             """)
             self.conn.commit()
         self._init_schema()
+
+    # --------------------- Reset для Backtest ---------------------
+    def reset_for_backtest(self):
+        """Полностью очищает БД перед новым бэктестом"""
+        with self._lock:
+            c = self.conn.cursor()
+            c.executescript("""
+                DELETE FROM trades;
+                DELETE FROM equity_history;
+                DELETE FROM bot_state;
+                DELETE FROM config;
+                DELETE FROM logs;
+            """)
+            self.conn.commit()
