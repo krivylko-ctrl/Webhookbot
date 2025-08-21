@@ -32,26 +32,26 @@ except Exception as e:
     st.info("Добавьте переменные окружения: BYBIT_API_KEY, BYBIT_API_SECRET")
     st.stop()
 
+
 @st.cache_resource
 def init_components():
     config = Config()
     db = Database()
     state_manager = StateManager(db)
 
-    # Прокидываем смарт-трейл/ARM из env (если есть)
-    config.enable_smart_trail      = bool(getattr(cfg, "ENABLE_SMART_TRAIL", True))
-    config.trailing_perc           = float(getattr(cfg, "TRAILING_PERC", 0.5))
-    config.trailing_offset_perc    = float(getattr(cfg, "TRAILING_OFFSET_PERC", 0.4))
-    config.trailing_offset         = float(getattr(cfg, "TRAILING_OFFSET_PERC", 0.4))
+    # Smart Trailing / ARM — строго как в Pine
+    config.enable_smart_trail   = bool(getattr(cfg, "ENABLE_SMART_TRAIL", True))
+    config.trailing_perc        = float(getattr(cfg, "TRAILING_PERC", 0.5))
+    config.trailing_offset_perc = float(getattr(cfg, "TRAILING_OFFSET_PERC", 0.4))
 
-    config.use_arm_after_rr        = bool(getattr(cfg, "USE_ARM_AFTER_RR", True))
-    config.arm_rr                  = float(getattr(cfg, "ARM_RR", 0.5))
-    config.arm_rr_basis            = str(getattr(cfg, "ARM_RR_BASIS", getattr(config, "arm_rr_basis", "extremum"))).lower()
+    config.use_arm_after_rr     = bool(getattr(cfg, "USE_ARM_AFTER_RR", True))
+    config.arm_rr               = float(getattr(cfg, "ARM_RR", 0.5))
+    config.arm_rr_basis         = str(getattr(cfg, "ARM_RR_BASIS", getattr(config, "arm_rr_basis", "extremum"))).lower()
     if config.arm_rr_basis not in ("extremum", "last"):
         config.arm_rr_basis = "extremum"
 
-    config.risk_pct                = float(getattr(cfg, "RISK_PCT", getattr(config, "risk_pct", 3.0)))
-    config.risk_reward             = float(getattr(cfg, "RISK_REWARD", getattr(config, "risk_reward", 1.3)))
+    config.risk_pct             = float(getattr(cfg, "RISK_PCT", getattr(config, "risk_pct", 3.0)))
+    config.risk_reward          = float(getattr(cfg, "RISK_REWARD", getattr(config, "risk_reward", 1.3)))
 
     if hasattr(cfg, "SYMBOL"):
         config.symbol = cfg.SYMBOL
@@ -86,13 +86,13 @@ def _bg_bot_loop(bybit_api, strategy: KWINStrategy, state_manager: StateManager,
 
     while getattr(st.session_state, "bot_running", False):
         try:
-            # 0) Подтянем «текущую цену» (для ARM/трейлинга)
+            # 0) Подтягиваем цену (для ARM/трейлинга)
             try:
                 _ = bybit_api.get_ticker(config.symbol)
             except Exception:
                 pass
 
-            # 1) Закрытые 15m бары (одно срабатывание на бар)
+            # 1) Закрытые 15m бары
             try:
                 kl = bybit_api.get_klines(config.symbol, "15", 3) if hasattr(bybit_api, "get_klines") else []
                 if kl:
@@ -113,7 +113,7 @@ def _bg_bot_loop(bybit_api, strategy: KWINStrategy, state_manager: StateManager,
             except Exception:
                 pass
 
-            # 2) Закрытые интрабар бары (обычно 1m) — ДЛЯ СМАРТ-ТРЕЙЛА
+            # 2) Интрабар (обычно 1m) — для Smart Trail
             try:
                 intrabar_tf = str(getattr(config, "intrabar_tf", "1"))
                 kl1 = bybit_api.get_klines(config.symbol, intrabar_tf, 3) if hasattr(bybit_api, "get_klines") else []
@@ -135,13 +135,13 @@ def _bg_bot_loop(bybit_api, strategy: KWINStrategy, state_manager: StateManager,
             except Exception:
                 pass
 
-            # 3) Доп. подстраховка — обновим трейлинг (если позиция есть)
+            # 3) Обновление трейлинга
             try:
                 strategy.process_trailing()
             except Exception:
                 pass
 
-            # 4) Периодически обновляем equity (раз в 30 итераций)
+            # 4) Периодическое обновление equity
             loop_i += 1
             if loop_i % 30 == 0:
                 try:
@@ -225,7 +225,7 @@ def main():
             st.write(f"**ARM basis:** {config.arm_rr_basis}")
             st.write(f"**ARM RR:** {config.arm_rr}")
 
-        # Отладка трейла (живой срез)
+        # Debug: Smart Trail
         with st.expander("🧪 Debug: Trailing state"):
             try:
                 d = strategy.get_trailing_debug()
@@ -236,7 +236,7 @@ def main():
             except Exception as e:
                 st.caption(f"нет данных ({e})")
 
-    # Основная область
+    # Основные вкладки
     tab1, tab2, tab3, tab4 = st.tabs(["📊 Дашборд", "📈 График", "💰 Equity", "📋 Сделки"])
     with tab1:
         show_dashboard(db, state_manager, strategy)
@@ -353,6 +353,7 @@ def show_trades_table(db):
         st.dataframe(df[cols].round(4), use_container_width=True)
     else:
         st.info("Нет сделок для отображения")
+
 
 if __name__ == "__main__":
     main()
