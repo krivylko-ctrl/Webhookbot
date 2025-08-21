@@ -13,10 +13,10 @@ def _to_iso(ts) -> Optional[str]:
     if isinstance(ts, datetime):
         if ts.tzinfo is not None:
             ts = ts.astimezone(timezone.utc).replace(tzinfo=None)
-        return ts.isoformat(timespec="seconds")
+        return ts.replace(microsecond=0).isoformat()
     try:
         if isinstance(ts, (int, float)):
-            if ts > 1e12:
+            if ts > 1e12:  # миллисекунды
                 ts = ts / 1000.0
             dt = datetime.utcfromtimestamp(float(ts))
             return dt.replace(microsecond=0).isoformat()
@@ -161,13 +161,14 @@ class Database:
                 side        = tr.get("direction")
                 exit_price  = _f(trade_data.get("exit_price"), entry_price)
 
+                # === Net PnL с комиссиями ===
                 gross = (exit_price - entry_price) * qty if side == "long" else (entry_price - exit_price) * qty
                 fee_in  = entry_price * qty * fee_rate
                 fee_out = exit_price * qty * fee_rate
                 net_pnl = gross - (fee_in + fee_out)
 
                 rr = None
-                if stop_loss is not None and stop_loss != 0:
+                if stop_loss and stop_loss != 0:
                     risk = abs(entry_price - stop_loss)
                     if risk > 0:
                         rr = abs(exit_price - entry_price) / risk
