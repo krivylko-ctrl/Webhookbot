@@ -543,22 +543,36 @@ class KWINStrategy:
 
             bar_high, bar_low = self._get_bar_extremes_for_trailing(price)
 
+            # -------- ARM: считаем RR и по экстремуму, и по текущей цене --------
             armed = bool(position.get("armed", not getattr(self.config, "use_arm_after_rr", True)))
             if not armed and getattr(self.config, "use_arm_after_rr", True):
                 risk = abs(entry - sl)
                 if risk > 0:
+                    rr_ext = (bar_high - entry) / risk if direction == "long" else (entry - bar_low) / risk
+                    rr_last = (price - entry) / risk if direction == "long" else (entry - price) / risk
+
+                    rr_need = float(getattr(self.config, "arm_rr", 0.5))
                     basis = str(getattr(self.config, "arm_rr_basis", "extremum")).lower()
-                    rr_px = (bar_high if direction == "long" else bar_low) if basis == "extremum" else price
-                    rr = (rr_px - entry) / risk if direction == "long" else (entry - rr_px) / risk
-                    if rr >= float(getattr(self.config, "arm_rr", 0.5)):
+                    rr_now = rr_ext if basis == "extremum" else rr_last
+                    rr_alt = rr_last if basis == "extremum" else rr_ext
+
+                    try:
+                        print(f"[ARM CHECK] risk={risk:.4f} rr_ext={rr_ext:.3f} rr_last={rr_last:.3f} need={rr_need} basis={basis}")
+                    except Exception:
+                        pass
+
+                    if rr_now >= rr_need or rr_alt >= rr_need:
                         armed = True
                         position["armed"] = True
                         if self.state:
                             self.state.set_position(position)
-                        print(f"[ARM] armed at ≥{self.config.arm_rr}R, basis={basis}")
+                        print(f"[ARM] enabled (hit {rr_need}R; used={basis}, rr_now={rr_now:.3f}, rr_alt={rr_alt:.3f})")
+
             if not armed:
+                # ещё рано — ждём условия ARM
                 return
 
+            # -------- якорь от экстремума --------
             anchor = float(position.get("trail_anchor") or entry)
             anchor = max(anchor, bar_high) if direction == "long" else min(anchor, bar_low)
             if anchor != position.get("trail_anchor"):
@@ -566,6 +580,7 @@ class KWINStrategy:
                 if self.state:
                     self.state.set_position(position)
 
+            # -------- процентный трейл от entry + offset --------
             trail_perc = float(getattr(self.config, "trailing_perc", 0.5)) / 100.0
             offset_perc = float(getattr(self.config, "trailing_offset_perc", 0.4)) / 100.0
             trail_dist = entry * trail_perc
@@ -575,10 +590,22 @@ class KWINStrategy:
                 candidate = round_price(anchor - trail_dist - offset_dist, self.tick_size)
                 if candidate > sl:
                     self._update_stop_loss(position, candidate)
+                else:
+                    try:
+                        print(f"[TRAIL SKIP] long: candidate={candidate:.4f} <= sl={sl:.4f} "
+                              f"(anchor={anchor:.4f}, trail%={trail_perc*100:.2f}, off%={offset_perc*100:.2f})")
+                    except Exception:
+                        pass
             else:
                 candidate = round_price(anchor + trail_dist + offset_dist, self.tick_size)
                 if candidate < sl:
                     self._update_stop_loss(position, candidate)
+                else:
+                    try:
+                        print(f"[TRAIL SKIP] short: candidate={candidate:.4f} >= sl={sl:.4f} "
+                              f"(anchor={anchor:.4f}, trail%={trail_perc*100:.2f}, off%={offset_perc*100:.2f})")
+                    except Exception:
+                        pass
         except Exception as e:
             print(f"[smart_trailing] {e}")
 
