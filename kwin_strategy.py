@@ -351,7 +351,7 @@ class KWINStrategy:
         """
         try:
             # ограничения по окну бэктеста
-            if not self._is_in_backtest_window_utc(int(self.candles_15m[0]["timestamp"])) if self.candles_15m else False:
+            if self.candles_15m and not self._is_in_backtest_window_utc(int(self.candles_15m[0]["timestamp"])):
                 return
 
             # уже есть позиция — выходим
@@ -368,7 +368,7 @@ class KWINStrategy:
 
             # бычий интрабар-SFP
             if self.can_enter_long and ref_low is not None:
-                lo = float(m1["low"]); hi = float(m1["high"]); cl = float(m1["close"])
+                lo = float(m1["low"]); cl = float(m1["close"])
                 if (lo < float(ref_low)) and (cl > float(ref_low)):
                     # проверка качества — на минутной свече
                     if not getattr(self.config, "use_sfp_quality", True) or self._check_bull_sfp_quality(
@@ -379,7 +379,7 @@ class KWINStrategy:
 
             # медвежий интрабар-SFP
             if self.can_enter_short and ref_high is not None:
-                lo = float(m1["low"]); hi = float(m1["high"]); cl = float(m1["close"])
+                hi = float(m1["high"]); cl = float(m1["close"])
                 if (hi > float(ref_high)) and (cl < float(ref_high)):
                     if not getattr(self.config, "use_sfp_quality", True) or self._check_bear_sfp_quality(
                         {"high": hi, "close": cl}, ref_high
@@ -683,7 +683,7 @@ class KWINStrategy:
                     rr_need = float(getattr(self.config, "arm_rr", 0.5))
                     basis   = str(getattr(self.config, "arm_rr_basis", "extremum")).lower()
                     rr_now  = rr_ext if basis == "extremum" else rr_last
-                    rr_alt  = rr_last if basis == "extremum" else rr_ext
+                    rr_alt  = rr_last if basis == "extremум" else rr_ext
 
                     if rr_now >= rr_need or rr_alt >= rr_need:
                         armed = True
