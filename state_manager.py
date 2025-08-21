@@ -1,198 +1,190 @@
-import json
-from typing import Dict, Optional
+# state_manager.py
+from __future__ import annotations
+from typing import Dict, Optional, Any
 from datetime import datetime
+from threading import RLock
+
 from database import Database
 
+
 class StateManager:
-    """Управление состоянием торгового бота"""
-    
+    """
+    Потокобезопасный стор состояния бота.
+    Хранит:
+      • equity
+      • текущую позицию (direction, size, entry_price, stop_loss, take_profit, armed, trail_anchor, entry_time_ts, status)
+      • статус бота
+    Состояние периодически/при изменениях сохраняется в БД через Database.save_bot_state().
+    """
+
     def __init__(self, db: Database):
         self.db = db
-        self._current_position = None
-        self._equity = 100.0  # Начальный капитал
-        self._bot_status = "stopped"
-        
-        # Загружаем сохраненное состояние
+        self._lock = RLock()
+
+        self._equity: float = 100.0
+        self._bot_status: str = "stopped"
+        self._current_position: Optional[Dict[str, Any]] = None
+
         self._load_state()
-    
-    def _load_state(self):
-        """Загрузка сохраненного состояния"""
+
+    # ----------------- Persist -----------------
+
+    def _load_state(self) -> None:
+        """Загрузка сохранённого состояния из БД."""
         try:
-            state = self.db.get_bot_state()
-            if state:
-                self._current_position = state.get('position')
-                self._equity = state.get('equity', 100.0)
-                self._bot_status = state.get('status', 'stopped')
+            state = self.db.get_bot_state() or {}
+            with self._lock:
+                self._current_position = state.get("position") or None
+                self._equity = float(state.get("equity", 100.0))
+                self._bot_status = str(state.get("status", "stopped"))
         except Exception as e:
-            print(f"Error loading state: {e}")
-    
-    def _save_state(self):
-        """Сохранение текущего состояния"""
+            print(f"[StateManager] Error loading state: {e}")
+
+    def _save_state(self) -> None:
+        """Сохранение текущего состояния в БД."""
         try:
-            state = {
-                'position': self._current_position,
-                'equity': self._equity,
-                'status': self._bot_status,
-                'updated_at': datetime.now().isoformat()
-            }
-            self.db.save_bot_state(state)
-        except Exception as e:
-            print(f"Error saving state: {e}")
-    
-    def get_current_position(self) -> Optional[Dict]:
-        """Получить текущую позицию"""
-        return self._current_position
-    
-    def set_position(self, position: Dict):
-        """Установить новую позицию"""
-        self._current_position = position
-        self._save_state()
-    
-    def update_position_stop_loss(self, new_sl: float):
-        """Обновить стоп-лосс текущей позиции"""
-        if self._current_position:
-            self._current_position['stop_loss'] = new_sl
-            self._save_state()
-    
-    def update_position_armed(self, armed: bool):
-        """Обновить статус арминга позиции"""
-        if self._current_position:
-            self._current_position['armed'] = armed
-            self._save_state()
-    
-    def close_position(self, exit_price: float, exit_reason: str = "manual"):
-        """Закрыть текущую позицию"""
-        if self._current_position:
-            # Рассчитываем PnL
-            entry_price = self._current_position.get('entry_price')
-            quantity = self._current_position.get('size')
-            direction = self._current_position.get('direction')
-            
-            if entry_price and quantity:
-                if direction == 'long':
-                    pnl = (exit_price - entry_price) * quantity
-                else:
-                    pnl = (entry_price - exit_price) * quantity
-                
-                # Учитываем комиссии
-                commission = (entry_price + exit_price) * quantity * 0.00055
-                net_pnl = pnl - commission
-                
-                # Обновляем equity
-                self._equity += net_pnl
-                
-                # Сохраняем закрытую сделку
-                trade_data = {
-                    'symbol': self._current_position.get('symbol'),
-                    'direction': direction,
-                    'entry_price': entry_price,
-                    'exit_price': exit_price,
-                    'quantity': quantity,
-                    'pnl': net_pnl,
-                    'rr': self._calculate_rr(self._current_position, exit_price),
-                    'exit_reason': exit_reason,
-                    'exit_time': datetime.now(),
-                    'status': 'closed'
+            with self._lock:
+                payload = {
+                    "position": self._current_position,
+                    "equity": float(self._equity),
+                    "status": self._bot_status,
+                    "updated_at": datetime.utcnow().isoformat()
                 }
-                self.db.update_trade_exit(trade_data)
-            
-            # Очищаем позицию
-            self._current_position = None
-            self._save_state()
-    
-    def clear_position(self):
-        """Очистка текущей позиции"""
-        self._current_position = None
-        self._save_state()
-    
-    def _calculate_rr(self, position: Dict, exit_price: float) -> float:
-        """Расчет Risk/Reward ratio"""
-        try:
-            entry_price = position.get('entry_price')
-            stop_loss = position.get('stop_loss')
-            direction = position.get('direction')
-            
-            if not all([entry_price, stop_loss]):
-                return 0.0
-            
-            if direction == 'long':
-                risk = float(entry_price) - float(stop_loss)
-                reward = float(exit_price) - float(entry_price)
-            else:
-                risk = float(stop_loss) - float(entry_price)
-                reward = float(entry_price) - float(exit_price)
-            
-            if risk <= 0:
-                return 0.0
-            
-            return reward / risk
-        except:
-            return 0.0
-    
+            self.db.save_bot_state(payload)
+        except Exception as e:
+            print(f"[StateManager] Error saving state: {e}")
+
+    # ----------------- Equity -----------------
+
     def get_equity(self) -> float:
-        """Получить текущий equity"""
-        return self._equity
-    
-    def set_equity(self, equity: float):
-        """Установить equity"""
-        self._equity = equity
+        with self._lock:
+            return float(self._equity)
+
+    def set_equity(self, equity: float) -> None:
+        with self._lock:
+            self._equity = float(equity)
         self._save_state()
-    
+
+    # ----------------- Bot status -----------------
+
     def get_bot_status(self) -> str:
-        """Получить статус бота"""
-        return self._bot_status
-    
-    def set_bot_status(self, status: str):
-        """Установить статус бота"""
-        self._bot_status = status
+        with self._lock:
+            return self._bot_status
+
+    def set_bot_status(self, status: str) -> None:
+        with self._lock:
+            self._bot_status = str(status)
         self._save_state()
-    
+
+    # ----------------- Position (CRUD) -----------------
+
+    def get_current_position(self) -> Optional[Dict[str, Any]]:
+        with self._lock:
+            return None if self._current_position is None else dict(self._current_position)
+
+    def set_position(self, position: Optional[Dict[str, Any]]) -> None:
+        """Полная установка позиции. None — закрыть локально (без сделки)."""
+        with self._lock:
+            if position is None:
+                self._current_position = None
+            else:
+                pos = dict(position)
+                # дефолты/нормализация
+                pos.setdefault("status", "open")
+                pos.setdefault("armed", False)
+                pos.setdefault("entry_time_ts", int(datetime.utcnow().timestamp() * 1000))
+                if pos.get("trail_anchor") is None:
+                    pos["trail_anchor"] = pos.get("entry_price")
+                self._current_position = pos
+        self._save_state()
+
+    def clear_position(self) -> None:
+        with self._lock:
+            self._current_position = None
+        self._save_state()
+
+    # Удобные апдейтеры — используются TrailEngine/стратегией
+    def update_position_stop_loss(self, new_sl: float) -> None:
+        with self._lock:
+            if self._current_position:
+                self._current_position["stop_loss"] = float(new_sl)
+        self._save_state()
+
+    def update_position_armed(self, armed: bool) -> None:
+        with self._lock:
+            if self._current_position:
+                self._current_position["armed"] = bool(armed)
+        self._save_state()
+
+    def update_trail_anchor(self, anchor: float) -> None:
+        with self._lock:
+            if self._current_position:
+                self._current_position["trail_anchor"] = float(anchor)
+        self._save_state()
+
+    # ----------------- Close position -----------------
+
+    def close_position(self, exit_price: float, exit_reason: str = "manual") -> None:
+        """
+        Закрыть текущую позицию и синхронизировать это с БД.
+        PnL/ RR рассчитываются внутри Database.update_trade_exit() — здесь не дублируем расчёты.
+        """
+        pos = self.get_current_position()
+        if not pos:
+            return
+
+        # Обновляем запись о сделке в БД (закрываем последнюю открытую)
+        try:
+            self.db.update_trade_exit(
+                {
+                    "exit_price": float(exit_price),
+                    "exit_time": datetime.utcnow(),
+                    "exit_reason": exit_reason,
+                    "status": "closed",
+                }
+            )
+        except Exception as e:
+            print(f"[StateManager] Error closing trade in DB: {e}")
+
+        # Локально позицию очищаем и сохраняем снапшот состояния
+        self.clear_position()
+
+    # ----------------- Helpers -----------------
+
     def is_position_open(self) -> bool:
-        """Проверить открыта ли позиция"""
-        return self._current_position is not None
-    
+        with self._lock:
+            return self._current_position is not None
+
     def get_position_direction(self) -> Optional[str]:
-        """Получить направление позиции"""
-        if self._current_position:
-            return self._current_position.get('direction')
-        return None
-    
+        with self._lock:
+            return None if not self._current_position else self._current_position.get("direction")
+
     def get_position_entry_price(self) -> Optional[float]:
-        """Получить цену входа в позицию"""
-        if self._current_position:
-            return self._current_position.get('entry_price')
-        return None
-    
+        with self._lock:
+            return None if not self._current_position else self._current_position.get("entry_price")
+
     def get_position_stop_loss(self) -> Optional[float]:
-        """Получить стоп-лосс позиции"""
-        if self._current_position:
-            return self._current_position.get('stop_loss')
-        return None
-    
+        with self._lock:
+            return None if not self._current_position else self._current_position.get("stop_loss")
+
     def get_position_take_profit(self) -> Optional[float]:
-        """Получить тейк-профит позиции"""
-        if self._current_position:
-            return self._current_position.get('take_profit')
-        return None
-    
+        with self._lock:
+            return None if not self._current_position else self._current_position.get("take_profit")
+
     def get_position_size(self) -> Optional[float]:
-        """Получить размер позиции"""
-        if self._current_position:
-            return self._current_position.get('size')
-        return None
-    
+        with self._lock:
+            return None if not self._current_position else self._current_position.get("size")
+
     def is_position_armed(self) -> bool:
-        """Проверить заармлена ли позиция"""
-        if self._current_position:
-            return self._current_position.get('armed', False)
-        return False
-    
-    def get_state_summary(self) -> Dict:
-        """Получить сводку текущего состояния"""
-        return {
-            'equity': self._equity,
-            'bot_status': self._bot_status,
-            'position_open': self.is_position_open(),
-            'position': self._current_position,
-            'timestamp': datetime.now().isoformat()
-        }
+        with self._lock:
+            return False if not self._current_position else bool(self._current_position.get("armed", False))
+
+    def get_state_summary(self) -> Dict[str, Any]:
+        with self._lock:
+            return {
+                "equity": float(self._equity),
+                "bot_status": self._bot_status,
+                "position_open": self._current_position is not None,
+                "position": None if self._current_position is None else dict(self._current_position),
+                "timestamp": datetime.utcnow().isoformat(),
+            }
