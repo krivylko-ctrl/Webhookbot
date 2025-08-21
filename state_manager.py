@@ -12,7 +12,8 @@ class StateManager:
     Потокобезопасный стор состояния бота.
     Хранит:
       • equity
-      • текущую позицию (direction, quantity, entry_price, stop_loss, take_profit, armed, trail_anchor, entry_time_ts, status)
+      • текущую позицию (direction, quantity, entry_price, stop_loss, take_profit,
+        armed, trail_anchor, entry_time_ts, status)
       • статус бота
     Состояние периодически/при изменениях сохраняется в БД через Database.save_bot_state().
     """
@@ -89,15 +90,17 @@ class StateManager:
                 self._current_position = None
             else:
                 pos = dict(position)
-                # дефолты/нормализация
+                # Дефолты/нормализация
                 pos.setdefault("status", "open")
                 pos.setdefault("armed", False)
                 pos.setdefault("entry_time_ts", int(datetime.utcnow().timestamp() * 1000))
                 if pos.get("trail_anchor") is None:
                     pos["trail_anchor"] = pos.get("entry_price")
-                # унификация ключа size -> quantity
-                if "size" in pos:
+
+                # Унификация объёма: size -> quantity
+                if "size" in pos and "quantity" not in pos:
                     pos["quantity"] = pos.pop("size")
+
                 self._current_position = pos
         self._save_state()
 
@@ -130,13 +133,14 @@ class StateManager:
     def close_position(self, exit_price: float, exit_reason: str = "manual") -> None:
         """
         Закрыть текущую позицию и синхронизировать это с БД.
-        PnL/ RR рассчитываются внутри Database.update_trade_exit() — здесь не дублируем расчёты.
+        PnL / RR считаются в Database.update_trade_exit().
+        После закрытия — обновляем equity на величину чистого PnL последней сделки (реинвест).
         """
         pos = self.get_current_position()
         if not pos:
             return
 
-        # Обновляем запись о сделке в БД (закрываем последнюю открытую)
+        # Закрываем сделку в БД
         try:
             self.db.update_trade_exit(
                 {
@@ -150,7 +154,20 @@ class StateManager:
             print(f"[StateManager] Error closing trade in DB: {e}")
             return
 
-        # Локально позицию очищаем и сохраняем снапшот состояния
+        # Подтягиваем свежий PnL последней сделки и применяем его к equity (сложный процент)
+        try:
+            trades = self.db.get_recent_trades(limit=1)
+            if trades:
+                last = trades[0]
+                pnl = last.get("pnl")
+                if pnl is not None:
+                    with self._lock:
+                        self._equity = float(self._equity) + float(pnl)
+                    self._save_state()
+        except Exception as e:
+            print(f"[StateManager] Error applying PnL to equity: {e}")
+
+        # Локально чистим позицию
         self.clear_position()
 
     # ----------------- Helpers -----------------
