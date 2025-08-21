@@ -57,9 +57,9 @@ class KWINStrategy:
         self.analytics = TradingAnalytics()
 
         # служебное состояние
-        self.candles_15m: List[Dict] = []
-        self.candles_1m: List[Dict] = []
-        self.candles_1h: List[Dict] = []
+        self.candles_15m: List[Dict] = []   # DESC: [0]=самый свежий закрытый 15m
+        self.candles_1m: List[Dict] = []    # DESC
+        self.candles_1h: List[Dict] = []    # DESC
         self.last_processed_bar_ts: int = 0
         self.can_enter_long = True
         self.can_enter_short = True
@@ -154,7 +154,7 @@ class KWINStrategy:
             print(f"[on_bar_close_60m] {e}")
 
     def on_bar_close_1m(self, candle: Dict):
-        """Интрабар трейлинг (подтягиваем SL по минуткам)."""
+        """Интрабар трейлинг + возможные интрабар-входы (M1) по SFP."""
         try:
             self.candles_1m.insert(0, candle)
             lim = int(getattr(self.config, "intrabar_pull_limit", 1000) or 1000)
@@ -162,9 +162,15 @@ class KWINStrategy:
                 self.candles_1m = self.candles_1m[:lim]
             self._ensure_desc(self.candles_1m)
 
+            # 1) Трейл по минуткам
             pos = self.state.get_current_position() if self.state else None
             if pos and pos.get("status") == "open" and getattr(self.config, "use_intrabar", True):
                 self._update_smart_trailing(pos)
+
+            # 2) Интрабар-вход (если позиции нет): используем M1-бар вместо 15m-бара
+            if not pos and getattr(self.config, "use_intrabar_entries", True):
+                self._try_intrabar_entry_from_m1(candle)
+
         except Exception as e:
             print(f"[on_bar_close_1m] {e}")
 
@@ -241,7 +247,7 @@ class KWINStrategy:
         """
         Pine-эквивалент ta.pivotlow(low, left, right) на баре 0.
         Пивот находится на баре [right] и должен быть минимумом окна из (left+right+1) баров.
-        Порядок свечей у нас DESC: 0=текущий, 1=предыдущий, ...
+        Порядок свечей у нас DESC: 0=текущий закрытый, 1=предыдущий, ...
         Окно -> индексы [0 .. left+right]; центр -> индекс 'right'.
         """
         n = int(left) + int(right) + 1
@@ -260,7 +266,7 @@ class KWINStrategy:
         center = highs[int(right)]
         return center if center == max(highs) else None
 
-    # legacy-хелперы (на случай вызовов из другого кода)
+    # legacy-хелперы
     def _is_prev_pivot_low(self, left: int, right: int = 1) -> bool:
         return self._pivot_low_value(left, right) is not None
 
@@ -268,39 +274,29 @@ class KWINStrategy:
         return self._pivot_high_value(left, right) is not None
 
     def _detect_bull_sfp(self) -> bool:
-        """
-        Бычий SFP: текущий бар (0) пробивает вниз уровень LOW пивота (пивот на баре [1])
-        и закрывается выше этого уровня.
-        """
+        """Бычий SFP на закрытом 15m баре."""
         L = int(getattr(self.config, "sfp_len", 2))
-        if len(self.candles_15m) < (L + 2):  # left + right + 1
+        if len(self.candles_15m) < (L + 2):
             return False
-
         curr = self.candles_15m[0]
         ref_low = self._pivot_low_value(L, 1)
         if ref_low is None:
             return False
-
         cond_break = float(curr["low"]) < float(ref_low)
-        cond_close = float(curr["close"]) > float(ref_low)   # важное ослабление: open>ref не требуем
+        cond_close = float(curr["close"]) > float(ref_low)
         if cond_break and cond_close:
             return self._check_bull_sfp_quality(curr, ref_low) if getattr(self.config, "use_sfp_quality", True) else True
         return False
 
     def _detect_bear_sfp(self) -> bool:
-        """
-        Медвежий SFP: текущий бар (0) пробивает вверх уровень HIGH пивота (пивот на баре [1])
-        и закрывается ниже этого уровня.
-        """
+        """Медвежий SFP на закрытом 15m баре."""
         L = int(getattr(self.config, "sfp_len", 2))
         if len(self.candles_15m) < (L + 2):
             return False
-
         curr = self.candles_15m[0]
         ref_high = self._pivot_high_value(L, 1)
         if ref_high is None:
             return False
-
         cond_break = float(curr["high"]) > float(ref_high)
         cond_close = float(curr["close"]) < float(ref_high)
         if cond_break and cond_close:
@@ -308,12 +304,7 @@ class KWINStrategy:
         return False
 
     def _check_bull_sfp_quality(self, current: dict, pivot_ref) -> bool:
-        """
-        Качество бычьего SFP:
-          • глубина «прокола» в тиках >= wick_min_ticks
-          • закрытие вернулось не меньше, чем на close_back_pct долю от глубины
-        pivot_ref — число (уровень low пивота) или dict с ключом 'low'.
-        """
+        """Качество бычьего SFP."""
         try:
             ref_low = float(pivot_ref["low"]) if isinstance(pivot_ref, dict) else float(pivot_ref)
             low = float(current["low"])
@@ -332,7 +323,7 @@ class KWINStrategy:
             return False
 
     def _check_bear_sfp_quality(self, current: dict, pivot_ref) -> bool:
-        """Качество медвежьего SFP — зеркально бычьему."""
+        """Качество медвежьего SFP."""
         try:
             ref_high = float(pivot_ref["high"]) if isinstance(pivot_ref, dict) else float(pivot_ref)
             high = float(current["high"])
@@ -349,6 +340,54 @@ class KWINStrategy:
             return (high - close) >= required
         except Exception:
             return False
+
+    # ---------- ИНТРАБАР-ВХОДЫ ПО M1 ----------
+
+    def _try_intrabar_entry_from_m1(self, m1: Dict) -> None:
+        """
+        Имитация «calc on every tick» как в Pine:
+        если внутри текущего 15m возникает SFP (минутная свеча проколола и закрылась обратно),
+        то вход выполняется немедленно по цене закрытия M1.
+        """
+        try:
+            # ограничения по окну бэктеста
+            if not self._is_in_backtest_window_utc(int(self.candles_15m[0]["timestamp"])) if self.candles_15m else False:
+                return
+
+            # уже есть позиция — выходим
+            if self.state and self.state.is_position_open():
+                return
+
+            L = int(getattr(self.config, "sfp_len", 2))
+            if len(self.candles_15m) < (L + 2):
+                return
+
+            # пивоты рассчитываются на закрытых 15m барах (bar[1] — центр)
+            ref_low = self._pivot_low_value(L, 1)
+            ref_high = self._pivot_high_value(L, 1)
+
+            # бычий интрабар-SFP
+            if self.can_enter_long and ref_low is not None:
+                lo = float(m1["low"]); hi = float(m1["high"]); cl = float(m1["close"])
+                if (lo < float(ref_low)) and (cl > float(ref_low)):
+                    # проверка качества — на минутной свече
+                    if not getattr(self.config, "use_sfp_quality", True) or self._check_bull_sfp_quality(
+                        {"low": lo, "close": cl}, ref_low
+                    ):
+                        self._process_long_entry(forced_entry_ts_ms=int(m1.get("timestamp") or 0))
+                        return
+
+            # медвежий интрабар-SFP
+            if self.can_enter_short and ref_high is not None:
+                lo = float(m1["low"]); hi = float(m1["high"]); cl = float(m1["close"])
+                if (hi > float(ref_high)) and (cl < float(ref_high)):
+                    if not getattr(self.config, "use_sfp_quality", True) or self._check_bear_sfp_quality(
+                        {"high": hi, "close": cl}, ref_high
+                    ):
+                        self._process_short_entry(forced_entry_ts_ms=int(m1.get("timestamp") or 0))
+                        return
+        except Exception as e:
+            print(f"[intrabar_entry] {e}")
 
     # ---------- ОРДЕРА / ВХОД ----------
 
@@ -456,7 +495,7 @@ class KWINStrategy:
             print(f"[validate_position] {e}")
             return False
 
-    def _process_long_entry(self):
+    def _process_long_entry(self, forced_entry_ts_ms: Optional[int] = None):
         try:
             price = self._get_current_price()
             if not price or len(self.candles_15m) < 2:
@@ -483,7 +522,7 @@ class KWINStrategy:
             if res is None:
                 return
 
-            bar_ts_ms = self._current_bar_ts_ms()
+            bar_ts_ms = forced_entry_ts_ms or self._current_bar_ts_ms()
             trade = {
                 "symbol": self.symbol,
                 "direction": "long",
@@ -526,7 +565,7 @@ class KWINStrategy:
         except Exception as e:
             print(f"[process_long_entry] {e}")
 
-    def _process_short_entry(self):
+    def _process_short_entry(self, forced_entry_ts_ms: Optional[int] = None):
         try:
             price = self._get_current_price()
             if not price or len(self.candles_15m) < 2:
@@ -552,7 +591,7 @@ class KWINStrategy:
             if res is None:
                 return
 
-            bar_ts_ms = self._current_bar_ts_ms()
+            bar_ts_ms = forced_entry_ts_ms or self._current_bar_ts_ms()
             trade = {
                 "symbol": self.symbol,
                 "direction": "short",
