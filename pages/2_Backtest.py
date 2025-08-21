@@ -35,11 +35,11 @@ st.title("📈 Бэктест KWIN Strategy")
 # ======================= Брокер под БЭКТЕСТ =======================
 class BacktestBroker:
     """
-    Брокер для бэктеста без «paper»-терминологии:
-      • отдает РЕАЛЬНЫЕ бары Bybit (HTTP v5)
-      • хранит «текущую» цену, которую стратегия читает через get_price()
-      • методы place_order / update_position_stop_loss / modify_order — безопасные заглушки,
-        чтобы стратегия и трейлинг работали, НО без реальных ордеров.
+    Брокер для бэктеста:
+      • отдаёт РЕАЛЬНЫЕ бары Bybit (HTTP v5),
+      • хранит «текущую» цену, которую стратегия читает через get_price(),
+      • place_order/update_position_stop_loss/modify_order — безопасные заглушки,
+        чтобы стратегия и трейлинг работали, но без реальных ордеров.
     """
     def __init__(self, market: BybitAPI):
         self.market = market
@@ -53,7 +53,6 @@ class BacktestBroker:
         return self.market.get_instruments_info(symbol)
 
     def get_ticker(self, symbol: str) -> Dict:
-        # Используется только как фолбэк. Для бэктеста стратегию кормим set_current_price().
         p = float(self._last_price.get(symbol, 0.0))
         return {"symbol": symbol, "lastPrice": p, "markPrice": p}
 
@@ -61,16 +60,13 @@ class BacktestBroker:
         self._last_price[symbol] = float(price)
 
     def get_price(self, symbol: str, source: str = "last") -> float:
-        # Стратегия берёт текущую цену из бэктестового фида (клоуз бара)
         return float(self._last_price.get(symbol, 0.0))
 
-    # ---- методы для совместимости со стратегией/трейлом ----
+    # ---- совместимость со стратегией / трейлом ----
     def place_order(self, **_kwargs):
-        # Никаких реальных ордеров. Возвращаем успех, чтобы стратегия сохранила сделку в БД.
         return {"ok": True, "filled": True, "msg": "backtest fill"}
 
     def update_position_stop_loss(self, symbol: str, new_sl: float):
-        # В бэктесте SL обновляем локально (через state), но возвращаем True для логики.
         return True
 
     def modify_order(self, **_kwargs):
@@ -131,10 +127,8 @@ def _compute_net_pnl(pos: Dict, exit_price: float, fee_rate: float) -> float:
 
 
 def _book_close_and_update_equity(state: StateManager, db: Database, cfg: Config, pos: Dict, exit_px: float, reason: str):
-    """Закрыть позицию, обновить equity и записать снапшот."""
-    # 1) Закрываем в БД (там посчитается PnL и статус)
-    state.close_position(exit_price=float(exit_px), exit_reason=reason)
-    # 2) Синхронизируем equity локально (чтобы была кривая/ДД немедленно)
+    """Закрыть позицию, обновить equity и записать снапшот (для честной кривой)."""
+    state.close_position(exit_price=float(exit_px), exit_reason=reason)  # в БД посчитается PnL/rr
     net = _compute_net_pnl(pos, exit_px, float(getattr(cfg, "taker_fee_rate", 0.00055)))
     new_eq = float(state.get_equity()) + net
     state.set_equity(new_eq)
@@ -175,9 +169,11 @@ def run_backtest(symbol: str,
                  price_source_for_logic: str = "last") -> Tuple[Database, StateManager, KWINStrategy]:
     """Ядро бэктеста: 15m + 1m интрабары, Pine-точное поведение входов/трейлинга, реальные бары Bybit."""
 
-    # отдельная БД под бэктест
+    # отдельная БД под бэктест (и ПОЛНЫЙ сброс таблиц перед каждым стартом)
     bt_db_path = f"kwin_backtest_{symbol}.db"
     db = Database(db_path=bt_db_path)
+    db.drop_and_recreate()
+
     state = StateManager(db)
     state.set_equity(float(init_equity))
     db.save_equity_snapshot(float(init_equity))  # стартовый снимок для кривой
@@ -339,7 +335,7 @@ with st.form("backtest_form"):
 
     st.markdown("---")
 
-    # ====== Доп. управление TP ======
+    # ====== Доп. управление TP/комиссией ======
     c17, c18 = st.columns(2)
     with c17:
         use_take_profit = st.checkbox("Use Take Profit", value=bool(getattr(cfg, "use_take_profit", True)))
@@ -352,7 +348,7 @@ with st.form("backtest_form"):
 
 # ========================= запуск бэктеста =========================
 def _compute_limits_from_days(days: int) -> Tuple[int, int]:
-    """конвертируем дни в лимиты баров (ограничим верхние лимиты API)."""
+    """Конвертируем дни в лимиты баров (ограничим верхние лимиты API)."""
     m15_per_day = 24 * 4         # 96
     m1_per_day  = 24 * 60        # 1440
     m15_limit = min(5000, days * m15_per_day + 2)
@@ -391,7 +387,7 @@ if submitted:
 
     cfg.price_for_logic = str(price_src).lower()
     cfg.intrabar_tf = "1"                  # минутки
-    cfg.days_back = int(bt_days)           # фильтр окна бэктеста
+    cfg.days_back = int(bt_days)           # окно бэктеста от текущей UTC-полуночи назад
 
     # лимиты истории из выбора периода
     m15_limit, m1_limit = _compute_limits_from_days(int(bt_days))
