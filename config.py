@@ -1,3 +1,6 @@
+# config.py
+from __future__ import annotations
+
 from typing import Dict, Any
 import json
 import os
@@ -15,6 +18,7 @@ SYMBOL             = env("SYMBOL", "ETHUSDT").upper()
 INTERVALS          = [i.strip() for i in env("INTERVALS", "1,15,60").split(",") if i.strip()]
 
 def must_have():
+    """Проверка критичных переменных окружения (актуально для live)."""
     missing = []
     if BYBIT_ACCOUNT_TYPE not in ("linear", "inverse", "option"):
         missing.append(f"BYBIT_ACCOUNT_TYPE (got '{BYBIT_ACCOUNT_TYPE}')")
@@ -33,7 +37,7 @@ class Config:
         # === ОСНОВНЫЕ ПАРАМЕТРЫ СТРАТЕГИИ ===
         self.symbol       = SYMBOL
         self.market_type  = BYBIT_ACCOUNT_TYPE or "linear"
-        self.interval     = "15"    # базовой ТФ для сигналов
+        self.interval     = "15"    # базовый ТФ для сигналов
 
         # Риск/TP
         self.risk_reward  = float(env("RISK_REWARD", "1.3"))
@@ -41,27 +45,28 @@ class Config:
         self.risk_pct     = float(env("RISK_PCT", "3.0"))
 
         # === Управление TP ===
-        self.use_take_profit = env("USE_TAKE_PROFIT", "false").lower() not in ("0","false","no")
+        # True — в бэктесте учитываем TP-выходы; False — игнорируем TP
+        self.use_take_profit = env("USE_TAKE_PROFIT", "false").lower() not in ("0", "false", "no")
 
         # === SMART TRAILING ===
-        self.enable_smart_trail   = env("ENABLE_SMART_TRAIL", "true").lower() not in ("0","false","no")
-        self.smart_trail_mode     = env("SMART_TRAIL_MODE", "pine").lower()  # "pine"|"legacy"
-        self.trailing_perc        = float(env("TRAILING_PERC", "0.5"))       # %
-        self.trailing_offset_perc = float(env("TRAILING_OFFSET_PERC", "0.4"))# %
-        self.trailing_offset      = self.trailing_offset_perc                # alias
+        self.enable_smart_trail   = env("ENABLE_SMART_TRAIL", "true").lower() not in ("0", "false", "no")
+        self.smart_trail_mode     = env("SMART_TRAIL_MODE", "pine").lower()  # "pine"|"legacy" (на будущее)
+        self.trailing_perc        = float(env("TRAILING_PERC", "0.5"))        # %
+        self.trailing_offset_perc = float(env("TRAILING_OFFSET_PERC", "0.4")) # %
+        self.trailing_offset      = self.trailing_offset_perc                 # alias для совместимости
 
         # ARM (вооружение трейла после достижения RR)
-        self.use_arm_after_rr = env("USE_ARM_AFTER_RR", "true").lower() not in ("0","false","no")
-        self.arm_rr           = max(0.1, float(env("ARM_RR", "0.5")))  # ≥0.1
-        self.arm_rr_basis     = (env("ARM_RR_BASIS", "extremum")).lower()
+        self.use_arm_after_rr = env("USE_ARM_AFTER_RR", "true").lower() not in ("0", "false", "no")
+        self.arm_rr           = max(0.1, float(env("ARM_RR", "0.5")))  # в R, минимально 0.1
+        self.arm_rr_basis     = env("ARM_RR_BASIS", "extremum").lower()  # "extremum"|"last"
 
         # Источники цены
-        self.price_for_logic      = "last"
-        self.trigger_price_source = "last"
+        self.price_for_logic      = "last"  # "last"|"mark"
+        self.trigger_price_source = "last"  # "last"|"mark"
 
         # === ИНТРАБАР ===
         self.use_intrabar        = True
-        self.intrabar_tf         = "1"
+        self.intrabar_tf         = "1"      # "1"|"3"|"5" (строкой)
         self.intrabar_pull_limit = 1500
         self.smooth_intrabar     = True
         self.intrabar_steps      = 6
@@ -73,10 +78,10 @@ class Config:
         # === ФИЛЬТРЫ SFP ===
         self.use_sfp_quality = True
         self.wick_min_ticks  = 7
-        self.close_back_pct  = 1.0
+        self.close_back_pct  = 1.0  # [0..1]
 
-        # === БЭКТЕСТ ===
-        self.period_choice = "30"
+        # === БЭКТЕСТ/ЭФФЕКТЫ ИСПОЛНЕНИЯ ===
+        self.period_choice = "30"  # "30"|"60"|"180"
         self.days_back     = 30
         self.slippage_pct  = 0.0
         self.latency_ms    = 0
@@ -88,12 +93,12 @@ class Config:
         self.qty_step       = 0.01
         self.tick_size      = 0.01
 
-        # Совместимость
-        self.use_bar_trail  = True
-        self.trail_lookback = 50
-        self.trail_buf_ticks= 40
+        # Совместимость со старой логикой bar-trail
+        self.use_bar_trail   = True
+        self.trail_lookback  = 50
+        self.trail_buf_ticks = 40
 
-        # нормализация
+        # Нормализация и загрузка config.json (если есть)
         self._update_days_back()
         self._normalize_derived()
         self.load_config()
@@ -113,60 +118,66 @@ class Config:
         else:
             try:
                 self.days_back = int(self.days_back or 30)
-            except:
+            except Exception:
                 self.days_back = 30
 
     def _normalize_derived(self):
-        # close_back_pct clamp
+        # close_back_pct clamp -> [0..1]
         try:
             if self.close_back_pct is None:
                 self.close_back_pct = 1.0
             if self.close_back_pct > 1.0:
-                self.close_back_pct = float(self.close_back_pct)/100.0
+                self.close_back_pct = float(self.close_back_pct) / 100.0
             if self.close_back_pct < 0.0:
                 self.close_back_pct = 0.0
-        except:
+        except Exception:
             self.close_back_pct = 1.0
 
-        # trailing_offset_perc sync
+        # trailing_offset_perc sync c alias
         try:
             if self.trailing_offset is not None:
                 self.trailing_offset_perc = float(self.trailing_offset)
-        except:
+        except Exception:
             pass
 
+        # здравые шаги для ETH/BTC
         sym = (self.symbol or "").upper()
-        if sym in ("ETHUSDT","BTCUSDT"):
+        if sym in ("ETHUSDT", "BTCUSDT"):
             self.qty_step = 0.001
             self.min_order_qty = 0.001
             self.tick_size = 0.01
 
-        self.price_for_logic      = (self.price_for_logic or "last").lower()
-        if self.price_for_logic not in ("last","mark"):
+        # строковые поля + вайтлисты
+        self.price_for_logic = (self.price_for_logic or "last").lower()
+        if self.price_for_logic not in ("last", "mark"):
             self.price_for_logic = "last"
+
         self.trigger_price_source = (self.trigger_price_source or "last").lower()
-        if self.trigger_price_source not in ("last","mark"):
+        if self.trigger_price_source not in ("last", "mark"):
             self.trigger_price_source = "last"
+
         self.arm_rr_basis = (self.arm_rr_basis or "extremum").lower()
-        if self.arm_rr_basis not in ("extremum","last"):
+        if self.arm_rr_basis not in ("extremum", "last"):
             self.arm_rr_basis = "extremum"
 
+        # числа
         try:
             self.trailing_perc = max(0.0, float(self.trailing_perc))
-        except:
+        except Exception:
             self.trailing_perc = 0.5
         try:
             self.trailing_offset_perc = max(0.0, float(self.trailing_offset_perc))
-        except:
+        except Exception:
             self.trailing_offset_perc = 0.4
 
+        # строки
         try:
             self.interval = str(self.interval)
-        except:
+        except Exception:
             self.interval = "15"
         try:
             self.intrabar_tf = str(self.intrabar_tf)
-        except:
+        except Exception:
             self.intrabar_tf = "1"
 
     # ---------- load/save ----------
@@ -174,40 +185,43 @@ class Config:
     def load_config(self, filename: str = "config.json"):
         try:
             if os.path.exists(filename):
-                with open(filename,"r") as f:
-                    data=json.load(f)
+                with open(filename, "r", encoding="utf-8") as f:
+                    data = json.load(f)
                 self._apply_config_data(data)
         except Exception as e:
             print(f"Error loading config: {e}")
 
     def save_config(self, filename: str = "config.json"):
         try:
-            with open(filename,"w") as f:
-                json.dump(self.to_dict(), f, indent=2)
+            with open(filename, "w", encoding="utf-8") as f:
+                json.dump(self.to_dict(), f, indent=2, ensure_ascii=False)
         except Exception as e:
             print(f"Error saving config: {e}")
 
-    def _apply_config_data(self, data: Dict[str,Any]):
-        for k,v in data.items():
-            if hasattr(self,k):
-                setattr(self,k,v)
+    def _apply_config_data(self, data: Dict[str, Any]):
+        for k, v in data.items():
+            if hasattr(self, k):
+                setattr(self, k, v)
         self._update_days_back()
         self._normalize_derived()
 
-    def update_from_dict(self,data:Dict[str,Any]):
+    def update_from_dict(self, data: Dict[str, Any]):
         self._apply_config_data(data)
         self.save_config()
 
     # ---------- export ----------
 
-    def to_dict(self)->Dict[str,Any]:
+    def to_dict(self) -> Dict[str, Any]:
         return {
+            # базовые
             "symbol": self.symbol,
             "market_type": self.market_type,
             "interval": str(self.interval),
             "risk_reward": self.risk_reward,
             "sfp_len": self.sfp_len,
             "risk_pct": self.risk_pct,
+
+            # TP
             "use_take_profit": self.use_take_profit,
 
             # Smart Trail
@@ -215,29 +229,34 @@ class Config:
             "smart_trail_mode": self.smart_trail_mode,
             "trailing_perc": self.trailing_perc,
             "trailing_offset_perc": self.trailing_offset_perc,
-            "trailing_offset": self.trailing_offset,
+            "trailing_offset": self.trailing_offset,   # alias
             "use_arm_after_rr": self.use_arm_after_rr,
             "arm_rr": self.arm_rr,
             "arm_rr_basis": self.arm_rr_basis,
 
+            # источники цены
             "price_for_logic": self.price_for_logic,
             "trigger_price_source": self.trigger_price_source,
 
+            # интрабар
             "use_intrabar": self.use_intrabar,
             "intrabar_tf": str(self.intrabar_tf),
             "intrabar_pull_limit": self.intrabar_pull_limit,
             "smooth_intrabar": self.smooth_intrabar,
             "intrabar_steps": self.intrabar_steps,
 
+            # фильтры
             "use_sfp_quality": self.use_sfp_quality,
             "wick_min_ticks": self.wick_min_ticks,
             "close_back_pct": self.close_back_pct,
 
+            # бэктест/исполнение
             "period_choice": self.period_choice,
             "days_back": self.days_back,
             "slippage_pct": self.slippage_pct,
             "latency_ms": self.latency_ms,
 
+            # маркет/ограничения
             "limit_qty_enabled": self.limit_qty_enabled,
             "max_qty_manual": self.max_qty_manual,
             "taker_fee_rate": self.taker_fee_rate,
@@ -246,21 +265,30 @@ class Config:
             "qty_step": self.qty_step,
             "tick_size": self.tick_size,
 
+            # совместимость (bar-trail)
             "use_bar_trail": self.use_bar_trail,
             "trail_lookback": self.trail_lookback,
             "trail_buf_ticks": self.trail_buf_ticks,
         }
 
-    def validate(self)->bool:
+    def validate(self) -> bool:
         try:
-            if self.risk_reward <= 0: raise ValueError("risk_reward must be >0")
-            if not (0 < self.risk_pct <= 100): raise ValueError("risk_pct must be 0..100")
-            if self.sfp_len < 1: raise ValueError("sfp_len >=1")
-            if self.max_qty_manual <= 0: raise ValueError("max_qty_manual >0")
-            if not (0.0 <= float(self.close_back_pct) <= 1.0): raise ValueError("close_back_pct 0..1")
-            if self.arm_rr_basis not in ("extremum","last"): raise ValueError("arm_rr_basis invalid")
-            if self.price_for_logic not in ("last","mark"): raise ValueError("price_for_logic invalid")
-            if self.trigger_price_source not in ("last","mark"): raise ValueError("trigger_price_source invalid")
+            if self.risk_reward <= 0:
+                raise ValueError("risk_reward must be > 0")
+            if not (0 < self.risk_pct <= 100):
+                raise ValueError("risk_pct must be in (0..100]")
+            if self.sfp_len < 1:
+                raise ValueError("sfp_len >= 1")
+            if self.max_qty_manual <= 0:
+                raise ValueError("max_qty_manual must be > 0")
+            if not (0.0 <= float(self.close_back_pct) <= 1.0):
+                raise ValueError("close_back_pct must be in [0..1]")
+            if self.arm_rr_basis not in ("extremum", "last"):
+                raise ValueError("arm_rr_basis invalid")
+            if self.price_for_logic not in ("last", "mark"):
+                raise ValueError("price_for_logic invalid")
+            if self.trigger_price_source not in ("last", "mark"):
+                raise ValueError("trigger_price_source invalid")
             return True
         except Exception as e:
             print(f"Config validation error: {e}")
