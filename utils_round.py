@@ -3,15 +3,14 @@ from __future__ import annotations
 from decimal import Decimal, ROUND_DOWN, ROUND_UP, ROUND_HALF_UP
 from typing import Optional
 
-
 # -----------------------------
-# БАЗОВЫЕ ФУНКЦИИ (как у тебя)
+# БАЗОВЫЕ ФУНКЦИИ
 # -----------------------------
 def round_price(price: float, tick: float, mode: str = "down") -> float:
     """
     Округление цены к шагу tick.
-    mode="down"  -> округление вниз (floor)
-    mode="up"    -> округление вверх (ceil)
+    mode="down" -> floor (вниз, для SL long)
+    mode="up"   -> ceil  (вверх, для SL short)
     """
     if tick <= 0:
         return float(price)
@@ -19,15 +18,14 @@ def round_price(price: float, tick: float, mode: str = "down") -> float:
     p = Decimal(str(price))
     if mode.lower() == "up":
         return float((p / q).to_integral_value(rounding=ROUND_UP) * q)
-    # по умолчанию вниз
     return float((p / q).to_integral_value(rounding=ROUND_DOWN) * q)
 
 
 def round_qty(qty: float, step: float, mode: str = "down") -> float:
     """
     Округление количества к шагу step.
-    mode="down"  -> округление вниз (floor)
-    mode="up"    -> округление вверх (ceil)
+    mode="down" -> floor (для ордеров по рынку, Binance/MEXC/Bybit)
+    mode="up"   -> ceil  (для защитных ордеров, если нужно гарантировать исполнение)
     """
     if step <= 0:
         return float(qty)
@@ -35,42 +33,39 @@ def round_qty(qty: float, step: float, mode: str = "down") -> float:
     v = Decimal(str(qty))
     if mode.lower() == "up":
         return float((v / q).to_integral_value(rounding=ROUND_UP) * q)
-    # по умолчанию вниз
     return float((v / q).to_integral_value(rounding=ROUND_DOWN) * q)
 
 
 # -----------------------------------------
-# ДОП. ХЕЛПЕРЫ ДЛЯ 1:1 С PINE-ЛОГИКОЙ ТИКОВ
+# ДОП. ХЕЛПЕРЫ 1:1 с PineScript
 # -----------------------------------------
 def floor_to_tick(price: float, tick: float) -> float:
-    """Жёстко вниз к ближайшему тиковому шагу (используй для SL long)."""
+    """Жёстко вниз к ближайшему тиковому шагу (для SL long)."""
     return round_price(price, tick, mode="down")
 
 
 def ceil_to_tick(price: float, tick: float) -> float:
-    """Жёстко вверх к ближайшему тиковому шагу (используй для SL short)."""
+    """Жёстко вверх к ближайшему тиковому шагу (для SL short)."""
     return round_price(price, tick, mode="up")
 
 
 def round_to_tick(price: float, tick: float) -> float:
     """
-    Округление к ближайшему тиковому шагу (как 'nearest').
-    Полезно для entry/TP, когда не требуется предвзятость вниз/вверх.
+    Округление к ближайшему тиковому шагу (как Pine `round()`).
+    Используется для entry/TP, где не важна предвзятость вверх/вниз.
     """
     if tick <= 0:
         return float(price)
     q = Decimal(str(tick))
     p = Decimal(str(price))
-    # банковское округление нам не нужно — берём HALF_UP
     return float((p / q).to_integral_value(rounding=ROUND_HALF_UP) * q)
 
 
 # -----------------------------
-# АЛИАСЫ ДЛЯ ОБРАТСОВМЕСТИМОСТИ
+# АЛИАСЫ ДЛЯ СОВМЕСТИМОСТИ
 # -----------------------------
-# В проекте могли использовать:
+# В проекте могут использовать старые вызовы:
 #   from utils_round import round_price, round_qty
 #   from utils_round import price_round, qty_round
-# Оставляем те же имена.
-price_round = round_to_tick   # "по-умолчанию" — к ближайшему тиковому шагу
-qty_round = round_qty         # количество традиционно режем вниз
+price_round = round_to_tick   # ближе всего к PineScript `round()`
+qty_round = round_qty
