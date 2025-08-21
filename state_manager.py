@@ -12,7 +12,7 @@ class StateManager:
     Потокобезопасный стор состояния бота.
     Хранит:
       • equity
-      • текущую позицию (direction, size, entry_price, stop_loss, take_profit, armed, trail_anchor, entry_time_ts, status)
+      • текущую позицию (direction, quantity, entry_price, stop_loss, take_profit, armed, trail_anchor, entry_time_ts, status)
       • статус бота
     Состояние периодически/при изменениях сохраняется в БД через Database.save_bot_state().
     """
@@ -95,6 +95,9 @@ class StateManager:
                 pos.setdefault("entry_time_ts", int(datetime.utcnow().timestamp() * 1000))
                 if pos.get("trail_anchor") is None:
                     pos["trail_anchor"] = pos.get("entry_price")
+                # унификация ключа size -> quantity
+                if "size" in pos:
+                    pos["quantity"] = pos.pop("size")
                 self._current_position = pos
         self._save_state()
 
@@ -145,6 +148,7 @@ class StateManager:
             )
         except Exception as e:
             print(f"[StateManager] Error closing trade in DB: {e}")
+            return
 
         # Локально позицию очищаем и сохраняем снапшот состояния
         self.clear_position()
@@ -171,9 +175,9 @@ class StateManager:
         with self._lock:
             return None if not self._current_position else self._current_position.get("take_profit")
 
-    def get_position_size(self) -> Optional[float]:
+    def get_position_quantity(self) -> Optional[float]:
         with self._lock:
-            return None if not self._current_position else self._current_position.get("size")
+            return None if not self._current_position else self._current_position.get("quantity")
 
     def is_position_armed(self) -> bool:
         with self._lock:
