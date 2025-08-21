@@ -41,6 +41,11 @@ class Config:
         self.sfp_len      = 2
         self.risk_pct     = float(env("RISK_PCT", "3.0"))
 
+        # === Управление TP в бэктесте ===
+        # True  -> в бэктесте учитываем TP-выходы
+        # False -> выходим только по SL/трейлингу (TP игнорируется)
+        self.use_take_profit = env("USE_TAKE_PROFIT", "false").lower() not in ("0", "false", "no")
+
         # === SMART TRAILING ===
         self.enable_smart_trail     = env("ENABLE_SMART_TRAIL", "true").lower() not in ("0", "false", "no")
         self.trailing_perc          = float(env("TRAILING_PERC", "0.5"))            # %
@@ -221,6 +226,9 @@ class Config:
             "sfp_len": self.sfp_len,
             "risk_pct": self.risk_pct,
 
+            # включение/выключение TP
+            "use_take_profit": self.use_take_profit,
+
             # трейлинг
             "enable_smart_trail": self.enable_smart_trail,
             "trailing_perc": self.trailing_perc,
@@ -275,6 +283,9 @@ class Config:
             "sfp_len":     {"type":"int","label":"Swing Length","min":1,"max":10,"step":1,"value":self.sfp_len},
             "risk_pct":    {"type":"float","label":"Risk % per trade","min":0.1,"max":10.0,"step":0.1,"value":self.risk_pct},
 
+            # ⬇️ новый переключатель для бэктеста
+            "use_take_profit":{"type":"bool","label":"Use Take Profit exits (backtest)","value":self.use_take_profit},
+
             "enable_smart_trail":{"type":"bool","label":"✅ Enable Smart Trailing TP","value":self.enable_smart_trail},
             "trailing_perc":     {"type":"float","label":"Trailing %","min":0.0,"max":5.0,"step":0.1,"value":self.trailing_perc},
             "trailing_offset_perc":{"type":"float","label":"Trailing Offset %","min":0.0,"max":5.0,"step":0.1,"value":self.trailing_offset_perc},
@@ -308,6 +319,7 @@ class Config:
             if self.arm_rr_basis not in ("extremum","last"): raise ValueError("arm_rr_basis must be extremum|last")
             if self.price_for_logic not in ("last","mark"): raise ValueError("price_for_logic must be last|mark")
             if self.trigger_price_source not in ("last","mark"): raise ValueError("trigger_price_source must be last|mark")
+            # use_take_profit — булев флаг, отдельной проверки не требует
             return True
         except Exception as e:
             print(f"Config validation error: {e}")
