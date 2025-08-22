@@ -267,6 +267,7 @@ def simulate_exits_on_m1(state: StateManager, db: Database, cfg: Config, m1: Dic
         if tp and lo <= tp:
             _book_close_and_update_equity(state, db, cfg, pos, tp, "TP"); return
 
+
 def run_backtest(symbol: str,
                  days: int,
                  init_equity: float,
@@ -293,12 +294,13 @@ def run_backtest(symbol: str,
     strat = KWINStrategy(cfg, api=broker, state_manager=state, db=db)
 
     # 15m история (с выравниванием и тёплым стартом)
-    data15 = load_m15_window(broker, symbol, days=int(days), sfp_len=int(getattr(cfg, "sfp_len", 2)))
+    data15 = load_m15_window(broker, symbol, days=int(days), sfп_len=int(getattr(cfg, "sfp_len", 2)))
     if data15.m15.empty:
         st.error("Не удалось загрузить 15m историю.")
         return db, state, strat
 
     m15 = data15.m15.reset_index(drop=True)
+
 
     # основной цикл по закрытым 15m барам
     intrabar_tf = str(getattr(cfg, "intrabar_tf", "1"))
@@ -353,7 +355,7 @@ with st.form("backtest_form"):
         init_eq = st.number_input("Начальный equity ($)", min_value=10.0, max_value=1_000_000.0,
                                   value=1000.0, step=10.0)
     with c0c:
-        price_src = st.selectbox("Источник цены", options=["last", "mark"], index=0)
+        price_src = st.selectbox("Источник цены для логики", options=["last", "mark"], index=0)
     with c0d:
         bt_days = st.selectbox("Период бэктеста (дней)", [7, 14, 30, 39, 60], index=3)
 
@@ -371,6 +373,28 @@ with st.form("backtest_form"):
     with c3:
         risk_pct = st.number_input("Risk % per trade", min_value=0.1, max_value=10.0,
                                    value=float(getattr(cfg, "risk_pct", 3.0)), step=0.1)
+
+    st.markdown("---")
+
+    # ====== Stop-Loss зона (Pine-подход) ======
+    st.subheader("📌 Stop-Loss Zone (Pine-like)")
+    z1, z2, z3, z4, z5 = st.columns(5)
+    with z1:
+        use_swing_sl = st.checkbox("SL от свинга (pivot)", value=bool(getattr(cfg, "use_swing_sl", True)))
+    with z2:
+        use_prev_candle_sl = st.checkbox("SL от свечи [1]", value=bool(getattr(cfg, "use_prev_candle_sl", False)))
+    with z3:
+        sl_buf_ticks = st.number_input("Буфер к SL (ticks)", min_value=0, max_value=1000,
+                                       value=int(getattr(cfg, "sl_buf_ticks", 40)), step=1)
+    with z4:
+        use_atr_buffer = st.checkbox("ATR-буфер", value=bool(getattr(cfg, "use_atr_buffer", False)))
+    with z5:
+        atr_mult = st.number_input("ATR Mult", min_value=0.0, max_value=10.0,
+                                   value=float(getattr(cfg, "atr_mult", 0.0)), step=0.1)
+
+    tps = st.selectbox("Триггер стопа/тейка (биржа)", options=["mark", "last"],
+                       index=0 if str(getattr(cfg, "trigger_price_source", "mark")).lower() == "mark" else 1,
+                       help="По какой цене биржа срабатывает SL/TP. Рекомендуется Mark.")
 
     st.markdown("---")
 
@@ -474,6 +498,15 @@ if submitted:
     cfg.sfp_len = int(sfp_len)
     cfg.risk_pct = float(risk_pct)
 
+    # ===== SL-зона (новые параметры) ====
+    cfg.use_swing_sl = bool(use_swing_sl)
+    cfg.use_prev_candle_sl = bool(use_prev_candle_sl)
+    cfg.sl_buf_ticks = int(sl_buf_ticks)
+    cfg.use_atr_buffer = bool(use_atr_buffer)
+    cfg.atr_mult = float(atr_mult)
+    cfg.trigger_price_source = str(tps).lower()  # "mark" | "last"
+
+    # ===== Smart trail / ARM / bar-trail / лимиты =====
     cfg.enable_smart_trail = bool(enable_smart_trail)
     cfg.trailing_perc = float(trailing_perc)
     cfg.trailing_offset_perc = float(trailing_offset_perc)
@@ -489,6 +522,7 @@ if submitted:
     cfg.limit_qty_enabled = bool(limit_qty_enabled)
     cfg.max_qty_manual = float(max_qty_manual)
 
+    # ===== фильтры / комиссия / источники цены =====
     cfg.use_sfp_quality = bool(use_sfp_quality)
     cfg.wick_min_ticks = int(wick_min_ticks)
     cfg.close_back_pct = float(close_back_pct)
