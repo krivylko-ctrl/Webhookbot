@@ -43,11 +43,15 @@ class BacktestBroker:
     """
     def __init__(self, market: BybitAPI):
         self.market = market
+        self.market.force_linear()  # строго фьючерсы/перпетуалы
         self._last_price: Dict[str, float] = {}
 
     # ---- маркет-данные (реальные) ----
     def get_klines(self, symbol: str, interval: str, limit: int = 200):
         return self.market.get_klines(symbol, interval, limit) or []
+
+    def get_klines_window(self, symbol: str, interval: str, start_ms: Optional[int], end_ms: Optional[int], limit: int = 1000):
+        return self.market.get_klines_window(symbol, interval, start_ms=start_ms, end_ms=end_ms, limit=limit) or []
 
     def get_instruments_info(self, symbol: str):
         return self.market.get_instruments_info(symbol)
@@ -82,7 +86,8 @@ class BtData:
 
 @st.cache_data(show_spinner=False)
 def load_history(_api: BacktestBroker, symbol: str, m15_limit: int, m1_limit: int, intrabar_tf: str = "1") -> BtData:
-    """Грузим историю с рынка (Bybit API)."""
+    """Грузим историю с рынка (Bybit API). Возвращаем DataFrame'ы по возрастанию времени."""
+    # 15m
     m15_raw = _api.get_klines(symbol, "15", m15_limit) or []
     df15 = pd.DataFrame(m15_raw)
     if not df15.empty:
@@ -90,6 +95,7 @@ def load_history(_api: BacktestBroker, symbol: str, m15_limit: int, m1_limit: in
     else:
         df15 = pd.DataFrame(columns=["timestamp","open","high","low","close","volume"])
 
+    # 1m / intrabar
     df1 = pd.DataFrame()
     if m1_limit > 0:
         m1_raw = _api.get_klines(symbol, intrabar_tf, m1_limit) or []
@@ -194,6 +200,7 @@ def run_backtest(symbol: str,
         return db, state, strat
 
     m15 = data.m15.reset_index(drop=True)
+    # основной цикл по закрытым 15m барам
     for i in range(0, len(m15) - 1):
         bar = m15.iloc[i].to_dict()
         t_curr = int(bar["timestamp"])
