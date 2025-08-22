@@ -68,6 +68,7 @@ class Config:
         # === ЗОНАЛЬНЫЙ СТОП ===
 # переключатели базы SL: свинговый pivot и/или экстремум SFP-свечи [0]
         self.use_swing_sl       = env("USE_SWING_SL", "false").lower() not in ("0","false","no")
+        self.use_sfp_candle_sl = env("USE_SFP_CANDLE_SL", "false").lower() not in ("0", "false", "no")
         self.use_prev_candle_sl = env("USE_PREV_CANDLE_SL", "true").lower() not in ("0","false","no")
         self.sl_buf_ticks       = int(env("SL_BUF_TICKS", "0"))  # если нужен отступ — увеличь
         self.use_atr_buffer     = env("USE_ATR_BUFFER", "false").lower() not in ("0","false","no")
@@ -260,6 +261,7 @@ class Config:
             "use_prev_candle_sl": self.use_prev_candle_sl,
             "use_intrabar_entries": self.use_intrabar_entries,
             "use_swing_sl": self.use_swing_sl,
+            "use_sfp_candle_sl": self.use_sfp_candle_sl,
             "use_sfp_candle_sl": self.use_sfp_candle_sl,
             "sl_buf_ticks": self.sl_buf_ticks,
 
