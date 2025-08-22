@@ -291,6 +291,7 @@ class KWINStrategy:
                         self._update_smart_trailing(pos)
         except Exception as e:
             print(f"[update_candles] {e}")
+
     # ---------- ЛОГИКА ВХОДОВ (совместимость) ----------
 
     def on_bar_close(self):
@@ -546,7 +547,39 @@ class KWINStrategy:
             print(f"[validate_position] {e}")
             return False
 
-    # ========== ВХОДЫ: используем SL «зоной» ==========
+    # ---------- Cooldown ----------
+    def _in_cooldown(self, now_ts_ms: int) -> bool:
+        """Если задан cooldown_minutes — запрещаем новые входы до истечения паузы после последнего закрытия."""
+        try:
+            cool_min = int(getattr(self.config, "cooldown_minutes", 0) or 0)
+            if cool_min <= 0:
+                return False
+            last_close_ts = None
+            # сперва спросим у StateManager (если он это хранит)
+            if self.state and hasattr(self.state, "get_last_close_time"):
+                try:
+                    last_close_ts = self.state.get_last_close_time()  # ожидаем unix ms или datetime
+                    if isinstance(last_close_ts, datetime):
+                        last_close_ts = int(last_close_ts.timestamp() * 1000)
+                except Exception:
+                    last_close_ts = None
+            # фоллбек: берём из БД последнюю закрытую сделку
+            if (last_close_ts is None) and self.db and hasattr(self.db, "get_recent_trades"):
+                try:
+                    rec = self.db.get_recent_trades(1) or []
+                    if rec and rec[0].get("exit_time"):
+                        last_close_ts = int(pd.to_datetime(rec[0]["exit_time"]).timestamp() * 1000)
+                except Exception:
+                    last_close_ts = None
+
+            if last_close_ts is None:
+                return False
+
+            return now_ts_ms < (int(last_close_ts) + cool_min * 60_000)
+        except Exception:
+            return False
+
+    # ========== ВХОДЫ ==========
     def _process_long_entry(self, entry_override: Optional[float] = None):
         try:
             if len(self.candles_15m) < 2:
@@ -555,6 +588,10 @@ class KWINStrategy:
             bar_close = float(self.candles_15m[0]["close"])
             price = float(entry_override) if entry_override is not None else bar_close
             entry = round_to_tick(float(price), self.tick_size)
+
+            # Cooldown-гейт
+            if self._in_cooldown(self._current_bar_ts_ms()):
+                return
 
             # Новый расчёт SL «зоной»
             sl = self._calc_sl_with_zone(direction="long", entry_price=entry)
@@ -624,6 +661,9 @@ class KWINStrategy:
             bar_close = float(self.candles_15m[0]["close"])
             price = float(entry_override) if entry_override is not None else bar_close
             entry = round_to_tick(float(price), self.tick_size)
+
+            if self._in_cooldown(self._current_bar_ts_ms()):
+                return
 
             sl = self._calc_sl_with_zone(direction="short", entry_price=entry)
             if sl is None:
@@ -839,9 +879,9 @@ class KWINStrategy:
             if (not self._is_in_backtest_window_utc(ts)) or (not self._is_after_cycle_start(ts)):
                 return
 
-            if self._detect_bull_sfp() and self.can_enter_long:
+            if self._detect_bull_sfp() and self.can_enter_long and not self._in_cooldown(ts):
                 self._process_long_entry()
-            elif self._detect_bear_sfp() and self.can_enter_short:
+            elif self._detect_bear_sfp() and self.can_enter_short and not self._in_cooldown(ts):
                 self._process_short_entry()
         except Exception as e:
             print(f"[run_cycle] {e}")
