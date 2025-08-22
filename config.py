@@ -1,4 +1,3 @@
-# config.py
 from __future__ import annotations
 
 from typing import Dict, Any
@@ -11,11 +10,13 @@ def env(name: str, default: str | None = None) -> str:
     v = os.getenv(name, default)
     return v if v is not None else ""
 
-BYBIT_API_KEY      = env("BYBIT_API_KEY", "")
-BYBIT_API_SECRET   = env("BYBIT_API_SECRET", "")
-BYBIT_ACCOUNT_TYPE = env("BYBIT_ACCOUNT_TYPE", "linear").lower()
-SYMBOL             = env("SYMBOL", "ETHUSDT").upper()
-INTERVALS          = [i.strip() for i in env("INTERVALS", "1,15,60").split(",") if i.strip()]
+BYBIT_API_KEY       = env("BYBIT_API_KEY", "")
+BYBIT_API_SECRET    = env("BYBIT_API_SECRET", "")
+# Мы работаем с деривативами. Допускаем только допустимые категории,
+# но по умолчанию фиксируемся на 'linear' (USDT-M фьючерсы).
+BYBIT_ACCOUNT_TYPE  = env("BYBIT_ACCOUNT_TYPE", "linear").lower()
+SYMBOL              = env("SYMBOL", "ETHUSDT").upper()
+INTERVALS           = [i.strip() for i in env("INTERVALS", "1,15,60").split(",") if i.strip()]
 
 def must_have():
     """Проверка критичных переменных окружения (актуально для live)."""
@@ -51,52 +52,52 @@ class Config:
         # === SMART TRAILING ===
         self.enable_smart_trail   = env("ENABLE_SMART_TRAIL", "true").lower() not in ("0", "false", "no")
         self.smart_trail_mode     = env("SMART_TRAIL_MODE", "pine").lower()  # "pine"|"legacy" (на будущее)
-        self.trailing_perc        = float(env("TRAILING_PERC", "0.5"))        # %
-        self.trailing_offset_perc = float(env("TRAILING_OFFSET_PERC", "0.4")) # %
-        self.trailing_offset      = self.trailing_offset_perc                 # alias для совместимости
+        self.trailing_perc        = float(env("TRAILING_PERC", "0.5"))         # %
+        self.trailing_offset_perc = float(env("TRAILING_OFFSET_PERC", "0.4"))  # %
+        self.trailing_offset      = self.trailing_offset_perc                  # alias для совместимости
 
         # ARM (вооружение трейла после достижения RR)
         self.use_arm_after_rr = env("USE_ARM_AFTER_RR", "true").lower() not in ("0", "false", "no")
-        self.arm_rr           = max(0.1, float(env("ARM_RR", "0.5")))  # в R, минимально 0.1
-        self.arm_rr_basis     = env("ARM_RR_BASIS", "extremum").lower()  # "extremum"|"last"
+        self.arm_rr           = max(0.1, float(env("ARM_RR", "0.5")))          # в R, минимально 0.1
+        self.arm_rr_basis     = env("ARM_RR_BASIS", "extremum").lower()        # "extremum"|"last"
 
         # Источники цены
-        self.price_for_logic      = "last"  # "last"|"mark"
-        self.trigger_price_source = "last"  # "last"|"mark"
+        self.price_for_logic      = env("PRICE_FOR_LOGIC", "last").lower()     # "last"|"mark"
+        self.trigger_price_source = env("TRIGGER_PRICE_SOURCE", "last").lower()# "last"|"mark"
 
         # === ИНТРАБАР ===
-        self.use_intrabar        = True
-        self.intrabar_tf         = "1"      # "1"|"3"|"5" (строкой)
-        self.intrabar_pull_limit = 1500
-        self.smooth_intrabar     = True
-        self.intrabar_steps      = 6
+        self.use_intrabar        = env("USE_INTRABAR", "true").lower() not in ("0","false","no")
+        self.intrabar_tf         = env("INTRABAR_TF", "1")      # "1"|"3"|"5" (строкой)
+        self.intrabar_pull_limit = int(env("INTRABAR_PULL_LIMIT", "1500"))
+        self.smooth_intrabar     = env("SMOOTH_INTRABAR", "true").lower() not in ("0","false","no")
+        self.intrabar_steps      = int(env("INTRABAR_STEPS", "6"))
 
         # === ОГРАНИЧЕНИЯ ПОЗИЦИИ ===
-        self.limit_qty_enabled = True
-        self.max_qty_manual    = 50.0
+        self.limit_qty_enabled = env("LIMIT_QTY_ENABLED", "true").lower() not in ("0","false","no")
+        self.max_qty_manual    = float(env("MAX_QTY_MANUAL", "50.0"))
 
         # === ФИЛЬТРЫ SFP ===
-        self.use_sfp_quality = True
-        self.wick_min_ticks  = 7
-        self.close_back_pct  = 1.0  # [0..1]
+        self.use_sfp_quality = env("USE_SFP_QUALITY", "true").lower() not in ("0","false","no")
+        self.wick_min_ticks  = int(env("WICK_MIN_TICKS", "7"))
+        self.close_back_pct  = float(env("CLOSE_BACK_PCT", "1.0"))  # [0..1]
 
         # === БЭКТЕСТ/ЭФФЕКТЫ ИСПОЛНЕНИЯ ===
-        self.period_choice = "30"  # "30"|"60"|"180"
-        self.days_back     = 30
-        self.slippage_pct  = 0.0
-        self.latency_ms    = 0
+        self.period_choice = env("PERIOD_CHOICE", "30")  # "30"|"60"|"180"
+        self.days_back     = int(env("DAYS_BACK", "30"))
+        self.slippage_pct  = float(env("SLIPPAGE_PCT", "0.0"))
+        self.latency_ms    = int(env("LATENCY_MS", "0"))
 
         # === МАРКЕТ ===
-        self.taker_fee_rate = 0.00055
-        self.min_net_profit = 1.2
-        self.min_order_qty  = 0.01
-        self.qty_step       = 0.01
-        self.tick_size      = 0.01
+        self.taker_fee_rate = float(env("TAKER_FEE_RATE", "0.00055"))
+        self.min_net_profit = float(env("MIN_NET_PROFIT", "1.2"))
+        self.min_order_qty  = float(env("MIN_ORDER_QTY", "0.01"))
+        self.qty_step       = float(env("QTY_STEP", "0.01"))
+        self.tick_size      = float(env("TICK_SIZE", "0.01"))
 
-        # Совместимость со старой логикой bar-trail
-        self.use_bar_trail   = True
-        self.trail_lookback  = 50
-        self.trail_buf_ticks = 40
+        # Совместимость со старой логикой bar-trail (активно не меняем механику)
+        self.use_bar_trail   = env("USE_BAR_TRAIL", "true").lower() not in ("0","false","no")
+        self.trail_lookback  = int(env("TRAIL_LOOKBACK", "50"))
+        self.trail_buf_ticks = int(env("TRAIL_BUF_TICKS", "40"))
 
         # Нормализация и загрузка config.json (если есть)
         self._update_days_back()
@@ -143,9 +144,11 @@ class Config:
         # здравые шаги для ETH/BTC
         sym = (self.symbol or "").upper()
         if sym in ("ETHUSDT", "BTCUSDT"):
-            self.qty_step = 0.001
-            self.min_order_qty = 0.001
-            self.tick_size = 0.01
+            # эти шаги потом будут уточнены через API (instrument info),
+            # но для локального UI дадим разумные значения.
+            self.qty_step = max(self.qty_step, 0.001)
+            self.min_order_qty = max(self.min_order_qty, 0.001)
+            self.tick_size = max(self.tick_size, 0.01)
 
         # строковые поля + вайтлисты
         self.price_for_logic = (self.price_for_logic or "last").lower()
