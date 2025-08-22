@@ -61,9 +61,16 @@ class Config:
         self.arm_rr           = max(0.1, float(env("ARM_RR", "0.5")))          # в R, минимально 0.1
         self.arm_rr_basis     = env("ARM_RR_BASIS", "extremum").lower()        # "extremum"|"last"
 
-        # Источники цены
+        # Источники цены (по умолчанию триггеры по mark)
         self.price_for_logic      = env("PRICE_FOR_LOGIC", "last").lower()     # "last"|"mark"
-        self.trigger_price_source = env("TRIGGER_PRICE_SOURCE", "last").lower()# "last"|"mark"
+        self.trigger_price_source = env("TRIGGER_PRICE_SOURCE", "mark").lower()# "last"|"mark"
+
+        # === ЗОНАЛЬНЫЙ СТОП (НОВЫЕ ПАРАМЕТРЫ) ===
+        self.use_swing_sl        = env("USE_SWING_SL", "true").lower() not in ("0","false","no")
+        self.use_prev_candle_sl  = env("USE_PREV_CANDLE_SL", "false").lower() not in ("0","false","no")
+        self.sl_buf_ticks        = int(env("SL_BUF_TICKS", "40"))
+        self.use_atr_buffer      = env("USE_ATR_BUFFER", "false").lower() not in ("0","false","no")
+        self.atr_mult            = float(env("ATR_MULT", "0.0"))
 
         # === ИНТРАБАР ===
         self.use_intrabar        = env("USE_INTRABAR", "true").lower() not in ("0","false","no")
@@ -155,13 +162,23 @@ class Config:
         if self.price_for_logic not in ("last", "mark"):
             self.price_for_logic = "last"
 
-        self.trigger_price_source = (self.trigger_price_source or "last").lower()
+        self.trigger_price_source = (self.trigger_price_source or "mark").lower()
         if self.trigger_price_source not in ("last", "mark"):
-            self.trigger_price_source = "last"
+            self.trigger_price_source = "mark"
 
         self.arm_rr_basis = (self.arm_rr_basis or "extremum").lower()
         if self.arm_rr_basis not in ("extremum", "last"):
             self.arm_rr_basis = "extremum"
+
+        # новые числовые — приводим к корректным диапазонам
+        try:
+            self.sl_buf_ticks = max(0, int(self.sl_buf_ticks))
+        except Exception:
+            self.sl_buf_ticks = 40
+        try:
+            self.atr_mult = max(0.0, float(self.atr_mult))
+        except Exception:
+            self.atr_mult = 0.0
 
         # числа
         try:
@@ -241,6 +258,13 @@ class Config:
             "price_for_logic": self.price_for_logic,
             "trigger_price_source": self.trigger_price_source,
 
+            # зональный SL (новые)
+            "use_swing_sl": self.use_swing_sl,
+            "use_prev_candle_sl": self.use_prev_candle_sl,
+            "sl_buf_ticks": self.sl_buf_ticks,
+            "use_atr_buffer": self.use_atr_buffer,
+            "atr_mult": self.atr_mult,
+
             # интрабар
             "use_intrabar": self.use_intrabar,
             "intrabar_tf": str(self.intrabar_tf),
@@ -292,6 +316,10 @@ class Config:
                 raise ValueError("price_for_logic invalid")
             if self.trigger_price_source not in ("last", "mark"):
                 raise ValueError("trigger_price_source invalid")
+            if self.sl_buf_ticks < 0:
+                raise ValueError("sl_buf_ticks must be >= 0")
+            if self.atr_mult < 0:
+                raise ValueError("atr_mult must be >= 0")
             return True
         except Exception as e:
             print(f"Config validation error: {e}")
