@@ -2,11 +2,11 @@ import os
 import sys
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
+from datetime import datetime, timezone, timedelta
 
 import streamlit as st
 import pandas as pd
 import plotly.graph_objects as go
-from datetime import datetime, timezone, timedelta
 
 # ===== PYTHONPATH (если запускается из подпапки) =====
 ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -36,20 +36,21 @@ st.title("📈 Бэктест KWIN Strategy")
 class BacktestBroker:
     """
     Брокер для бэктеста:
-      • отдаёт РЕАЛЬНЫЕ бары Bybit (HTTP v5),
-      • хранит «текущую» цену, которую стратегия читает через get_price(),
-      • place_order/update_position_stop_loss/modify_order — безопасные заглушки.
+      • отдаёт РЕАЛЬНЫЕ бары Bybit,
+      • хранит «текущую» цену для стратегии,
+      • ордерные методы — безопасные заглушки.
     """
     def __init__(self, market: BybitAPI):
         self.market = market
-        self.market.force_linear()  # строго фьючерсы/перпетуалы
+        self.market.force_linear()
         self._last_price: Dict[str, float] = {}
 
-    # ---- маркет-данные (реальные) ----
+    # ---- маркет-данные ----
     def get_klines(self, symbol: str, interval: str, limit: int = 200):
         return self.market.get_klines(symbol, interval, limit) or []
 
-    def get_klines_window(self, symbol: str, interval: str, start_ms: Optional[int], end_ms: Optional[int], limit: int = 1000):
+    def get_klines_window(self, symbol: str, interval: str,
+                          start_ms: Optional[int], end_ms: Optional[int], limit: int = 1000):
         return self.market.get_klines_window(symbol, interval, start_ms=start_ms, end_ms=end_ms, limit=limit) or []
 
     def get_instruments_info(self, symbol: str):
@@ -65,7 +66,7 @@ class BacktestBroker:
     def get_price(self, symbol: str, source: str = "last") -> float:
         return float(self._last_price.get(symbol, 0.0))
 
-    # ---- совместимость со стратегией / трейлом ----
+    # ---- ордерные заглушки ----
     def place_order(self, **_kwargs):
         return {"ok": True, "filled": True, "msg": "backtest fill"}
 
@@ -80,71 +81,88 @@ class BacktestBroker:
 @dataclass
 class BtData:
     m15: pd.DataFrame
-    m1: Optional[pd.DataFrame]
+
+
+def _utc_midnight_today() -> datetime:
+    now = datetime.now(timezone.utc)
+    return now.replace(hour=0, minute=0, second=0, microsecond=0)
 
 
 @st.cache_data(show_spinner=False)
-def load_history_window(
-    _api: BacktestBroker,
-    symbol: str,
-    days: int,
-    intrabar_tf: str,
-    sfp_len: int
-) -> BtData:
+def load_m15_window(_api: BacktestBroker, symbol: str, days: int, sfp_len: int) -> BtData:
     """
-    Грузим историю по ЖЁСТКОМУ окну времени:
-    [utc_midnight_today - days .. now], + буфер прогрева.
-    Возвращаем DataFrame'ы по возрастанию времени.
+    15m история по ЖЁСТКОМУ окну времени + буфер прогрева для пивотов.
+    Возвращаем DataFrame по возрастанию времени.
     """
-    # рамки окна
-    utc_now = datetime.now(timezone.utc)
-    utc_midnight_today = utc_now.replace(hour=0, minute=0, second=0, microsecond=0)
-    start_dt = utc_midnight_today - timedelta(days=int(days))
+    utc_midnight = _utc_midnight_today()
+    start_dt = utc_midnight - timedelta(days=int(days))
+    end_dt = datetime.now(timezone.utc)
 
-    # --- буфер прогрева ---
-    # Для pivot(L,1) нужно минимум L+1 "прошлых" баров. Дадим чуть больше.
-    warmup_15m = max(0, sfp_len + 5)       # ещё ~ (sfp_len+5) баров 15m до старта окна
-    warmup_ms_15m = warmup_15m * 15 * 60 * 1000
-    warmup_ms_1m  = 60 * 60 * 1000         # 1 час на минутках для трейла/интрабара
+    # буфер прогрева для ta.pivot(low/high, L, 1)
+    warmup_15m = max(0, int(sfp_len) + 5)
+    start_ms = int(start_dt.timestamp() * 1000) - warmup_15m * 15 * 60 * 1000
+    end_ms = int(end_dt.timestamp() * 1000)
 
-    start_ms_15 = int(start_dt.timestamp() * 1000) - warmup_ms_15m
-    start_ms_1  = int(start_dt.timestamp() * 1000) - warmup_ms_1m
-    end_ms      = int(utc_now.timestamp() * 1000)
-
-    # --- 15m ---
-    m15_raw = _api.get_klines_window(symbol, "15", start_ms=start_ms_15, end_ms=end_ms, limit=5000) or []
-    df15 = pd.DataFrame(m15_raw)
-    if not df15.empty:
-        df15 = df15.sort_values("timestamp").reset_index(drop=True)
+    raw = _api.get_klines_window(symbol, "15", start_ms=start_ms, end_ms=end_ms, limit=5000)
+    df = pd.DataFrame(raw or [])
+    if df.empty:
+        df = pd.DataFrame(columns=["timestamp","open","high","low","close","volume"])
     else:
-        df15 = pd.DataFrame(columns=["timestamp","open","high","low","close","volume"])
-
-    # --- 1m / intrabar ---
-    df1 = pd.DataFrame()
-    if intrabar_tf and intrabar_tf.isdigit():
-        m1_raw = _api.get_klines_window(symbol, intrabar_tf, start_ms=start_ms_1, end_ms=end_ms, limit=5000) or []
-        df1 = pd.DataFrame(m1_raw)
-        if not df1.empty:
-            df1 = df1.sort_values("timestamp").reset_index(drop=True)
-        else:
-            df1 = pd.DataFrame(columns=["timestamp","open","high","low","close","volume"])
-
-    return BtData(m15=df15, m1=(df1 if not df1.empty else None))
+        df = df.sort_values("timestamp").reset_index(drop=True)
+    return BtData(m15=df)
 
 
-def iter_m1_between(df1: Optional[pd.DataFrame], t_from: int, t_to: int) -> List[Dict]:
-    """1m свечи строго в (t_from, t_to]."""
-    if df1 is None or df1.empty:
+@st.cache_data(show_spinner=False)
+def load_m1_day(_api: BacktestBroker, symbol: str, intrabar_tf: str, day_start_ms: int) -> pd.DataFrame:
+    """
+    Минутки/интрабар за ОДИН ДЕНЬ: [day_start .. day_start+24h].
+    Кэшируется поминутно по дням => ~N запросов на N дней, а не десятки тысяч минут.
+    """
+    day_end_ms = day_start_ms + 24 * 60 * 60 * 1000
+    raw = _api.get_klines_window(symbol, intrabar_tf, start_ms=day_start_ms, end_ms=day_end_ms, limit=5000)
+    df = pd.DataFrame(raw or [])
+    if df.empty:
+        return pd.DataFrame(columns=["timestamp","open","high","low","close","volume"])
+    return df.sort_values("timestamp").reset_index(drop=True)
+
+
+def iter_m1_between_by_day(_api: BacktestBroker, symbol: str, intrabar_tf: str, t_from: int, t_to: int) -> List[Dict]:
+    """
+    Возвращает список m1-свечей строго в (t_from, t_to], подгружая данные
+    суточными пачками и вырезая нужный интервал.
+    """
+    if t_to <= t_from:
         return []
-    mask = (df1["timestamp"] > t_from) & (df1["timestamp"] <= t_to)
-    sub = df1.loc[mask]
-    if sub.empty:
-        return []
-    return sub.to_dict("records")
+
+    # нормализуем к UTC-полуночам
+    start_day = _utc_midnight_today().replace(
+        year=datetime.utcfromtimestamp(t_from/1000).year,
+        month=datetime.utcfromtimestamp(t_from/1000).month,
+        day=datetime.utcfromtimestamp(t_from/1000).day
+    )
+    end_day = _utc_midnight_today().replace(
+        year=datetime.utcfromtimestamp(t_to/1000).year,
+        month=datetime.utcfromtimestamp(t_to/1000).month,
+        day=datetime.utcfromtimestamp(t_to/1000).day
+    )
+    # если t_to попадает позже текущего дня — не страшно, мы всё равно ограничим фильтром
+
+    day = datetime(start_day.year, start_day.month, start_day.day, tzinfo=timezone.utc)
+    out: List[Dict] = []
+    while day <= end_day:
+        day_ms = int(day.timestamp() * 1000)
+        df_day = load_m1_day(_api, symbol, intrabar_tf, day_ms)
+        if not df_day.empty:
+            mask = (df_day["timestamp"] > t_from) & (df_day["timestamp"] <= t_to)
+            sub = df_day.loc[mask]
+            if not sub.empty:
+                out.extend(sub.to_dict("records"))
+        day += timedelta(days=1)
+
+    return out
 
 
 def _compute_net_pnl(pos: Dict, exit_price: float, fee_rate: float) -> float:
-    """Тот же расчёт, что в Database.update_trade_exit: gross - (fee_in + fee_out)."""
     entry = float(pos.get("entry_price") or 0.0)
     qty   = float(pos.get("size") or pos.get("quantity") or 0.0)
     if qty <= 0:
@@ -157,8 +175,7 @@ def _compute_net_pnl(pos: Dict, exit_price: float, fee_rate: float) -> float:
 
 
 def _book_close_and_update_equity(state: StateManager, db: Database, cfg: Config, pos: Dict, exit_px: float, reason: str):
-    """Закрыть позицию, обновить equity и записать снапшот (для честной кривой)."""
-    state.close_position(exit_price=float(exit_px), exit_reason=reason)  # в БД посчитается PnL/rr
+    state.close_position(exit_price=float(exit_px), exit_reason=reason)
     net = _compute_net_pnl(pos, exit_px, float(getattr(cfg, "taker_fee_rate", 0.00055)))
     new_eq = float(state.get_equity()) + net
     state.set_equity(new_eq)
@@ -193,42 +210,42 @@ def run_backtest(symbol: str,
                  init_equity: float,
                  cfg: Config,
                  price_source_for_logic: str = "last") -> Tuple[Database, StateManager, KWINStrategy]:
-    """Ядро бэктеста: 15m + 1m интрабары, Pine-точное поведение входов/трейлинга, реальные бары Bybit."""
+    """15m + интрабар M1 (по дням), Pine-точные входы/трейл, реальные бары Bybit."""
 
-    # отдельная БД под бэктест (и ПОЛНЫЙ сброс таблиц перед каждым стартом)
+    # отдельная БД под бэктест (полный сброс перед стартом)
     bt_db_path = f"kwin_backtest_{symbol}.db"
     db = Database(db_path=bt_db_path)
     db.drop_and_recreate()
 
     state = StateManager(db)
     state.set_equity(float(init_equity))
-    db.save_equity_snapshot(float(init_equity))  # стартовый снимок для кривой
+    db.save_equity_snapshot(float(init_equity))
 
-    # реальный маркет-источник + брокер для бэктеста
+    # маркет-источник + брокер для бэктеста
     real_market = BybitAPI(api_key="", api_secret="", testnet=False)
     broker = BacktestBroker(market=real_market)
 
     # стратегия
     cfg.price_for_logic = str(price_source_for_logic).lower()
-    cfg.start_time_ms = None               # в бэктесте не ограничиваем «isActive»
+    cfg.start_time_ms = None                    # не ограничиваем «isActive» в bt
     strat = KWINStrategy(cfg, api=broker, state_manager=state, db=db)
 
-    # история по ОКНУ
-    intrabar_tf = str(getattr(cfg, "intrabar_tf", "1"))
-    data = load_history_window(broker, symbol, days=int(days), intrabar_tf=intrabar_tf, sfp_len=int(getattr(cfg, "sfp_len", 2)))
-    if data.m15.empty:
+    # 15m история
+    data15 = load_m15_window(broker, symbol, days=int(days), sfp_len=int(getattr(cfg, "sfp_len", 2)))
+    if data15.m15.empty:
         st.error("Не удалось загрузить 15m историю.")
         return db, state, strat
 
-    m15 = data.m15.reset_index(drop=True)
+    m15 = data15.m15.reset_index(drop=True)
 
     # основной цикл по закрытым 15m барам
+    intrabar_tf = str(getattr(cfg, "intrabar_tf", "1"))
     for i in range(0, len(m15) - 1):
         bar = m15.iloc[i].to_dict()
         t_curr = int(bar["timestamp"])
         t_next = int(m15.iloc[i + 1]["timestamp"])
 
-        # Кормим стратегии «текущую» цену — клоуз 15m-бара
+        # «текущая» цена — клоуз 15m
         broker.set_current_price(symbol, float(bar["close"]))
 
         strat.on_bar_close_15m({
@@ -239,8 +256,8 @@ def run_backtest(symbol: str,
             "close": float(bar["close"]),
         })
 
-        # Интрабары M1
-        m1_set = iter_m1_between(data.m1, t_curr, t_next)
+        # интрабары из кэша "по дням"
+        m1_set = iter_m1_between_by_day(broker, symbol, intrabar_tf, t_curr, t_next)
         for m1 in m1_set:
             broker.set_current_price(symbol, float(m1["close"]))
             strat.on_bar_close_1m({
@@ -252,7 +269,7 @@ def run_backtest(symbol: str,
             })
             simulate_exits_on_m1(state, db, cfg, m1)
 
-    # Если под конец позиция осталась открыта — закроем по последнему close 15m (консервативно)
+    # если осталась открытая позиция — закроем по последнему close 15m
     pos = state.get_current_position()
     if pos and pos.get("status") == "open":
         last_close = float(m15.iloc[-1]["close"])
@@ -267,12 +284,12 @@ st.markdown("## ⚙️ Настройки бэктеста")
 with st.form("backtest_form"):
     cfg = Config()
 
-    # ----- верхняя строка (символ/капитал/источник цены/период) -----
     c0a, c0b, c0c, c0d = st.columns(4)
     with c0a:
         symbol = st.text_input("Символ", value=str(getattr(cfg, "symbol", "ETHUSDT")))
     with c0b:
-        init_eq = st.number_input("Начальный equity ($)", min_value=10.0, max_value=1_000_000.0, value=1000.0, step=10.0)
+        init_eq = st.number_input("Начальный equity ($)", min_value=10.0, max_value=1_000_000.0,
+                                  value=1000.0, step=10.0)
     with c0c:
         price_src = st.selectbox("Источник цены", options=["last", "mark"], index=0)
     with c0d:
@@ -280,7 +297,7 @@ with st.form("backtest_form"):
 
     st.markdown("---")
 
-    # ====== Группа: Основные ======
+    # ====== Основные ======
     st.subheader("📌 Основные параметры")
     c1, c2, c3 = st.columns(3)
     with c1:
@@ -295,7 +312,7 @@ with st.form("backtest_form"):
 
     st.markdown("---")
 
-    # ====== Группа: Smart Trailing TP ======
+    # ====== Smart Trailing ======
     st.subheader("📌 Smart Trailing TP")
     c4, c5, c6 = st.columns(3)
     with c4:
@@ -310,7 +327,7 @@ with st.form("backtest_form"):
 
     st.markdown("---")
 
-    # ====== Группа: ARM RR ======
+    # ====== ARM RR ======
     st.subheader("📌 ARM RR")
     c7, c8 = st.columns(2)
     with c7:
@@ -322,7 +339,7 @@ with st.form("backtest_form"):
 
     st.markdown("---")
 
-    # ====== Группа: Bar-Low/High Smart Trail ======
+    # ====== Bar-Low/High Smart Trail ======
     st.subheader("📌 Use Bar-Low/High Smart Trail")
     c9, c10, c11 = st.columns(3)
     with c9:
@@ -337,7 +354,7 @@ with st.form("backtest_form"):
 
     st.markdown("---")
 
-    # ====== Группа: Лимиты позиции ======
+    # ====== Лимиты позиции ======
     st.subheader("📌 Лимиты позиции")
     c12, c13 = st.columns(2)
     with c12:
@@ -349,7 +366,7 @@ with st.form("backtest_form"):
 
     st.markdown("---")
 
-    # ====== Группа: Фильтры SFP ======
+    # ====== Фильтры SFP ======
     st.subheader("📌 Фильтр SFP (wick + closeback)")
     c14, c15, c16 = st.columns(3)
     with c14:
@@ -364,7 +381,7 @@ with st.form("backtest_form"):
 
     st.markdown("---")
 
-    # ====== Доп. управление TP/комиссией ======
+    # ====== TP / комиссия ======
     c17, c18 = st.columns(2)
     with c17:
         use_take_profit = st.checkbox("Use Take Profit", value=bool(getattr(cfg, "use_take_profit", True)))
@@ -374,7 +391,7 @@ with st.form("backtest_form"):
 
     st.markdown("---")
 
-    # ====== Intrabar entries (calc_on_every_tick) ======
+    # ====== Intrabar entries ======
     intrabar_entries = st.checkbox("🔁 Intrabar entries (calc_on_every_tick)", value=True)
 
     submitted = st.form_submit_button("🚀 Запустить бэктест", use_container_width=True)
@@ -382,13 +399,14 @@ with st.form("backtest_form"):
 
 # ========================= запуск бэктеста =========================
 if submitted:
-    # перед стартом — ЖЁСТКО чистим кэш, чтобы каждый запуск был с нуля
+    # полный сброс кэша перед каждым запуском
     try: st.cache_data.clear()
     except Exception: pass
     try: st.cache_resource.clear()
     except Exception: pass
 
-    # применяем значения в конфиг (строго без изменения механики)
+    # применяем значения в конфиг
+    cfg = Config()
     cfg.symbol = symbol.strip().upper()
     cfg.risk_reward = float(risk_reward)
     cfg.sfp_len = int(sfp_len)
@@ -417,10 +435,10 @@ if submitted:
     cfg.taker_fee_rate = float(taker_fee)
 
     cfg.price_for_logic = str(price_src).lower()
-    cfg.intrabar_tf = "1"                  # минутки
-    cfg.days_back = int(bt_days)           # окно бэктеста от текущей UTC-полуночи назад
+    cfg.intrabar_tf = "1"
+    cfg.days_back = int(bt_days)
     cfg.use_intrabar_entries = bool(intrabar_entries)
-    cfg.start_time_ms = None               # не режем историю в бэктесте
+    cfg.start_time_ms = None  # никаких ограничений «isActive» в бэктесте
 
     with st.spinner("Грузим историю и запускаем бэктест…"):
         db, state, strat = run_backtest(
@@ -481,7 +499,7 @@ if submitted:
         for col in ("entry_time","exit_time"):
             if col in df.columns: df[col] = pd.to_datetime(df[col], errors="coerce")
         for col in ("pnl","rr","entry_price","exit_price","quantity","qty"):
-            if col in df.columns: df[col] = pd.to_numeric(df[col], errors='coerce')
+            if col in df.columns: df[col] = pd.to_numeric(df[col], errors="coerce")
         if "quantity" not in df.columns and "qty" in df.columns:
             df["quantity"] = df["qty"]
         cols = [c for c in ["entry_time","direction","entry_price","exit_price","quantity","pnl","rr","status","exit_reason"] if c in df.columns]
