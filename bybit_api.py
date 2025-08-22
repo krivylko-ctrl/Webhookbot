@@ -16,7 +16,8 @@ except Exception:
 
 
 class BybitAPI:
-    """Лёгкая обёртка над Bybit v5 (HTTP + паблик WS). Совместима с KWINStrategy/TrailEngine."""
+    """Лёгкая обёртка над Bybit v5 (HTTP + паблик WS). Совместима с KWINStrategy/TrailEngine.
+       По умолчанию — категория linear (USDT-M perpetual/фьючерсы)."""
 
     def __init__(self, api_key: str, api_secret: str, testnet: bool = False):
         self.api_key = api_key or ""
@@ -34,6 +35,12 @@ class BybitAPI:
             self.ws_url = "wss://stream.bybit.com/v5/public/linear"
 
         self.session = requests.Session()
+        # полезные заголовки для стабильности (иногда CF/edge лучше пропускает с UA)
+        self.session.headers.update({
+            "User-Agent": "KWINBot/1.0 (+https://example.local)",
+            "Accept": "application/json",
+        })
+
         self.ws = None
         self.ws_callbacks: Dict[str, Callable] = {}
 
@@ -85,6 +92,7 @@ class BybitAPI:
                     "X-BAPI-RECV-WINDOW": "5000",
                 })
 
+            # сшиваем сессии: используем общий session для keep-alive
             if method.upper() == "GET":
                 r = self.session.get(url, params=params, headers=headers, timeout=timeout)
             elif method.upper() == "POST":
@@ -94,7 +102,14 @@ class BybitAPI:
                 raise ValueError(f"Unsupported HTTP method: {method}")
 
             r.raise_for_status()
-            return r.json()
+            resp = r.json()
+            # удобная диагностика, если retCode != 0
+            if isinstance(resp, dict) and resp.get("retCode") not in (0, "0", None):
+                try:
+                    print(f"[BybitAPI] {method} {endpoint} retCode={resp.get('retCode')} retMsg={resp.get('retMsg')}")
+                except Exception:
+                    pass
+            return resp
         except requests.exceptions.RequestException as e:
             print(f"API Request Error [{method} {endpoint}]: {e}")
             return {"retCode": -1, "retMsg": str(e)}
@@ -109,10 +124,15 @@ class BybitAPI:
     # ==================== конфиг ====================
 
     def set_market_type(self, market_type: str):
+        """Жёстко фиксируем категорию (linear/inverse/spot/option). По умолчанию — linear."""
         m = (market_type or "linear").lower()
         self.market_type = m
         base = "stream-testnet" if self.testnet else "stream"
         self.ws_url = f"wss://{base}.bybit.com/v5/public/{m}"
+
+    def force_linear(self):
+        """Удобный хелпер: насильно фиксирует работу только с фьючерсами (linear)."""
+        self.set_market_type("linear")
 
     # ==================== публичные ====================
 
@@ -126,43 +146,103 @@ class BybitAPI:
                 return int(int(result["timeNano"]) / 1_000_000_000)
         return None
 
+    def _to_float(self, x, default=0.0) -> float:
+        try:
+            return float(x)
+        except Exception:
+            return float(default)
+
     def get_klines(self, symbol: str, interval: str, limit: int = 200) -> Optional[List[Dict]]:
+        """
+        Последние N свечей по категории self.market_type (по умолчанию — linear).
+        interval: строка минут ("1","3","5","15","60",...).
+        Возвращает список по возрастанию timestamp (мс).
+        """
         params = {
-            "category": self.market_type,
-            "symbol": symbol,
-            "interval": interval,
-            "limit": limit,
+            "category": self.market_type,          # <— важно: фьючерсы
+            "symbol": (symbol or "").upper(),
+            "interval": str(interval),
+            "limit": int(limit),
         }
         resp = self._send_request("GET", "/v5/market/kline", params, requires_auth=False)
         if resp.get("retCode") == 0:
-            lst = (resp.get("result") or {}).get("list") or []
+            lst = ((resp.get("result") or {}).get("list") or [])
+            if not lst:
+                print(f"[BybitAPI] get_klines returned empty list for {params}")
+                return []
             out: List[Dict] = []
             for it in lst:
-                # Bybit v5: [start(ms), open, high, low, close, volume, turnover]
-                out.append({
-                    "timestamp": int(it[0]),
-                    "open": float(it[1]),
-                    "high": float(it[2]),
-                    "low": float(it[3]),
-                    "close": float(it[4]),
-                    "volume": float(it[5]) if it[5] is not None else 0.0,
-                })
+                # Формат v5: [start(ms), open, high, low, close, volume, turnover]
+                try:
+                    out.append({
+                        "timestamp": int(it[0]),
+                        "open":  self._to_float(it[1]),
+                        "high":  self._to_float(it[2]),
+                        "low":   self._to_float(it[3]),
+                        "close": self._to_float(it[4]),
+                        "volume": self._to_float(it[5]),
+                    })
+                except Exception:
+                    continue
             out.sort(key=lambda x: x["timestamp"])
             return out
+        # retCode != 0
+        print(f"[BybitAPI] get_klines error: {resp.get('retCode')} {resp.get('retMsg')}")
+        return None
+
+    def get_klines_window(
+        self,
+        symbol: str,
+        interval: str,
+        *,
+        start_ms: Optional[int] = None,
+        end_ms: Optional[int] = None,
+        limit: int = 1000
+    ) -> Optional[List[Dict]]:
+        """
+        Чтение свечей с окнами времени (start/end в мс). Удобно для бэктеста.
+        Возвращает по возрастанию timestamp (мс).
+        """
+        params = {
+            "category": self.market_type,
+            "symbol": (symbol or "").upper(),
+            "interval": str(interval),
+            "limit": int(limit),
+        }
+        if start_ms is not None:
+            params["start"] = int(start_ms)
+        if end_ms is not None:
+            params["end"] = int(end_ms)
+
+        resp = self._send_request("GET", "/v5/market/kline", params, requires_auth=False)
+        if resp.get("retCode") == 0:
+            lst = ((resp.get("result") or {}).get("list") or [])
+            out: List[Dict] = []
+            for it in lst:
+                try:
+                    out.append({
+                        "timestamp": int(it[0]),
+                        "open":  self._to_float(it[1]),
+                        "high":  self._to_float(it[2]),
+                        "low":   self._to_float(it[3]),
+                        "close": self._to_float(it[4]),
+                        "volume": self._to_float(it[5]),
+                    })
+                except Exception:
+                    continue
+            out.sort(key=lambda x: x["timestamp"])
+            return out
+        print(f"[BybitAPI] get_klines_window error: {resp.get('retCode')} {resp.get('retMsg')}")
         return None
 
     def get_ticker(self, symbol: str) -> Optional[Dict]:
-        params = {"category": self.market_type, "symbol": symbol}
+        params = {"category": self.market_type, "symbol": (symbol or "").upper()}
         resp = self._send_request("GET", "/v5/market/tickers", params, requires_auth=False)
         if resp.get("retCode") == 0:
             lst = (resp.get("result") or {}).get("list") or []
             if lst:
                 t = lst[0]
-                def _f(x): 
-                    try:
-                        return float(x)
-                    except Exception:
-                        return 0.0
+                _f = self._to_float
                 return {
                     "symbol": t.get("symbol"),
                     "lastPrice": _f(t.get("lastPrice", 0)),
@@ -171,21 +251,27 @@ class BybitAPI:
                     "ask1Price": _f(t.get("ask1Price", 0)),
                     "volume24h": _f(t.get("volume24h", 0)),
                 }
+            print(f"[BybitAPI] get_ticker empty list for {params}")
+        else:
+            print(f"[BybitAPI] get_ticker error: {resp.get('retCode')} {resp.get('retMsg')}")
         return None
 
     def get_price(self, symbol: str, source: str = "last") -> float:
         t = self.get_ticker(symbol) or {}
-        last = float(t.get("lastPrice", 0) or 0)
-        mark = float(t.get("markPrice", 0) or 0)
+        last = self._to_float(t.get("lastPrice", 0))
+        mark = self._to_float(t.get("markPrice", 0))
         return mark if (str(source).lower() == "mark" and mark > 0) else last
 
     def get_instruments_info(self, symbol: str) -> Optional[Dict]:
-        params = {"category": self.market_type, "symbol": symbol}
+        params = {"category": self.market_type, "symbol": (symbol or "").upper()}
         resp = self._send_request("GET", "/v5/market/instruments-info", params, requires_auth=False)
         if resp.get("retCode") == 0:
             lst = (resp.get("result") or {}).get("list") or []
+            if not lst:
+                print(f"[BybitAPI] instruments-info empty for {params}")
             # В ответе уже есть priceFilter/lotSizeFilter — стратегия ожидает именно их.
             return lst[0] if lst else None
+        print(f"[BybitAPI] instruments-info error: {resp.get('retCode')} {resp.get('retMsg')}")
         return None
 
     # ==================== приватные ====================
@@ -195,6 +281,7 @@ class BybitAPI:
         resp = self._send_request("GET", "/v5/account/wallet-balance", params, requires_auth=True)
         if resp.get("retCode") == 0:
             return resp.get("result")
+        print(f"[BybitAPI] wallet-balance error: {resp.get('retCode')} {resp.get('retMsg')}")
         return None
 
     def place_order(
@@ -215,7 +302,7 @@ class BybitAPI:
     ) -> Optional[Dict]:
         params: Dict[str, str] = {
             "category": self.market_type,
-            "symbol": symbol,
+            "symbol": (symbol or "").upper(),
             "side": str(side).title(),
             "orderType": str(orderType).title(),
             "qty": str(qty),
@@ -246,6 +333,7 @@ class BybitAPI:
         resp = self._send_request("POST", "/v5/order/create", params, requires_auth=True)
         if resp.get("retCode") == 0:
             return resp.get("result")
+        print(f"[BybitAPI] place_order error: {resp.get('retCode')} {resp.get('retMsg')}")
         return None
 
     def update_position_stop_loss(
@@ -262,7 +350,7 @@ class BybitAPI:
         """
         params: Dict[str, str] = {
             "category": self.market_type,
-            "symbol": symbol,
+            "symbol": (symbol or "").upper(),
             "stopLoss": str(new_sl),
             "slTriggerBy": self._map_trigger_by(trigger_by_source),
         }
@@ -274,7 +362,7 @@ class BybitAPI:
             return True
         # Для безопасности — логируем ответ
         try:
-            print(f"update_position_stop_loss failed: {resp.get('retMsg')}")
+            print(f"[BybitAPI] update_position_stop_loss failed: {resp.get('retMsg')}")
         except Exception:
             pass
         return False
@@ -305,7 +393,7 @@ class BybitAPI:
             if take_profit is not None:
                 params_tp = {
                     "category": self.market_type,
-                    "symbol": symbol,
+                    "symbol": (symbol or "").upper(),
                     "takeProfit": str(take_profit),
                     "tpTriggerBy": self._map_trigger_by(trigger_by_source),
                 }
@@ -313,7 +401,7 @@ class BybitAPI:
                 ok_tp = (resp_tp.get("retCode") == 0)
                 if not ok_tp:
                     try:
-                        print(f"modify_order TP fallback failed: {resp_tp.get('retMsg')}")
+                        print(f"[BybitAPI] modify_order TP fallback failed: {resp_tp.get('retMsg')}")
                     except Exception:
                         pass
             return {"ok": (ok_sl and ok_tp)}
@@ -321,7 +409,7 @@ class BybitAPI:
         # Иначе — обычный amend ордера
         params: Dict[str, str] = {
             "category": self.market_type,
-            "symbol": symbol,
+            "symbol": (symbol or "").upper(),
         }
         if order_id:
             params["orderId"] = order_id
@@ -336,6 +424,7 @@ class BybitAPI:
         # сначала амендим ордер (цена/кол-во), затем через trading-stop обновим SL/TP.
         resp = self._send_request("POST", "/v5/order/amend", params, requires_auth=True)
         if resp.get("retCode") != 0:
+            print(f"[BybitAPI] order/amend error: {resp.get('retCode')} {resp.get('retMsg')}")
             return None
 
         # Доп. шаг: SL/TP
@@ -346,7 +435,7 @@ class BybitAPI:
             if take_profit is not None:
                 params_tp = {
                     "category": self.market_type,
-                    "symbol": symbol,
+                    "symbol": (symbol or "").upper(),
                     "takeProfit": str(take_profit),
                     "tpTriggerBy": self._map_trigger_by(trigger_by_source),
                 }
@@ -397,7 +486,7 @@ class BybitAPI:
         """Подписка на kline (возвращаются только закрытые бары)."""
         if not self.ws:
             self.start_websocket()
-        topic = f"kline.{interval}.{symbol}"
+        topic = f"kline.{interval}.{(symbol or '').upper()}"
         self.ws_callbacks[topic] = lambda data: (
             callback(data) if (data.get("data", [{}])[0].get("confirm", False)) else None
         )
