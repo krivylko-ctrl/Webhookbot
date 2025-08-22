@@ -73,7 +73,7 @@ class Config:
         self.atr_mult            = float(env("ATR_MULT", "0.0"))
 
         # === ИНТРАБАР ===
-        self.use_intrabar        = env("USE_INTRABAR", "true").lower() not in ("0","false","no")
+        self.use_intrabar        = env("USE_INTRABAR", "false").lower() not in ("0","false","no")
         self.intrabar_tf         = env("INTRABAR_TF", "1")      # "1"|"3"|"5" (строкой)
         self.intrabar_pull_limit = int(env("INTRABAR_PULL_LIMIT", "1500"))
         self.smooth_intrabar     = env("SMOOTH_INTRABAR", "true").lower() not in ("0","false","no")
