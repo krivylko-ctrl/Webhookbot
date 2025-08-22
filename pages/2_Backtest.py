@@ -1,4 +1,3 @@
-# pages/03_backtest.py
 import os
 import sys
 from dataclasses import dataclass
@@ -7,6 +6,7 @@ from typing import Dict, List, Optional, Tuple
 import streamlit as st
 import pandas as pd
 import plotly.graph_objects as go
+from datetime import datetime, timezone, timedelta
 
 # ===== PYTHONPATH (если запускается из подпапки) =====
 ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -84,27 +84,52 @@ class BtData:
 
 
 @st.cache_data(show_spinner=False)
-def load_history(_api: BacktestBroker, symbol: str, m15_limit: int, m1_limit: int, intrabar_tf: str = "1") -> BtData:
-    """Грузим историю с рынка (Bybit API). Возвращаем DataFrame'ы по возрастанию времени."""
-    # 15m
-    m15_raw = _api.get_klines(symbol, "15", m15_limit) or []
+def load_history_window(
+    _api: BacktestBroker,
+    symbol: str,
+    days: int,
+    intrabar_tf: str,
+    sfp_len: int
+) -> BtData:
+    """
+    Грузим историю по ЖЁСТКОМУ окну времени:
+    [utc_midnight_today - days .. now], + буфер прогрева.
+    Возвращаем DataFrame'ы по возрастанию времени.
+    """
+    # рамки окна
+    utc_now = datetime.now(timezone.utc)
+    utc_midnight_today = utc_now.replace(hour=0, minute=0, second=0, microsecond=0)
+    start_dt = utc_midnight_today - timedelta(days=int(days))
+
+    # --- буфер прогрева ---
+    # Для pivot(L,1) нужно минимум L+1 "прошлых" баров. Дадим чуть больше.
+    warmup_15m = max(0, sfp_len + 5)       # ещё ~ (sfp_len+5) баров 15m до старта окна
+    warmup_ms_15m = warmup_15m * 15 * 60 * 1000
+    warmup_ms_1m  = 60 * 60 * 1000         # 1 час на минутках для трейла/интрабара
+
+    start_ms_15 = int(start_dt.timestamp() * 1000) - warmup_ms_15m
+    start_ms_1  = int(start_dt.timestamp() * 1000) - warmup_ms_1m
+    end_ms      = int(utc_now.timestamp() * 1000)
+
+    # --- 15m ---
+    m15_raw = _api.get_klines_window(symbol, "15", start_ms=start_ms_15, end_ms=end_ms, limit=5000) or []
     df15 = pd.DataFrame(m15_raw)
     if not df15.empty:
         df15 = df15.sort_values("timestamp").reset_index(drop=True)
     else:
         df15 = pd.DataFrame(columns=["timestamp","open","high","low","close","volume"])
 
-    # 1m / intrabar
+    # --- 1m / intrabar ---
     df1 = pd.DataFrame()
-    if m1_limit > 0:
-        m1_raw = _api.get_klines(symbol, intrabar_tf, m1_limit) or []
+    if intrabar_tf and intrabar_tf.isdigit():
+        m1_raw = _api.get_klines_window(symbol, intrabar_tf, start_ms=start_ms_1, end_ms=end_ms, limit=5000) or []
         df1 = pd.DataFrame(m1_raw)
         if not df1.empty:
             df1 = df1.sort_values("timestamp").reset_index(drop=True)
         else:
             df1 = pd.DataFrame(columns=["timestamp","open","high","low","close","volume"])
 
-    return BtData(m15=df15, m1=df1 if not df1.empty else None)
+    return BtData(m15=df15, m1=(df1 if not df1.empty else None))
 
 
 def iter_m1_between(df1: Optional[pd.DataFrame], t_from: int, t_to: int) -> List[Dict]:
@@ -141,10 +166,7 @@ def _book_close_and_update_equity(state: StateManager, db: Database, cfg: Config
 
 
 def simulate_exits_on_m1(state: StateManager, db: Database, cfg: Config, m1: Dict):
-    """
-    Биржевой приоритет: сначала SL, потом TP.
-    При срабатывании — закрываем позицию, обновляем equity (кривая/DD).
-    """
+    """Биржевой приоритет: сначала SL, потом TP."""
     pos = state.get_current_position()
     if not pos or pos.get("status") != "open":
         return
@@ -167,8 +189,7 @@ def simulate_exits_on_m1(state: StateManager, db: Database, cfg: Config, m1: Dic
 
 
 def run_backtest(symbol: str,
-                 m15_limit: int,
-                 m1_limit: int,
+                 days: int,
                  init_equity: float,
                  cfg: Config,
                  price_source_for_logic: str = "last") -> Tuple[Database, StateManager, KWINStrategy]:
@@ -189,18 +210,18 @@ def run_backtest(symbol: str,
 
     # стратегия
     cfg.price_for_logic = str(price_source_for_logic).lower()
-    # отключаем фильтр «isActive» в бэктесте
-    cfg.start_time_ms = None
+    cfg.start_time_ms = None               # в бэктесте не ограничиваем «isActive»
     strat = KWINStrategy(cfg, api=broker, state_manager=state, db=db)
 
-    # история
+    # история по ОКНУ
     intrabar_tf = str(getattr(cfg, "intrabar_tf", "1"))
-    data = load_history(broker, symbol, m15_limit, m1_limit, intrabar_tf)
+    data = load_history_window(broker, symbol, days=int(days), intrabar_tf=intrabar_tf, sfp_len=int(getattr(cfg, "sfp_len", 2)))
     if data.m15.empty:
         st.error("Не удалось загрузить 15m историю.")
         return db, state, strat
 
     m15 = data.m15.reset_index(drop=True)
+
     # основной цикл по закрытым 15m барам
     for i in range(0, len(m15) - 1):
         bar = m15.iloc[i].to_dict()
@@ -218,7 +239,7 @@ def run_backtest(symbol: str,
             "close": float(bar["close"]),
         })
 
-        # Прогоним внутри-барный трейлинг/выходы по минуткам
+        # Интрабары M1
         m1_set = iter_m1_between(data.m1, t_curr, t_next)
         for m1 in m1_set:
             broker.set_current_price(symbol, float(m1["close"]))
@@ -255,7 +276,7 @@ with st.form("backtest_form"):
     with c0c:
         price_src = st.selectbox("Источник цены", options=["last", "mark"], index=0)
     with c0d:
-        bt_days = st.selectbox("Период бэктеста (дней)", [7, 14, 30, 60], index=2)
+        bt_days = st.selectbox("Период бэктеста (дней)", [7, 14, 30, 39, 60], index=3)
 
     st.markdown("---")
 
@@ -355,30 +376,17 @@ with st.form("backtest_form"):
 
     # ====== Intrabar entries (calc_on_every_tick) ======
     intrabar_entries = st.checkbox("🔁 Intrabar entries (calc_on_every_tick)", value=True)
-    # (интрабарный TF фиксируем в 1m, как в Pine)
+
     submitted = st.form_submit_button("🚀 Запустить бэктест", use_container_width=True)
 
 
 # ========================= запуск бэктеста =========================
-def _compute_limits_from_days(days: int) -> Tuple[int, int]:
-    """Конвертируем дни в лимиты баров (ограничим верхние лимиты API)."""
-    m15_per_day = 24 * 4         # 96
-    m1_per_day  = 24 * 60        # 1440
-    m15_limit = min(5000, days * m15_per_day + 2)
-    m1_limit  = min(5000, days * m1_per_day + 2)
-    return m15_limit, m1_limit
-
-
 if submitted:
     # перед стартом — ЖЁСТКО чистим кэш, чтобы каждый запуск был с нуля
-    try:
-        st.cache_data.clear()
-    except Exception:
-        pass
-    try:
-        st.cache_resource.clear()
-    except Exception:
-        pass
+    try: st.cache_data.clear()
+    except Exception: pass
+    try: st.cache_resource.clear()
+    except Exception: pass
 
     # применяем значения в конфиг (строго без изменения механики)
     cfg.symbol = symbol.strip().upper()
@@ -414,14 +422,10 @@ if submitted:
     cfg.use_intrabar_entries = bool(intrabar_entries)
     cfg.start_time_ms = None               # не режем историю в бэктесте
 
-    # лимиты истории из выбора периода
-    m15_limit, m1_limit = _compute_limits_from_days(int(bt_days))
-
     with st.spinner("Грузим историю и запускаем бэктест…"):
         db, state, strat = run_backtest(
             symbol=cfg.symbol,
-            m15_limit=int(m15_limit),
-            m1_limit=int(m1_limit),
+            days=int(bt_days),
             init_equity=float(init_eq),
             cfg=cfg,
             price_source_for_logic=str(price_src),
