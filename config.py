@@ -1,326 +1,212 @@
-from __future__ import annotations
-
-from typing import Dict, Any
-import json
+import streamlit as st
+import sys
 import os
 
-# -------------------- ENV helpers --------------------
+# Если запускаешь страницу из подпапки — добавим корень в PYTHONPATH
+ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if ROOT_DIR not in sys.path:
+    sys.path.append(ROOT_DIR)
 
-def env(name: str, default: str | None = None) -> str:
-    v = os.getenv(name, default)
-    return v if v is not None else ""
+from config import Config
 
-BYBIT_API_KEY       = env("BYBIT_API_KEY", "")
-BYBIT_API_SECRET    = env("BYBIT_API_SECRET", "")
-# Мы работаем с деривативами. Допускаем только допустимые категории,
-# но по умолчанию фиксируемся на 'linear' (USDT-M фьючерсы).
-BYBIT_ACCOUNT_TYPE  = env("BYBIT_ACCOUNT_TYPE", "linear").lower()
-SYMBOL              = env("SYMBOL", "ETHUSDT").upper()
-INTERVALS           = [i.strip() for i in env("INTERVALS", "1,15,60").split(",") if i.strip()]
+st.set_page_config(
+    page_title="KWIN Bot - Настройки",
+    page_icon="⚙️",
+    layout="wide"
+)
 
-def must_have():
-    """Проверка критичных переменных окружения (актуально для live)."""
-    missing = []
-    if BYBIT_ACCOUNT_TYPE not in ("linear", "inverse", "option"):
-        missing.append(f"BYBIT_ACCOUNT_TYPE (got '{BYBIT_ACCOUNT_TYPE}')")
-    if missing:
-        raise RuntimeError("Missing/invalid env: " + ", ".join(missing))
+def main():
+    st.title("⚙️ Настройки KWIN Trading Bot")
+    st.caption("Все параметры сохраняются в config.json и используются ботом в live/бэктесте.")
+    st.markdown("---")
 
+    # Загружаем текущую конфигурацию (внутри она подтягивает config.json, если есть)
+    cfg = Config()
 
-# =====================================================
-#                    CONFIG CLASS
-# =====================================================
+    # ─────────────────────────────────  ОСНОВНЫЕ ─────────────────────────────────
+    st.subheader("🎯 Основные настройки торговли")
+    c1, c2, c3, c4 = st.columns(4)
+    with c1:
+        risk_pct = st.number_input("Риск на сделку (%)", 0.1, 10.0, float(cfg.risk_pct), 0.1,
+                                   help="Процент от капитала, рискуемый на одну сделку.")
+        risk_reward = st.number_input("Risk/Reward соотношение", 0.5, 5.0, float(cfg.risk_reward), 0.1)
+    with c2:
+        max_qty = st.number_input("Макс. позиция (в базовом активе)", 0.001, 10_000.0,
+                                  float(cfg.max_qty_manual), 0.001)
+        limit_qty_enabled = st.checkbox("Ограничивать максимальную позицию",
+                                        value=bool(getattr(cfg, "limit_qty_enabled", True)))
+    with c3:
+        taker_fee = st.number_input("Комиссия taker (десятичная)", 0.0, 0.01, float(cfg.taker_fee_rate), 0.00005)
+        price_for_logic = st.selectbox("Источник цены для логики", ["last", "mark"],
+                                       index=0 if cfg.price_for_logic == "last" else 1)
+    with c4:
+        use_take_profit = st.checkbox("Использовать Take Profit", value=bool(cfg.use_take_profit))
+        intrabar_tf = st.text_input("Интрабар TF (\"1\",\"3\",\"5\")", value=str(getattr(cfg, "intrabar_tf", "1")))
 
-class Config:
-    """Конфигурация стратегии KWIN (эквивалент TV inputs, Pine v5)"""
+    # Интрабар: входы и трейлинг/обновления
+    cIntra1, cIntra2 = st.columns(2)
+    with cIntra1:
+        use_intrabar = st.checkbox("Включить интрабар-трейл/обновления", value=bool(getattr(cfg, "use_intrabar", True)))
+    with cIntra2:
+        use_intrabar_entries = st.checkbox("Включить интрабар-входы", value=bool(getattr(cfg, "use_intrabar_entries", False)))
 
-    def __init__(self):
-        # === ОСНОВНЫЕ ПАРАМЕТРЫ СТРАТЕГИИ ===
-        self.symbol       = SYMBOL
-        self.market_type  = BYBIT_ACCOUNT_TYPE or "linear"
-        self.interval     = "15"    # базовый ТФ для сигналов
+    # ───────────────────────────────  ФИЛЬТРЫ SFP  ───────────────────────────────
+    st.subheader("🛡️ Фильтры SFP")
+    s1, s2, s3, s4 = st.columns(4)
+    with s1:
+        sfp_len = st.number_input("SFP Length", 1, 10, int(getattr(cfg, "sfp_len", 2)))
+    with s2:
+        use_sfp_quality = st.checkbox("Фильтр качества SFP (wick+close-back)",
+                                      value=bool(getattr(cfg, "use_sfp_quality", True)))
+    with s3:
+        wick_min_ticks = st.number_input("Мин. глубина фитиля (в тиках)", 0, 100,
+                                         int(getattr(cfg, "wick_min_ticks", 7)))
+    with s4:
+        close_back_pct = st.number_input("Close-back (0.0 … 1.0)", 0.0, 1.0,
+                                         float(getattr(cfg, "close_back_pct", 1.0)), 0.05)
 
-        # Риск/TP
-        self.risk_reward  = float(env("RISK_REWARD", "1.3"))
-        self.sfp_len      = 2
-        self.risk_pct     = float(env("RISK_PCT", "3.0"))
+    # ───────────────────────────── Stop-Loss Zone (Pine) ─────────────────────────
+    st.subheader("📌 Stop-Loss Zone (Pine-like)")
+    z1, z2, z3, z4, z5 = st.columns(5)
+    with z1:
+        use_swing_sl = st.checkbox("SL от свинга (pivot)", value=bool(getattr(cfg, "use_swing_sl", True)))
+    with z2:
+        use_prev_candle_sl = st.checkbox("SL от свечи [1]", value=bool(getattr(cfg, "use_prev_candle_sl", False)))
+    with z3:
+        sl_buf_ticks = st.number_input("Буфер к SL (ticks)", 0, 1000, int(getattr(cfg, "sl_buf_ticks", 40)))
+    with z4:
+        use_atr_buffer = st.checkbox("ATR-буфер", value=bool(getattr(cfg, "use_atr_buffer", False)))
+    with z5:
+        atr_mult = st.number_input("ATR Mult", 0.0, 10.0, float(getattr(cfg, "atr_mult", 0.0)), 0.1)
 
-        # === Управление TP ===
-        # True — в бэктесте учитываем TP-выходы; False — игнорируем TP
-        self.use_take_profit = env("USE_TAKE_PROFIT", "false").lower() not in ("0", "false", "no")
+    tps = st.selectbox("Триггер стопа/тейка (биржа)", ["mark", "last"],
+                       index=0 if str(getattr(cfg, "trigger_price_source", "mark")).lower() == "mark" else 1,
+                       help="По какой цене срабатывает SL/TP на бирже.")
 
-        # === SMART TRAILING ===
-        self.enable_smart_trail   = env("ENABLE_SMART_TRAIL", "true").lower() not in ("0", "false", "no")
-        self.smart_trail_mode     = env("SMART_TRAIL_MODE", "pine").lower()  # "pine"|"legacy" (на будущее)
-        self.trailing_perc        = float(env("TRAILING_PERC", "0.5"))         # %
-        self.trailing_offset_perc = float(env("TRAILING_OFFSET_PERC", "0.4"))  # %
-        self.trailing_offset      = self.trailing_offset_perc                  # alias для совместимости
+    # ───────────────────────────────  SMART TRAILING  ─────────────────────────────
+    st.subheader("🎯 Smart Trailing")
+    tr1, tr2, tr3, tr4 = st.columns(4)
+    with tr1:
+        enable_smart_trail = st.checkbox("Включить Smart Trailing", value=bool(getattr(cfg, "enable_smart_trail", True)))
+    with tr2:
+        use_arm_after_rr = st.checkbox("Арминг трейла после достижения RR",
+                                       value=bool(getattr(cfg, "use_arm_after_rr", True)))
+    with tr3:
+        arm_rr = st.number_input("RR для арминга (R)", 0.1, 5.0, float(getattr(cfg, "arm_rr", 0.5)), 0.1)
+    with tr4:
+        arm_rr_basis = st.selectbox("База RR для арминга", ["extremum", "last"],
+                                    index=0 if getattr(cfg, "arm_rr_basis", "extremum") == "extremum" else 1)
 
-        # ARM (вооружение трейла после достижения RR)
-        self.use_arm_after_rr = env("USE_ARM_AFTER_RR", "true").lower() not in ("0", "false", "no")
-        self.arm_rr           = max(0.1, float(env("ARM_RR", "0.5")))          # в R, минимально 0.1
-        self.arm_rr_basis     = env("ARM_RR_BASIS", "extremum").lower()        # "extremum"|"last"
+    tr5, tr6 = st.columns(2)
+    with tr5:
+        trailing_perc = st.number_input("Процент трейлинга (%)", 0.0, 5.0,
+                                        float(getattr(cfg, "trailing_perc", 0.5)), 0.1)
+    with tr6:
+        trailing_offset_perc = st.number_input("Offset трейлинга (%)", 0.0, 5.0,
+                                               float(getattr(cfg, "trailing_offset_perc", 0.4)), 0.1)
 
-        # Источники цены (по умолчанию триггеры по mark)
-        self.price_for_logic      = env("PRICE_FOR_LOGIC", "last").lower()     # "last"|"mark"
-        self.trigger_price_source = env("TRIGGER_PRICE_SOURCE", "mark").lower()# "last"|"mark"
+    # Баровый трейл / прочее
+    st.subheader("📦 Баровый трейлинг / прочее")
+    b1, b2 = st.columns(2)
+    with b1:
+        use_bar_trail = st.checkbox("Баровый трейлинг (lowest/highest N закрытых баров)",
+                                    value=bool(getattr(cfg, "use_bar_trail", True)))
+    with b2:
+        trail_lookback = st.number_input("Trail lookback bars", 1, 300, int(getattr(cfg, "trail_lookback", 50)))
+    trail_buf_ticks = st.number_input("Trail buffer (ticks)", 0, 500, int(getattr(cfg, "trail_buf_ticks", 40)))
 
-        # === ЗОНАЛЬНЫЙ СТОП (НОВЫЕ ПАРАМЕТРЫ) ===
-        self.use_swing_sl        = env("USE_SWING_SL", "true").lower() not in ("0","false","no")
-        self.use_prev_candle_sl  = env("USE_PREV_CANDLE_SL", "false").lower() not in ("0","false","no")
-        self.sl_buf_ticks        = int(env("SL_BUF_TICKS", "40"))
-        self.use_atr_buffer      = env("USE_ATR_BUFFER", "false").lower() not in ("0","false","no")
-        self.atr_mult            = float(env("ATR_MULT", "0.0"))
+    # ─────────────────────────────  КНОПКИ ДЕЙСТВИЯ  ─────────────────────────────
+    st.markdown("---")
+    cleft, cmid, cright = st.columns([1, 2, 1])
 
-        # === ИНТРАБАР ===
-        self.use_intrabar        = env("USE_INTRABAR", "true").lower() not in ("0","false","no")
-        self.intrabar_tf         = env("INTRABAR_TF", "1")      # "1"|"3"|"5" (строкой)
-        self.intrabar_pull_limit = int(env("INTRABAR_PULL_LIMIT", "1500"))
-        self.smooth_intrabar     = env("SMOOTH_INTRABAR", "true").lower() not in ("0","false","no")
-        self.intrabar_steps      = int(env("INTRABAR_STEPS", "6"))
+    with cmid:
+        colA, colB = st.columns(2)
+        with colA:
+            if st.button("💾 Сохранить настройки", use_container_width=True, type="primary"):
+                # записываем всё обратно в cfg и сохраняем
+                cfg.risk_pct = float(risk_pct)
+                cfg.risk_reward = float(risk_reward)
+                cfg.max_qty_manual = float(max_qty)
+                cfg.limit_qty_enabled = bool(limit_qty_enabled)
 
-        # === ОГРАНИЧЕНИЯ ПОЗИЦИИ ===
-        self.limit_qty_enabled = env("LIMIT_QTY_ENABLED", "true").lower() not in ("0","false","no")
-        self.max_qty_manual    = float(env("MAX_QTY_MANUAL", "50.0"))
+                cfg.taker_fee_rate = float(taker_fee)
+                cfg.price_for_logic = str(price_for_logic).lower()
 
-        # === ФИЛЬТРЫ SFP ===
-        self.use_sfp_quality = env("USE_SFP_QUALITY", "true").lower() not in ("0","false","no")
-        self.wick_min_ticks  = int(env("WICK_MIN_TICKS", "7"))
-        self.close_back_pct  = float(env("CLOSE_BACK_PCT", "1.0"))  # [0..1]
+                cfg.use_take_profit = bool(use_take_profit)
+                cfg.intrabar_tf = str(intrabar_tf)
+                cfg.use_intrabar = bool(use_intrabar)
+                cfg.use_intrabar_entries = bool(use_intrabar_entries)
 
-        # === БЭКТЕСТ/ЭФФЕКТЫ ИСПОЛНЕНИЯ ===
-        self.period_choice = env("PERIOD_CHOICE", "30")  # "30"|"60"|"180"
-        self.days_back     = int(env("DAYS_BACK", "30"))
-        self.slippage_pct  = float(env("SLIPPAGE_PCT", "0.0"))
-        self.latency_ms    = int(env("LATENCY_MS", "0"))
+                cfg.sfp_len = int(sfp_len)
+                cfg.use_sfp_quality = bool(use_sfp_quality)
+                cfg.wick_min_ticks = int(wick_min_ticks)
+                cfg.close_back_pct = float(close_back_pct)
 
-        # === МАРКЕТ ===
-        self.taker_fee_rate = float(env("TAKER_FEE_RATE", "0.00055"))
-        self.min_net_profit = float(env("MIN_NET_PROFIT", "1.2"))
-        self.min_order_qty  = float(env("MIN_ORDER_QTY", "0.01"))
-        self.qty_step       = float(env("QTY_STEP", "0.01"))
-        self.tick_size      = float(env("TICK_SIZE", "0.01"))
+                cfg.use_swing_sl = bool(use_swing_sl)
+                cfg.use_prev_candle_sl = bool(use_prev_candle_sl)
+                cfg.sl_buf_ticks = int(sl_buf_ticks)
+                cfg.use_atr_buffer = bool(use_atr_buffer)
+                cfg.atr_mult = float(atr_mult)
+                cfg.trigger_price_source = str(tps).lower()
 
-        # Совместимость со старой логикой bar-trail (активно не меняем механику)
-        self.use_bar_trail   = env("USE_BAR_TRAIL", "true").lower() not in ("0","false","no")
-        self.trail_lookback  = int(env("TRAIL_LOOKBACK", "50"))
-        self.trail_buf_ticks = int(env("TRAIL_BUF_TICKS", "40"))
+                cfg.enable_smart_trail = bool(enable_smart_trail)
+                cfg.use_arm_after_rr = bool(use_arm_after_rr)
+                cfg.arm_rr = float(arm_rr)
+                cfg.arm_rr_basis = str(arm_rr_basis)
 
-        # Нормализация и загрузка config.json (если есть)
-        self._update_days_back()
-        self._normalize_derived()
-        self.load_config()
-        self._update_days_back()
-        self._normalize_derived()
+                cfg.trailing_perc = float(trailing_perc)
+                cfg.trailing_offset_perc = float(trailing_offset_perc)
+                cfg.trailing_offset = float(trailing_offset_perc)
 
-    # ---------- normalizers ----------
+                cfg.use_bar_trail = bool(use_bar_trail)
+                cfg.trail_lookback = int(trail_lookback)
+                cfg.trail_buf_ticks = int(trail_buf_ticks)
 
-    def _update_days_back(self):
-        pc = str(self.period_choice)
-        if pc == "30":
-            self.days_back = 30
-        elif pc == "60":
-            self.days_back = 60
-        elif pc == "180":
-            self.days_back = 180
-        else:
-            try:
-                self.days_back = int(self.days_back or 30)
-            except Exception:
-                self.days_back = 30
+                if cfg.validate():
+                    cfg.save_config()
+                    st.success("✅ Настройки сохранены.")
+                else:
+                    st.error("❌ Валидация не пройдена. Проверь значения.")
 
-    def _normalize_derived(self):
-        # close_back_pct clamp -> [0..1]
-        try:
-            if self.close_back_pct is None:
-                self.close_back_pct = 1.0
-            if self.close_back_pct > 1.0:
-                self.close_back_pct = float(self.close_back_pct) / 100.0
-            if self.close_back_pct < 0.0:
-                self.close_back_pct = 0.0
-        except Exception:
-            self.close_back_pct = 1.0
+        with colB:
+            if st.button("⭐ Применить пресет TradingView", use_container_width=True):
+                # Эталонный набор из вашего списка
+                cfg.use_intrabar_entries = False
+                cfg.use_swing_sl = True
+                cfg.use_prev_candle_sl = False
+                cfg.sl_buf_ticks = 40
+                cfg.use_atr_buffer = False
+                cfg.atr_mult = 0.0
+                cfg.trigger_price_source = "mark"
 
-        # trailing_offset_perc sync c alias
-        try:
-            if self.trailing_offset is not None:
-                self.trailing_offset_perc = float(self.trailing_offset)
-        except Exception:
-            pass
+                cfg.use_sfp_quality = True
+                cfg.wick_min_ticks = 7
+                cfg.close_back_pct = 1.0
 
-        # здравые шаги для ETH/BTC
-        sym = (self.symbol or "").upper()
-        if sym in ("ETHUSDT", "BTCUSDT"):
-            # эти шаги потом будут уточнены через API (instrument info),
-            # но для локального UI дадим разумные значения.
-            self.qty_step = max(self.qty_step, 0.001)
-            self.min_order_qty = max(self.min_order_qty, 0.001)
-            self.tick_size = max(self.tick_size, 0.01)
+                cfg.use_take_profit = True
+                cfg.risk_reward = 1.3
 
-        # строковые поля + вайтлисты
-        self.price_for_logic = (self.price_for_logic or "last").lower()
-        if self.price_for_logic not in ("last", "mark"):
-            self.price_for_logic = "last"
+                cfg.use_arm_after_rr = True
+                cfg.arm_rr = 0.5
+                cfg.arm_rr_basis = "extremum"
 
-        self.trigger_price_source = (self.trigger_price_source or "mark").lower()
-        if self.trigger_price_source not in ("last", "mark"):
-            self.trigger_price_source = "mark"
+                cfg.enable_smart_trail = True
+                cfg.trailing_perc = 0.5
+                cfg.trailing_offset_perc = 0.4
+                cfg.trailing_offset = 0.4
 
-        self.arm_rr_basis = (self.arm_rr_basis or "extremum").lower()
-        if self.arm_rr_basis not in ("extremum", "last"):
-            self.arm_rr_basis = "extremum"
+                if cfg.validate():
+                    cfg.save_config()
+                    st.success("✅ Пресет применён и сохранён.")
+                else:
+                    st.error("❌ Пресет не прошёл валидацию (проверь значения).")
 
-        # новые числовые — приводим к корректным диапазонам
-        try:
-            self.sl_buf_ticks = max(0, int(self.sl_buf_ticks))
-        except Exception:
-            self.sl_buf_ticks = 40
-        try:
-            self.atr_mult = max(0.0, float(self.atr_mult))
-        except Exception:
-            self.atr_mult = 0.0
+    # ─────────────────────────────  ПРОСМОТР ТЕКУЩЕГО  ────────────────────────────
+    st.markdown("---")
+    st.subheader("📋 Текущая конфигурация")
+    with st.expander("Показать все параметры (config.json)"):
+        st.json(cfg.to_dict())
 
-        # числа
-        try:
-            self.trailing_perc = max(0.0, float(self.trailing_perc))
-        except Exception:
-            self.trailing_perc = 0.5
-        try:
-            self.trailing_offset_perc = max(0.0, float(self.trailing_offset_perc))
-        except Exception:
-            self.trailing_offset_perc = 0.4
-
-        # строки
-        try:
-            self.interval = str(self.interval)
-        except Exception:
-            self.interval = "15"
-        try:
-            self.intrabar_tf = str(self.intrabar_tf)
-        except Exception:
-            self.intrabar_tf = "1"
-
-    # ---------- load/save ----------
-
-    def load_config(self, filename: str = "config.json"):
-        try:
-            if os.path.exists(filename):
-                with open(filename, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-                self._apply_config_data(data)
-        except Exception as e:
-            print(f"Error loading config: {e}")
-
-    def save_config(self, filename: str = "config.json"):
-        try:
-            with open(filename, "w", encoding="utf-8") as f:
-                json.dump(self.to_dict(), f, indent=2, ensure_ascii=False)
-        except Exception as e:
-            print(f"Error saving config: {e}")
-
-    def _apply_config_data(self, data: Dict[str, Any]):
-        for k, v in data.items():
-            if hasattr(self, k):
-                setattr(self, k, v)
-        self._update_days_back()
-        self._normalize_derived()
-
-    def update_from_dict(self, data: Dict[str, Any]):
-        self._apply_config_data(data)
-        self.save_config()
-
-    # ---------- export ----------
-
-    def to_dict(self) -> Dict[str, Any]:
-        return {
-            # базовые
-            "symbol": self.symbol,
-            "market_type": self.market_type,
-            "interval": str(self.interval),
-            "risk_reward": self.risk_reward,
-            "sfp_len": self.sfp_len,
-            "risk_pct": self.risk_pct,
-
-            # TP
-            "use_take_profit": self.use_take_profit,
-
-            # Smart Trail
-            "enable_smart_trail": self.enable_smart_trail,
-            "smart_trail_mode": self.smart_trail_mode,
-            "trailing_perc": self.trailing_perc,
-            "trailing_offset_perc": self.trailing_offset_perc,
-            "trailing_offset": self.trailing_offset,   # alias
-            "use_arm_after_rr": self.use_arm_after_rr,
-            "arm_rr": self.arm_rr,
-            "arm_rr_basis": self.arm_rr_basis,
-
-            # источники цены
-            "price_for_logic": self.price_for_logic,
-            "trigger_price_source": self.trigger_price_source,
-
-            # зональный SL (новые)
-            "use_swing_sl": self.use_swing_sl,
-            "use_prev_candle_sl": self.use_prev_candle_sl,
-            "sl_buf_ticks": self.sl_buf_ticks,
-            "use_atr_buffer": self.use_atr_buffer,
-            "atr_mult": self.atr_mult,
-
-            # интрабар
-            "use_intrabar": self.use_intrabar,
-            "intrabar_tf": str(self.intrabar_tf),
-            "intrabar_pull_limit": self.intrabar_pull_limit,
-            "smooth_intrabar": self.smooth_intrabar,
-            "intrabar_steps": self.intrabar_steps,
-
-            # фильтры
-            "use_sfp_quality": self.use_sfp_quality,
-            "wick_min_ticks": self.wick_min_ticks,
-            "close_back_pct": self.close_back_pct,
-
-            # бэктест/исполнение
-            "period_choice": self.period_choice,
-            "days_back": self.days_back,
-            "slippage_pct": self.slippage_pct,
-            "latency_ms": self.latency_ms,
-
-            # маркет/ограничения
-            "limit_qty_enabled": self.limit_qty_enabled,
-            "max_qty_manual": self.max_qty_manual,
-            "taker_fee_rate": self.taker_fee_rate,
-            "min_net_profit": self.min_net_profit,
-            "min_order_qty": self.min_order_qty,
-            "qty_step": self.qty_step,
-            "tick_size": self.tick_size,
-
-            # совместимость (bar-trail)
-            "use_bar_trail": self.use_bar_trail,
-            "trail_lookback": self.trail_lookback,
-            "trail_buf_ticks": self.trail_buf_ticks,
-        }
-
-    def validate(self) -> bool:
-        try:
-            if self.risk_reward <= 0:
-                raise ValueError("risk_reward must be > 0")
-            if not (0 < self.risk_pct <= 100):
-                raise ValueError("risk_pct must be in (0..100]")
-            if self.sfp_len < 1:
-                raise ValueError("sfp_len >= 1")
-            if self.max_qty_manual <= 0:
-                raise ValueError("max_qty_manual must be > 0")
-            if not (0.0 <= float(self.close_back_pct) <= 1.0):
-                raise ValueError("close_back_pct must be in [0..1]")
-            if self.arm_rr_basis not in ("extremum", "last"):
-                raise ValueError("arm_rr_basis invalid")
-            if self.price_for_logic not in ("last", "mark"):
-                raise ValueError("price_for_logic invalid")
-            if self.trigger_price_source not in ("last", "mark"):
-                raise ValueError("trigger_price_source invalid")
-            if self.sl_buf_ticks < 0:
-                raise ValueError("sl_buf_ticks must be >= 0")
-            if self.atr_mult < 0:
-                raise ValueError("atr_mult must be >= 0")
-            return True
-        except Exception as e:
-            print(f"Config validation error: {e}")
-            return False
+if __name__ == "__main__":
+    main()
+    
