@@ -1,4 +1,4 @@
-# kwin_strategy.py
+# kwin_strategy.py  — обновлено: добавлен расчёт SL-зоны и интеграция в входы
 from __future__ import annotations
 
 import time
@@ -119,6 +119,111 @@ class KWINStrategy:
         self.config.tick_size = self.tick_size or 0.01
         self.config.qty_step = self.qty_step or 0.01
         self.config.min_order_qty = self.min_order_qty or 0.01
+
+    # ---------- NEW: ATR(15m) для буфера SL ----------
+    def _atr_15m(self, period: int = 14) -> Optional[float]:
+        """
+        Классический ATR по 15m: TR = max(H-L, |H-Cprev|, |L-Cprev|).
+        Возвращает среднее TR за period баров. Нужен только для SL-буфера.
+        """
+        try:
+            bars = self.candles_15m
+            if not bars or len(bars) < period + 1:
+                return None
+            # работаем от старых к новым
+            arr = sorted(bars[:period + 1], key=lambda x: x["timestamp"])
+            trs: List[float] = []
+            for i in range(1, len(arr)):
+                h = float(arr[i]["high"]); l = float(arr[i]["low"])
+                cp = float(arr[i-1]["close"])
+                tr = max(h - l, abs(h - cp), abs(l - cp))
+                trs.append(tr)
+            if not trs:
+                return None
+            return float(np.mean(trs))
+        except Exception:
+            return None
+
+    # ---------- NEW: SL «зона» как в Pine ----------
+    def _calc_sl_with_zone(self, direction: str, entry_price: float) -> Optional[float]:
+        """
+        База SL:
+          - если use_prev_candle_sl: long -> low[1], short -> high[1]
+          - elif use_swing_sl: long -> min(low[1], low[sfp_len]), short -> max(high[1], high[sfp_len])
+          - иначе fallback: prev bar low/high.
+        Далее: буфер по тикам (sl_buf_ticks) и опционально ATR*atr_mult.
+        Округление: long -> floor_to_tick, short -> ceil_to_tick.
+        """
+        try:
+            L = int(getattr(self.config, "sfp_len", 2))
+            if len(self.candles_15m) < max(L + 1, 2):
+                return None
+
+            prev = self.candles_15m[1]
+            use_prev = bool(getattr(self.config, "use_prev_candle_sl", False))
+            use_swing = bool(getattr(self.config, "use_swing_sl", True))
+
+            tick = float(self.tick_size or 0.01)
+            buf_ticks = int(getattr(self.config, "sl_buf_ticks", 40) or 0)
+            buf_px = buf_ticks * tick
+
+            # кандидаты от пивота
+            pivot_low = None
+            pivot_high = None
+            if use_swing and len(self.candles_15m) > L:
+                try:
+                    pivot_low = float(self.candles_15m[L]["low"])
+                    pivot_high = float(self.candles_15m[L]["high"])
+                except Exception:
+                    pivot_low = pivot_high = None
+
+            # базовые уровни
+            if direction == "long":
+                base_prev = float(prev["low"])
+                if use_prev:
+                    base = base_prev
+                elif use_swing and pivot_low is not None:
+                    base = min(base_prev, pivot_low)
+                else:
+                    base = base_prev
+                # применяем буферы
+                sl_raw = base - buf_px
+            else:
+                base_prev = float(prev["high"])
+                if use_prev:
+                    base = base_prev
+                elif use_swing and pivot_high is not None:
+                    base = max(base_prev, pivot_high)
+                else:
+                    base = base_prev
+                sl_raw = base + buf_px
+
+            # ATR-буфер (опционально)
+            if bool(getattr(self.config, "use_atr_buffer", False)):
+                atr_mult = float(getattr(self.config, "atr_mult", 0.0) or 0.0)
+                if atr_mult > 0:
+                    atr_val = self._atr_15m(period=14)
+                    if atr_val is not None and atr_val > 0:
+                        if direction == "long":
+                            sl_raw -= atr_mult * atr_val
+                        else:
+                            sl_raw += atr_mult * atr_val
+
+            # округление к тику в правильную сторону
+            if direction == "long":
+                sl = floor_to_tick(sl_raw, tick)
+                # гарантия: SL ниже entry
+                if sl >= entry_price:
+                    sl = floor_to_tick(entry_price - tick, tick)
+            else:
+                sl = ceil_to_tick(sl_raw, tick)
+                if sl <= entry_price:
+                    sl = ceil_to_tick(entry_price + tick, tick)
+
+            return float(sl)
+        except Exception as e:
+            print(f"[calc_sl_with_zone] {e}")
+            return None
 
     # ============ ОБРАБОТКА БАРОВ ============
 
@@ -426,7 +531,7 @@ class KWINStrategy:
                 orderType="Market",
                 qty=qty,
                 stop_loss=sl_send,
-                trigger_by_source=getattr(self.config, "trigger_price_source", "last"),
+                trigger_by_source=getattr(self.config, "trigger_price_source", "mark"),
             )
         except TypeError:
             return self.api.place_order(
@@ -484,6 +589,7 @@ class KWINStrategy:
             print(f"[validate_position] {e}")
             return False
 
+    # ========== ОБНОВЛЕНО: входы используют SL «зоной» ==========
     def _process_long_entry(self, entry_override: Optional[float] = None):
         try:
             if len(self.candles_15m) < 2:
@@ -491,11 +597,13 @@ class KWINStrategy:
 
             bar_close = float(self.candles_15m[0]["close"])
             price = float(entry_override) if entry_override is not None else bar_close
-
-            raw_sl = float(self.candles_15m[1]["low"])
-
             entry = round_to_tick(float(price), self.tick_size)
-            sl    = floor_to_tick(raw_sl, self.tick_size)
+
+            # Новый расчёт SL «зоной»
+            sl = self._calc_sl_with_zone(direction="long", entry_price=entry)
+            if sl is None:
+                return
+
             stop_size = entry - sl
             if stop_size <= 0:
                 return
@@ -519,8 +627,8 @@ class KWINStrategy:
                 "quantity": float(qty),
                 "entry_time": datetime.utcfromtimestamp(bar_ts_ms / 1000) if bar_ts_ms else datetime.utcnow(),
                 "status": "open",
+                "take_profit": tp_for_filter,
             }
-            trade["take_profit"] = tp_for_filter
             if self.db:
                 self.db.save_trade(trade)
 
@@ -547,7 +655,7 @@ class KWINStrategy:
 
             self.can_enter_long = False
             self.can_enter_short = False
-            print(f"[ENTRY LONG] {qty} @ {entry}, SL={sl}, TP(filt)={tp_for_filter}")
+            print(f"[ENTRY LONG] {qty} @ {entry}, SL(zone)={sl}, TP(filt)={tp_for_filter}")
         except Exception as e:
             print(f"[process_long_entry] {e}")
 
@@ -558,11 +666,12 @@ class KWINStrategy:
 
             bar_close = float(self.candles_15m[0]["close"])
             price = float(entry_override) if entry_override is not None else bar_close
-
-            raw_sl = float(self.candles_15m[1]["high"])
-
             entry = round_to_tick(float(price), self.tick_size)
-            sl    = ceil_to_tick(raw_sl, self.tick_size)
+
+            sl = self._calc_sl_with_zone(direction="short", entry_price=entry)
+            if sl is None:
+                return
+
             stop_size = sl - entry
             if stop_size <= 0:
                 return
@@ -614,7 +723,7 @@ class KWINStrategy:
 
             self.can_enter_short = False
             self.can_enter_long = False
-            print(f"[ENTRY SHORT] {qty} @ {entry}, SL={sl}, TP(filt)={tp_for_filter}")
+            print(f"[ENTRY SHORT] {qty} @ {entry}, SL(zone)={sl}, TP(filt)={tp_for_filter}")
         except Exception as e:
             print(f"[process_short_entry] {e}")
 
@@ -658,8 +767,8 @@ class KWINStrategy:
                     rr_last = (price - entry) / risk   if direction == "long" else (entry - price) / risk
                     rr_need = float(getattr(self.config, "arm_rr", 0.5))
                     basis   = str(getattr(self.config, "arm_rr_basis", "extremum")).lower()
-                    rr_now  = rr_ext if basis == "extremум" else rr_last
-                    rr_alt  = rr_last if basis == "extremум" else rr_ext
+                    rr_now  = rr_ext if basis == "extremum" else rr_last
+                    rr_alt  = rr_last if basis == "extremum" else rr_ext
 
                     if rr_now >= rr_need or rr_alt >= rr_need:
                         armed = True
