@@ -83,71 +83,134 @@ class BtData:
     m15: pd.DataFrame
 
 
-def _utc_midnight_today() -> datetime:
-    now = datetime.now(timezone.utc)
-    return now.replace(hour=0, minute=0, second=0, microsecond=0)
+def _utc_midnight(dt: Optional[datetime] = None) -> datetime:
+    dt = dt or datetime.now(timezone.utc)
+    return dt.replace(hour=0, minute=0, second=0, microsecond=0)
+
+
+def _align_floor(ts_ms: int, tf_ms: int) -> int:
+    return (int(ts_ms) // tf_ms) * tf_ms
+
+
+def _align_ceil(ts_ms: int, tf_ms: int) -> int:
+    return ((int(ts_ms) + tf_ms - 1) // tf_ms) * tf_ms
+
+
+def _norm_ts_ms(df: pd.DataFrame, col: str = "timestamp") -> pd.DataFrame:
+    """Приводим timestamp к миллисекундам, если пришли секунды."""
+    if col in df.columns and not df.empty:
+        mx = pd.to_numeric(df[col], errors="coerce").max()
+        if pd.notna(mx) and mx < 1_000_000_000_000:  # секунды
+            df[col] = pd.to_numeric(df[col], errors="coerce") * 1000
+    return df
+
+
+def _fetch_aligned_window(
+    _api: BacktestBroker,
+    symbol: str,
+    interval: str,
+    start_ms: int,
+    end_ms: int,
+    limit: int = 1000,
+    overlap_bars: int = 2,
+) -> List[Dict]:
+    """
+    Универсальный лоадер через broker.get_klines_window с:
+      • выравниванием start/end к сетке ТФ,
+      • чанками с перекрытием (overlap_bars),
+      • дедупом и сортировкой,
+      • нормализацией timestamp в мс.
+    """
+    tf_ms = int(interval) * 60_000
+    start_ms = _align_floor(start_ms, tf_ms)
+    end_ms = _align_ceil(end_ms, tf_ms) - 1
+
+    out: List[Dict] = []
+    step_ms = limit * tf_ms + overlap_bars * tf_ms
+    cursor = start_ms
+    while cursor <= end_ms:
+        chunk_end = min(end_ms, cursor + step_ms - 1)
+        rows = _api.get_klines_window(symbol, interval, start_ms=cursor, end_ms=chunk_end, limit=limit) or []
+        if rows:
+            # в dict-форму и ms-нормализация
+            for r in rows:
+                ts = int(r.get("timestamp") or r.get("open_time") or 0)
+                if ts and ts < 1_000_000_000_000:  # сек -> мс
+                    ts *= 1000
+                out.append({
+                    "timestamp": ts,
+                    "open":  float(r["open"]),
+                    "high":  float(r["high"]),
+                    "low":   float(r["low"]),
+                    "close": float(r["close"]),
+                    "volume": float(r.get("volume") or 0.0),
+                })
+        cursor = chunk_end + 1
+
+    # дедуп + сортировка
+    out = sorted({b["timestamp"]: b for b in out if b["timestamp"]}.values(), key=lambda x: x["timestamp"])
+    return out
 
 
 @st.cache_data(show_spinner=False)
 def load_m15_window(_api: BacktestBroker, symbol: str, days: int, sfp_len: int) -> BtData:
     """
-    15m история по ЖЁСТКОМУ окну времени + буфер прогрева для пивотов.
+    15m история по ЖЁСТКОМУ окну времени + тёплый старт для пивотов.
     Возвращаем DataFrame по возрастанию времени.
     """
-    utc_midnight = _utc_midnight_today()
+    # окно бэктеста: [UTC-полночь - days, now]
+    utc_midnight = _utc_midnight()
     start_dt = utc_midnight - timedelta(days=int(days))
     end_dt = datetime.now(timezone.utc)
 
-    # буфер прогрева для ta.pivot(low/high, L, 1)
-    warmup_15m = max(0, int(sfp_len) + 5)
+    # warm-up: L + 2 + 10 баров 15m
+    warmup_15m = int(sfp_len) + 12
     start_ms = int(start_dt.timestamp() * 1000) - warmup_15m * 15 * 60 * 1000
     end_ms = int(end_dt.timestamp() * 1000)
 
-    raw = _api.get_klines_window(symbol, "15", start_ms=start_ms, end_ms=end_ms, limit=5000)
+    # надёжная подгрузка с выравниванием и перекрытием
+    raw = _fetch_aligned_window(_api, symbol, "15", start_ms=start_ms, end_ms=end_ms, limit=1000, overlap_bars=2)
     df = pd.DataFrame(raw or [])
     if df.empty:
         df = pd.DataFrame(columns=["timestamp","open","high","low","close","volume"])
     else:
-        df = df.sort_values("timestamp").reset_index(drop=True)
+        df = _norm_ts_ms(df, "timestamp").sort_values("timestamp").reset_index(drop=True)
     return BtData(m15=df)
 
 
 @st.cache_data(show_spinner=False)
 def load_m1_day(_api: BacktestBroker, symbol: str, intrabar_tf: str, day_start_ms: int) -> pd.DataFrame:
     """
-    Минутки/интрабар за ОДИН ДЕНЬ: [day_start .. day_start+24h].
-    Кэшируется поминутно по дням => ~N запросов на N дней, а не десятки тысяч минут.
+    Минутки/интрабар за ОДИН ДЕНЬ: [day_start .. day_start+24h], с выравниванием и перекрытием.
+    Кэшируется поминутно по дням => ~N запросов на N дней.
     """
-    day_end_ms = day_start_ms + 24 * 60 * 60 * 1000
-    raw = _api.get_klines_window(symbol, intrabar_tf, start_ms=day_start_ms, end_ms=day_end_ms, limit=5000)
+    tf_ms = int(intrabar_tf) * 60_000
+    day_start_ms = _align_floor(day_start_ms, 24 * 60 * 60 * 1000)
+    day_end_ms = day_start_ms + 24 * 60 * 60 * 1000 - 1
+
+    raw = _fetch_aligned_window(_api, symbol, intrabar_tf, start_ms=day_start_ms, end_ms=day_end_ms,
+                                limit=1000, overlap_bars=5)
     df = pd.DataFrame(raw or [])
     if df.empty:
         return pd.DataFrame(columns=["timestamp","open","high","low","close","volume"])
-    return df.sort_values("timestamp").reset_index(drop=True)
+    return _norm_ts_ms(df, "timestamp").sort_values("timestamp").reset_index(drop=True)
 
 
 def iter_m1_between_by_day(_api: BacktestBroker, symbol: str, intrabar_tf: str, t_from: int, t_to: int) -> List[Dict]:
     """
     Возвращает список m1-свечей строго в (t_from, t_to], подгружая данные
-    суточными пачками и вырезая нужный интервал.
+    суточными пачками и вырезая нужный интервал. Время — в МИЛЛИСЕКУНДАХ.
     """
     if t_to <= t_from:
         return []
 
-    # нормализуем к UTC-полуночам
-    start_day = _utc_midnight_today().replace(
-        year=datetime.utcfromtimestamp(t_from/1000).year,
-        month=datetime.utcfromtimestamp(t_from/1000).month,
-        day=datetime.utcfromtimestamp(t_from/1000).day
-    )
-    end_day = _utc_midnight_today().replace(
-        year=datetime.utcfromtimestamp(t_to/1000).year,
-        month=datetime.utcfromtimestamp(t_to/1000).month,
-        day=datetime.utcfromtimestamp(t_to/1000).day
-    )
-    # если t_to попадает позже текущего дня — не страшно, мы всё равно ограничим фильтром
+    # нормализуем к UTC-полуночам исходя из t_from/t_to
+    from_dt = datetime.utcfromtimestamp(int(t_from) / 1000).replace(tzinfo=timezone.utc)
+    to_dt   = datetime.utcfromtimestamp(int(t_to)   / 1000).replace(tzinfo=timezone.utc)
 
-    day = datetime(start_day.year, start_day.month, start_day.day, tzinfo=timezone.utc)
+    day = _utc_midnight(from_dt)
+    end_day = _utc_midnight(to_dt)
+
     out: List[Dict] = []
     while day <= end_day:
         day_ms = int(day.timestamp() * 1000)
@@ -204,7 +267,6 @@ def simulate_exits_on_m1(state: StateManager, db: Database, cfg: Config, m1: Dic
         if tp and lo <= tp:
             _book_close_and_update_equity(state, db, cfg, pos, tp, "TP"); return
 
-
 def run_backtest(symbol: str,
                  days: int,
                  init_equity: float,
@@ -230,7 +292,7 @@ def run_backtest(symbol: str,
     cfg.start_time_ms = None                    # не ограничиваем «isActive» в bt
     strat = KWINStrategy(cfg, api=broker, state_manager=state, db=db)
 
-    # 15m история
+    # 15m история (с выравниванием и тёплым стартом)
     data15 = load_m15_window(broker, symbol, days=int(days), sfp_len=int(getattr(cfg, "sfp_len", 2)))
     if data15.m15.empty:
         st.error("Не удалось загрузить 15m историю.")
@@ -399,7 +461,7 @@ with st.form("backtest_form"):
 
 # ========================= запуск бэктеста =========================
 if submitted:
-    # полный сброс кэша перед каждым запуском
+    # полный сброс кэша перед каждым запуском (пробиваем @st.cache_data/@st.cache_resource)
     try: st.cache_data.clear()
     except Exception: pass
     try: st.cache_resource.clear()
