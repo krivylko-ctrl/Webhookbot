@@ -64,13 +64,15 @@ class BacktestBroker:
         self._last_price[symbol] = float(price)
 
     def get_price(self, symbol: str, source: str = "last") -> float:
+        # Для бэктеста используем локально «подтверждённую» цену
         return float(self._last_price.get(symbol, 0.0))
 
     # ---- ордерные заглушки ----
     def place_order(self, **_kwargs):
         return {"ok": True, "filled": True, "msg": "backtest fill"}
 
-    def update_position_stop_loss(self, symbol: str, new_sl: float):
+    def update_position_stop_loss(self, symbol: str, new_sl: float, **_kwargs):
+        # Совместимость сигнатуры с реальным API (приходит trigger_by_source и др.)
         return True
 
     def modify_order(self, **_kwargs):
@@ -195,7 +197,6 @@ def load_m1_day(_api: BacktestBroker, symbol: str, intrabar_tf: str, day_start_m
     Минутки/интрабар за ОДИН ДЕНЬ: [day_start .. day_start+24h], с выравниванием и перекрытием.
     Кэшируется поминутно по дням => ~N запросов на N дней.
     """
-    # tf_ms пригодится, если решим делать под-чанки по TF (оставим для читаемости)
     tf_ms = int(intrabar_tf) * 60_000  # noqa: F841
     day_start_ms = _align_floor(day_start_ms, 24 * 60 * 60 * 1000)
     day_end_ms = day_start_ms + 24 * 60 * 60 * 1000 - 1
@@ -306,7 +307,6 @@ def run_backtest(symbol: str,
     strat = KWINStrategy(cfg, api=broker, state_manager=state, db=db)
 
     # 15m история (с выравниванием и тёплым стартом)
-    # — исправили опечатку + функция всё равно выдержит 'sfn_len'/'sfп_len' благодаря **kwargs
     data15 = load_m15_window(broker, symbol, days=int(days), sfp_len=int(getattr(cfg, "sfp_len", 2)))
     if data15.m15.empty:
         st.error("Не удалось загрузить 15m историю.")
@@ -369,7 +369,8 @@ with st.form("backtest_form"):
     with c0c:
         price_src = st.selectbox("Источник цены для логики", options=["last", "mark"], index=0)
     with c0d:
-        bt_days = st.selectbox("Период бэктеста (дней)", [7, 14, 30, 39, 60], index=3)
+        # Убрали 39 дней из списка
+        bt_days = st.selectbox("Период бэктеста (дней)", [7, 14, 30, 60], index=2)
 
     st.markdown("---")
 
@@ -394,7 +395,7 @@ with st.form("backtest_form"):
     with z1:
         use_swing_sl = st.checkbox("SL от свинга (pivot)", value=bool(getattr(cfg, "use_swing_sl", True)))
     with z2:
-        use_prev_candle_sl = st.checkbox("SL от свечи [1]", value=bool(getattr(cfg, "use_prev_candle_sl", False)))
+        use_prev_candle_sl = st.checkbox("SL от SFP-свечи [0]", value=False)  # дефолт выкл.
     with z3:
         sl_buf_ticks = st.number_input("Буфер к SL (ticks)", min_value=0, max_value=1000,
                                        value=int(getattr(cfg, "sl_buf_ticks", 40)), step=1)
@@ -490,7 +491,7 @@ with st.form("backtest_form"):
     st.markdown("---")
 
     # ====== Intrabar entries ======
-    intrabar_entries = st.checkbox("🔁 Intrabar entries (calc_on_every_tick)", value=True)
+    intrabar_entries = st.checkbox("🔁 Intrabar entries (calc_on_every_tick)", value=False)
 
     submitted = st.form_submit_button("🚀 Запустить бэктест", use_container_width=True)
 
