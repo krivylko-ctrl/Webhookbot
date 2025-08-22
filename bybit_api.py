@@ -16,7 +16,7 @@ except Exception:
 
 
 class BybitAPI:
-    """Лёгкая обёртка над Bybit v5 (HTTP + паблик WS). Совместима с KWINStrategy/TrailEngine.
+    """Лёгкая обёртка над Bybit v5 (HTTP + паблик WS).
        По умолчанию — категория linear (USDT-M perpetual/фьючерсы)."""
 
     def __init__(self, api_key: str, api_secret: str, testnet: bool = False):
@@ -119,7 +119,13 @@ class BybitAPI:
 
     @staticmethod
     def _map_trigger_by(source: str) -> str:
-        return "MarkPrice" if str(source).lower() == "mark" else "LastPrice"
+        s = str(source).lower()
+        # v5 ожидает 'MarkPrice' / 'LastPrice' / (редко 'IndexPrice')
+        if s.startswith("mark"):
+            return "MarkPrice"
+        if s.startswith("index"):
+            return "IndexPrice"
+        return "LastPrice"
 
     # ==================== конфиг ====================
 
@@ -295,7 +301,7 @@ class BybitAPI:
         take_profit: Optional[float] = None,
         order_link_id: Optional[str] = None,
         reduce_only: bool = False,
-        trigger_by_source: str = "last",
+        trigger_by_source: str = "mark",
         time_in_force: Optional[str] = None,
         position_idx: Optional[int] = None,
         tpsl_mode: Optional[str] = None,
@@ -320,6 +326,7 @@ class BybitAPI:
         if tpsl_mode:
             params["tpslMode"] = str(tpsl_mode)
 
+        # SL/TP + источник триггера (MarkPrice/LastPrice)
         if stop_loss is not None:
             params["stopLoss"] = str(stop_loss)
             params["slTriggerBy"] = self._map_trigger_by(trigger_by_source)
@@ -327,6 +334,7 @@ class BybitAPI:
             params["takeProfit"] = str(take_profit)
             params["tpTriggerBy"] = self._map_trigger_by(trigger_by_source)
 
+        # для stop/conditional-ордеров указываем общий triggerBy
         if orderType.lower() in {"stop", "conditional"}:
             params["triggerBy"] = self._map_trigger_by(trigger_by_source)
 
@@ -341,7 +349,7 @@ class BybitAPI:
         symbol: str,
         new_sl: float,
         *,
-        trigger_by_source: str = "last",
+        trigger_by_source: str = "mark",
         position_idx: Optional[int] = None
     ) -> bool:
         """
@@ -377,7 +385,7 @@ class BybitAPI:
         qty: Optional[float] = None,
         stop_loss: Optional[float] = None,
         take_profit: Optional[float] = None,
-        trigger_by_source: str = "last",
+        trigger_by_source: str = "mark",
     ) -> Optional[Dict]:
         """
         Изменение ордера. Если ID/LinkID не передан, а хотим поменять только SL/TP,
