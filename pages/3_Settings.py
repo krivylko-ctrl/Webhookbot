@@ -103,9 +103,13 @@ def main():
             index=["1","3","5"].index(str(getattr(config, "intrabar_tf", "1"))),
             help="Таймфрейм для интрабарной логики/данных."
         )
+
+        # ===== Включить интрабар-трейл/обновления (по умолчанию ВКЛ, если конфиг ещё не сохранён) =====
+        config_file = os.path.join(ROOT_DIR, "config.json")
+        default_intrabar = True if not os.path.exists(config_file) else bool(getattr(config, "use_intrabar", True))
         use_intrabar = st.checkbox(
             "Включить интрабар-трейл/обновления",
-            value=bool(getattr(config, "use_intrabar", True))
+            value=default_intrabar
         )
 
     st.markdown("---")
@@ -212,6 +216,7 @@ def main():
             help="extremum — считаем от экстремума бара; last — от текущей цены"
         )
     with t2:
+        # Эти поля будут сохранены в config.json (если они есть в Config.to_dict)
         trailing_basis = st.selectbox(
             "Базис трейла",
             options=["risk_r", "entry_pct"],
