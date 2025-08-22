@@ -153,11 +153,22 @@ def _fetch_aligned_window(
 
 
 @st.cache_data(show_spinner=False)
-def load_m15_window(_api: BacktestBroker, symbol: str, days: int, sfp_len: int) -> BtData:
+def load_m15_window(_api: BacktestBroker, symbol: str, days: int, sfp_len: int = 2, **kwargs) -> BtData:
     """
     15m история по ЖЁСТКОМУ окну времени + тёплый старт для пивотов.
     Возвращаем DataFrame по возрастанию времени.
+
+    Совместимость: принимаем ошибочные ключи ('sfn_len', 'sfп_len', 'sf_len', 'sfpLen')
+    и тихо маппим их на sfp_len.
     """
+    # --- совместимость с опечатками ключа ---
+    for alt in ("sfn_len", "sf_len", "sfп_len", "sfpLen"):
+        if alt in kwargs and (sfp_len is None or sfp_len == 2):
+            try:
+                sfp_len = int(kwargs[alt])
+            except Exception:
+                pass
+
     # окно бэктеста: [UTC-полночь - days, now]
     utc_midnight = _utc_midnight()
     start_dt = utc_midnight - timedelta(days=int(days))
@@ -184,7 +195,8 @@ def load_m1_day(_api: BacktestBroker, symbol: str, intrabar_tf: str, day_start_m
     Минутки/интрабар за ОДИН ДЕНЬ: [day_start .. day_start+24h], с выравниванием и перекрытием.
     Кэшируется поминутно по дням => ~N запросов на N дней.
     """
-    tf_ms = int(intrabar_tf) * 60_000
+    # tf_ms пригодится, если решим делать под-чанки по TF (оставим для читаемости)
+    tf_ms = int(intrabar_tf) * 60_000  # noqa: F841
     day_start_ms = _align_floor(day_start_ms, 24 * 60 * 60 * 1000)
     day_end_ms = day_start_ms + 24 * 60 * 60 * 1000 - 1
 
@@ -294,13 +306,13 @@ def run_backtest(symbol: str,
     strat = KWINStrategy(cfg, api=broker, state_manager=state, db=db)
 
     # 15m история (с выравниванием и тёплым стартом)
-    data15 = load_m15_window(broker, symbol, days=int(days), sfп_len=int(getattr(cfg, "sfp_len", 2)))
+    # — исправили опечатку + функция всё равно выдержит 'sfn_len'/'sfп_len' благодаря **kwargs
+    data15 = load_m15_window(broker, symbol, days=int(days), sfp_len=int(getattr(cfg, "sfp_len", 2)))
     if data15.m15.empty:
         st.error("Не удалось загрузить 15m историю.")
         return db, state, strat
 
     m15 = data15.m15.reset_index(drop=True)
-
 
     # основной цикл по закрытым 15m барам
     intrabar_tf = str(getattr(cfg, "intrabar_tf", "1"))
