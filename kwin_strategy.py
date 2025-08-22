@@ -257,6 +257,26 @@ class KWINStrategy:
         center = highs[int(right)]
         return center if center == max(highs) else None
 
+    # >>> ДОБАВКА: булева проверка подтверждённого пивота (1:1 с Pine)
+    def _pivot_confirmed(self, left: int, right: int = 1, kind: str = "low") -> bool:
+        """
+        True, если на баре [1] подтверждён pivot:
+         - kind="low": ta.pivotlow(left, right)
+         - kind="high": ta.pivothigh(left, right)
+        Центр окна — индекс 'right' (у нас это 1).
+        """
+        n = int(left) + int(right) + 1
+        if len(self.candles_15m) < n:
+            return False
+        if kind == "low":
+            arr = [float(self.candles_15m[i]["low"]) for i in range(0, n)]
+            center = arr[int(right)]
+            return center == min(arr)
+        else:
+            arr = [float(self.candles_15m[i]["high"]) for i in range(0, n)]
+            center = arr[int(right)]
+            return center == max(arr)
+
     def _detect_bull_sfp(self) -> bool:
         """
         Бычий SFP по Pine:
@@ -270,7 +290,7 @@ class KWINStrategy:
             return False
 
         # факт пивота
-        if self._pivot_low_value(L, 1) is None:
+        if not self._pivot_confirmed(L, 1, kind="low"):
             return False
 
         curr = self.candles_15m[0]
@@ -299,7 +319,7 @@ class KWINStrategy:
         if len(self.candles_15m) < (L + 2):
             return False
 
-        if self._pivot_high_value(L, 1) is None:
+        if not self._pivot_confirmed(L, 1, kind="high"):
             return False
 
         curr = self.candles_15m[0]
@@ -368,8 +388,8 @@ class KWINStrategy:
             if len(self.candles_15m) < (L + 2):
                 return
 
-            has_bull_pivot = self._pivot_low_value(L, 1)  is not None
-            has_bear_pivot = self._pivot_high_value(L, 1) is not None
+            has_bull_pivot = self._pivot_confirmed(L, 1, kind="low")
+            has_bear_pivot = self._pivot_confirmed(L, 1, kind="high")
 
             # бычий: low<low[L] и close>low[L] на минутке
             if self.can_enter_long and has_bull_pivot:
