@@ -261,23 +261,24 @@ class KWINStrategy:
         """
         Бычий SFP по Pine:
           pivotlow(L,1) подтверждён И
-          low(текущего 15m) < ref_low И
-          open(текущего 15m) > ref_low И
-          close(текущего 15m) > ref_low,
+          сравнение идёт с low[sfpLen] (а не с центром пивота),
+          условия: low < low[sfpLen] И open > low[sfpLen] И close > low[sfpLen],
         + опциональная проверка качества (wick+closeBack).
         """
         L = int(getattr(self.config, "sfp_len", 2))
         if len(self.candles_15m) < (L + 2):
             return False
-        curr = self.candles_15m[0]
-        ref_low = self._pivot_low_value(L, 1)
-        if ref_low is None:
+
+        # факт пивота
+        if self._pivot_low_value(L, 1) is None:
             return False
+
+        curr = self.candles_15m[0]
+        ref = float(self.candles_15m[L]["low"])  # === low[sfpLen] ===
 
         lo = float(curr["low"])
         op = float(curr["open"])
         cl = float(curr["close"])
-        ref = float(ref_low)
 
         cond_break = lo < ref
         cond_open  = op > ref
@@ -290,23 +291,23 @@ class KWINStrategy:
         """
         Медвежий SFP по Pine:
           pivothigh(L,1) подтверждён И
-          high(текущего 15m) > ref_high И
-          open(текущего 15m) < ref_high И
-          close(текущего 15m) < ref_high,
+          сравнение с high[sfpLen],
+          условия: high > high[sfpLen] И open < high[sfpLen] И close < high[sfpLen],
         + опциональная проверка качества (wick+closeBack).
         """
         L = int(getattr(self.config, "sfp_len", 2))
         if len(self.candles_15m) < (L + 2):
             return False
-        curr = self.candles_15m[0]
-        ref_high = self._pivot_high_value(L, 1)
-        if ref_high is None:
+
+        if self._pivot_high_value(L, 1) is None:
             return False
+
+        curr = self.candles_15m[0]
+        ref = float(self.candles_15m[L]["high"])  # === high[sfpLen] ===
 
         hi = float(curr["high"])
         op = float(curr["open"])
         cl = float(curr["close"])
-        ref = float(ref_high)
 
         cond_break = hi > ref
         cond_open  = op < ref
@@ -355,7 +356,7 @@ class KWINStrategy:
         """
         Имитация «calc_on_every_tick»: если внутри текущего 15m возникает SFP,
         то вход выполняется немедленно по цене закрытия M1.
-        Условия соответствуют Pine (без 'open' на m1 — Pine проверяет на 15m).
+        Требуем pivot(L,1) и сравниваем с low[sfpLen]/high[sfpLen] (как в Pine).
         """
         try:
             if not (self.candles_15m and self._is_in_backtest_window_utc(int(self.candles_15m[0]["timestamp"])) and self._is_after_cycle_start(int(self.candles_15m[0]["timestamp"]))):
@@ -367,22 +368,24 @@ class KWINStrategy:
             if len(self.candles_15m) < (L + 2):
                 return
 
-            ref_low = self._pivot_low_value(L, 1)
-            ref_high = self._pivot_high_value(L, 1)
+            has_bull_pivot = self._pivot_low_value(L, 1)  is not None
+            has_bear_pivot = self._pivot_high_value(L, 1) is not None
 
-            # бычий
-            if self.can_enter_long and ref_low is not None:
+            # бычий: low<low[L] и close>low[L] на минутке
+            if self.can_enter_long and has_bull_pivot:
+                ref = float(self.candles_15m[L]["low"])  # low[sfpLen]
                 lo = float(m1["low"]); cl = float(m1["close"])
-                if (lo < float(ref_low)) and (cl > float(ref_low)):
-                    if not getattr(self.config, "use_sfp_quality", True) or self._check_bull_sfp_quality({"low": lo, "close": cl}, float(ref_low)):
+                if (lo < ref) and (cl > ref):
+                    if not getattr(self.config, "use_sfp_quality", True) or self._check_bull_sfp_quality({"low": lo, "close": cl}, ref):
                         self._process_long_entry(entry_override=cl)
                         return
 
-            # медвежий
-            if self.can_enter_short and ref_high is not None:
+            # медвежий: high>high[L] и close<high[L] на минутке
+            if self.can_enter_short and has_bear_pivot:
+                ref = float(self.candles_15m[L]["high"])  # high[sfpLen]
                 hi = float(m1["high"]); cl = float(m1["close"])
-                if (hi > float(ref_high)) and (cl < float(ref_high)):
-                    if not getattr(self.config, "use_sfp_quality", True) or self._check_bear_sfp_quality({"high": hi, "close": cl}, float(ref_high)):
+                if (hi > ref) and (cl < ref):
+                    if not getattr(self.config, "use_sfp_quality", True) or self._check_bear_sfp_quality({"high": hi, "close": cl}, ref):
                         self._process_short_entry(entry_override=cl)
                         return
         except Exception as e:
@@ -684,8 +687,8 @@ class KWINStrategy:
                     rr_last = (price - entry) / risk   if direction == "long" else (entry - price) / risk
                     rr_need = float(getattr(self.config, "arm_rr", 0.5))
                     basis   = str(getattr(self.config, "arm_rr_basis", "extremum")).lower()
-                    rr_now  = rr_ext if basis == "extremum" else rr_last
-                    rr_alt  = rr_last if basis == "extremum" else rr_ext
+                    rr_now  = rr_ext if basis == "extremум" else rr_last
+                    rr_alt  = rr_last if basis == "extremум" else rr_ext
 
                     if rr_now >= rr_need or rr_alt >= rr_need:
                         armed = True
