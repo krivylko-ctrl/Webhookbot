@@ -38,19 +38,11 @@ class BacktestBroker:
     Брокер для бэктеста:
       • отдаёт РЕАЛЬНЫЕ бары Bybit (HTTP v5),
       • хранит «текущую» цену, которую стратегия читает через get_price(),
-      • place_order/update_position_stop_loss/modify_order — безопасные заглушки,
-        чтобы стратегия и трейлинг работали, но без реальных ордеров.
+      • place_order/update_position_stop_loss/modify_order — безопасные заглушки.
     """
     def __init__(self, market: BybitAPI):
         self.market = market
-        # строго деривативы (если у API есть такой метод)
-        try:
-            if hasattr(self.market, "force_linear"):
-                self.market.force_linear()
-            elif hasattr(self.market, "set_market_type"):
-                self.market.set_market_type("linear")
-        except Exception:
-            pass
+        self.market.force_linear()  # строго фьючерсы/перпетуалы
         self._last_price: Dict[str, float] = {}
 
     # ---- маркет-данные (реальные) ----
@@ -197,6 +189,8 @@ def run_backtest(symbol: str,
 
     # стратегия
     cfg.price_for_logic = str(price_source_for_logic).lower()
+    # отключаем фильтр «isActive» в бэктесте
+    cfg.start_time_ms = None
     strat = KWINStrategy(cfg, api=broker, state_manager=state, db=db)
 
     # история
@@ -207,7 +201,7 @@ def run_backtest(symbol: str,
         return db, state, strat
 
     m15 = data.m15.reset_index(drop=True)
-    # основной цикл по закрытым 15m барам (OLD -> NEW)
+    # основной цикл по закрытым 15m барам
     for i in range(0, len(m15) - 1):
         bar = m15.iloc[i].to_dict()
         t_curr = int(bar["timestamp"])
@@ -357,21 +351,35 @@ with st.form("backtest_form"):
         taker_fee = st.number_input("Taker fee (decimal)", min_value=0.0, max_value=0.01,
                                     value=float(getattr(cfg, "taker_fee_rate", 0.00055)), step=0.00005)
 
+    st.markdown("---")
+
+    # ====== Intrabar entries (calc_on_every_tick) ======
+    intrabar_entries = st.checkbox("🔁 Intrabar entries (calc_on_every_tick)", value=True)
+    # (интрабарный TF фиксируем в 1m, как в Pine)
     submitted = st.form_submit_button("🚀 Запустить бэктест", use_container_width=True)
 
 
 # ========================= запуск бэктеста =========================
 def _compute_limits_from_days(days: int) -> Tuple[int, int]:
-    """Конвертируем дни в лимиты баров (с разумным запасом)."""
+    """Конвертируем дни в лимиты баров (ограничим верхние лимиты API)."""
     m15_per_day = 24 * 4         # 96
     m1_per_day  = 24 * 60        # 1440
-    # + запас баров, чтобы корректно работали окна пивотов/фильтров
-    m15_limit = min(5000, days * m15_per_day + 50)
-    m1_limit  = min(5000, days * m1_per_day + 200)
+    m15_limit = min(5000, days * m15_per_day + 2)
+    m1_limit  = min(5000, days * m1_per_day + 2)
     return m15_limit, m1_limit
 
 
 if submitted:
+    # перед стартом — ЖЁСТКО чистим кэш, чтобы каждый запуск был с нуля
+    try:
+        st.cache_data.clear()
+    except Exception:
+        pass
+    try:
+        st.cache_resource.clear()
+    except Exception:
+        pass
+
     # применяем значения в конфиг (строго без изменения механики)
     cfg.symbol = symbol.strip().upper()
     cfg.risk_reward = float(risk_reward)
@@ -403,12 +411,11 @@ if submitted:
     cfg.price_for_logic = str(price_src).lower()
     cfg.intrabar_tf = "1"                  # минутки
     cfg.days_back = int(bt_days)           # окно бэктеста от текущей UTC-полуночи назад
+    cfg.use_intrabar_entries = bool(intrabar_entries)
+    cfg.start_time_ms = None               # не режем историю в бэктесте
 
     # лимиты истории из выбора периода
     m15_limit, m1_limit = _compute_limits_from_days(int(bt_days))
-
-    # === ВАЖНО: каждый запуск — чистый кэш истории ===
-    st.cache_data.clear()
 
     with st.spinner("Грузим историю и запускаем бэктест…"):
         db, state, strat = run_backtest(
