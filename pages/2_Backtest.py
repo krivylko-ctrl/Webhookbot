@@ -43,7 +43,14 @@ class BacktestBroker:
     """
     def __init__(self, market: BybitAPI):
         self.market = market
-        self.market.force_linear()  # строго фьючерсы/перпетуалы
+        # строго деривативы (если у API есть такой метод)
+        try:
+            if hasattr(self.market, "force_linear"):
+                self.market.force_linear()
+            elif hasattr(self.market, "set_market_type"):
+                self.market.set_market_type("linear")
+        except Exception:
+            pass
         self._last_price: Dict[str, float] = {}
 
     # ---- маркет-данные (реальные) ----
@@ -200,7 +207,7 @@ def run_backtest(symbol: str,
         return db, state, strat
 
     m15 = data.m15.reset_index(drop=True)
-    # основной цикл по закрытым 15m барам
+    # основной цикл по закрытым 15m барам (OLD -> NEW)
     for i in range(0, len(m15) - 1):
         bar = m15.iloc[i].to_dict()
         t_curr = int(bar["timestamp"])
@@ -355,11 +362,12 @@ with st.form("backtest_form"):
 
 # ========================= запуск бэктеста =========================
 def _compute_limits_from_days(days: int) -> Tuple[int, int]:
-    """Конвертируем дни в лимиты баров (ограничим верхние лимиты API)."""
+    """Конвертируем дни в лимиты баров (с разумным запасом)."""
     m15_per_day = 24 * 4         # 96
     m1_per_day  = 24 * 60        # 1440
-    m15_limit = min(5000, days * m15_per_day + 2)
-    m1_limit  = min(5000, days * m1_per_day + 2)
+    # + запас баров, чтобы корректно работали окна пивотов/фильтров
+    m15_limit = min(5000, days * m15_per_day + 50)
+    m1_limit  = min(5000, days * m1_per_day + 200)
     return m15_limit, m1_limit
 
 
@@ -398,6 +406,9 @@ if submitted:
 
     # лимиты истории из выбора периода
     m15_limit, m1_limit = _compute_limits_from_days(int(bt_days))
+
+    # === ВАЖНО: каждый запуск — чистый кэш истории ===
+    st.cache_data.clear()
 
     with st.spinner("Грузим историю и запускаем бэктест…"):
         db, state, strat = run_backtest(
@@ -459,7 +470,7 @@ if submitted:
         for col in ("entry_time","exit_time"):
             if col in df.columns: df[col] = pd.to_datetime(df[col], errors="coerce")
         for col in ("pnl","rr","entry_price","exit_price","quantity","qty"):
-            if col in df.columns: df[col] = pd.to_numeric(df[col], errors="coerce")
+            if col in df.columns: df[col] = pd.to_numeric(df[col], errors='coerce')
         if "quantity" not in df.columns and "qty" in df.columns:
             df["quantity"] = df["qty"]
         cols = [c for c in ["entry_time","direction","entry_price","exit_price","quantity","pnl","rr","status","exit_reason"] if c in df.columns]
