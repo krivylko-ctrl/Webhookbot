@@ -53,7 +53,7 @@ class Config:
         self.enable_smart_trail   = env("ENABLE_SMART_TRAIL", "true").lower() not in ("0", "false", "no")
         self.smart_trail_mode     = env("SMART_TRAIL_MODE", "pine").lower()  # "pine"|"legacy" (на будущее)
         self.trailing_perc        = float(env("TRAILING_PERC", "0.5"))         # %
-        self.trailing_offset_perc = float(env("TRAILING_OFFSET_PERC", "0.4"))  # %
+        self.trailing_offset_perc = float(env("TRAILING_OFFSET_PERC", "0.3"))  # %
         self.trailing_offset      = self.trailing_offset_perc                  # alias для совместимости
 
         # ARM (вооружение трейла после достижения RR)
@@ -73,6 +73,7 @@ class Config:
 
         # === ИНТРАБАР ===
         self.use_intrabar        = env("USE_INTRABAR", "false").lower() not in ("0","false","no")
+        self.use_intrabar_entries = env("USE_INTRABAR_ENTRIES", "false").lower() not in ("0","false","no")
         self.intrabar_tf         = env("INTRABAR_TF", "1")      # "1"|"3"|"5" (строкой)
         self.intrabar_pull_limit = int(env("INTRABAR_PULL_LIMIT", "1500"))
         self.smooth_intrabar     = env("SMOOTH_INTRABAR", "true").lower() not in ("0","false","no")
