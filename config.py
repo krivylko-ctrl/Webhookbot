@@ -66,18 +66,20 @@ class Config:
         self.trigger_price_source = env("TRIGGER_PRICE_SOURCE", "mark").lower()# "last"|"mark"
 
         # === ЗОНАЛЬНЫЙ СТОП ===
-        # переключатели базы SL: свинговый пивот и/или экстремум SFP-свечи [0]
+# переключатели базы SL: свинговый pivot и/или экстремум SFP-свечи [0]
         self.use_swing_sl       = env("USE_SWING_SL", "true").lower() not in ("0","false","no")
-        self.use_sfp_candle_sl  = env("USE_SFP_CANDLE_SL", "false").lower() not in ("0","false","no")
-        self.sl_buf_ticks       = int(env("SL_BUF_TICKS", "40"))
+        self.use_prev_candle_sl = env("USE_PREV_CANDLE_SL", "false").lower() not in ("0","false","no")
+        self.sl_buf_ticks       = int(env("SL_BUF_TICKS", "0"))  # если нужен отступ — увеличь
+        self.use_atr_buffer     = env("USE_ATR_BUFFER", "false").lower() not in ("0","false","no")
+        self.atr_mult           = float(env("ATR_MULT", "0.0"))
 
-        # === ИНТРАБАР ===
-        self.use_intrabar        = env("USE_INTRABAR", "false").lower() not in ("0","false","no")
-        self.use_intrabar_entries = env("USE_INTRABAR_ENTRIES", "false").lower() not in ("0","false","no")
-        self.intrabar_tf         = env("INTRABAR_TF", "1")      # "1"|"3"|"5" (строкой)
-        self.intrabar_pull_limit = int(env("INTRABAR_PULL_LIMIT", "1500"))
-        self.smooth_intrabar     = env("SMOOTH_INTRABAR", "true").lower() not in ("0","false","no")
-        self.intrabar_steps      = int(env("INTRABAR_STEPS", "6"))
+# === ИНТРАБАР ===
+        self.use_intrabar         = env("USE_INTRABAR", "true").lower() not in ("0","false","no")   # 1m только для трейлинга
+        self.use_intrabar_entries = env("USE_INTRABAR_ENTRIES", "false").lower() not in ("0","false","no")  # ⛔ входы по M1
+        self.intrabar_tf          = env("INTRABAR_TF", "1")
+        self.intrabar_pull_limit  = int(env("INTRABAR_PULL_LIMIT", "1500"))
+        self.smooth_intrabar      = env("SMOOTH_INTRABAR", "true").lower() not in ("0","false","no")
+        self.intrabar_steps       = int(env("INTRABAR_STEPS", "6"))
 
         # === ОГРАНИЧЕНИЯ ПОЗИЦИИ ===
         self.limit_qty_enabled = env("LIMIT_QTY_ENABLED", "true").lower() not in ("0","false","no")
@@ -255,6 +257,8 @@ class Config:
             "trigger_price_source": self.trigger_price_source,
 
             # зональный SL
+            "use_prev_candle_sl": self.use_prev_candle_sl,
+            "use_intrabar_entries": self.use_intrabar_entries,
             "use_swing_sl": self.use_swing_sl,
             "use_sfp_candle_sl": self.use_sfp_candle_sl,
             "sl_buf_ticks": self.sl_buf_ticks,
