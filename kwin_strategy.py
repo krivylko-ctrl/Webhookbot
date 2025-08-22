@@ -1,4 +1,4 @@
-# kwin_strategy.py  — обновлено: добавлен расчёт SL-зоны и интеграция в входы
+# kwin_strategy.py  — обновлено: SL от SFP-свечи [0] / свинговый пивот, без ATR/prev[1]
 from __future__ import annotations
 
 import time
@@ -37,7 +37,7 @@ class KWINStrategy:
         self.state = state_manager
         self.db = db
 
-        # смарт-трейл движок (без изменений)
+        # смарт-трейл движок
         self.trail_engine: Optional[TrailEngine] = None
         try:
             self.trail_engine = TrailEngine(config, state_manager, api)
@@ -83,7 +83,7 @@ class KWINStrategy:
         # (необяз.) поддержка «cycle start» как в Pine:
         self.start_time_ms: Optional[int] = getattr(self.config, "start_time_ms", None)
 
-        # >>> ВСТАВКА: флаг одноразового проигрывания истории 15m <<<
+        # одноразовое проигрывание истории 15m
         self._history_replayed: bool = False
 
     # ============ ВСПОМОГАТЕЛЬНОЕ ============
@@ -120,38 +120,14 @@ class KWINStrategy:
         self.config.qty_step = self.qty_step or 0.01
         self.config.min_order_qty = self.min_order_qty or 0.01
 
-    # ---------- NEW: ATR(15m) для буфера SL ----------
-    def _atr_15m(self, period: int = 14) -> Optional[float]:
-        """
-        Классический ATR по 15m: TR = max(H-L, |H-Cprev|, |L-Cprev|).
-        Возвращает среднее TR за period баров. Нужен только для SL-буфера.
-        """
-        try:
-            bars = self.candles_15m
-            if not bars or len(bars) < period + 1:
-                return None
-            # работаем от старых к новым
-            arr = sorted(bars[:period + 1], key=lambda x: x["timestamp"])
-            trs: List[float] = []
-            for i in range(1, len(arr)):
-                h = float(arr[i]["high"]); l = float(arr[i]["low"])
-                cp = float(arr[i-1]["close"])
-                tr = max(h - l, abs(h - cp), abs(l - cp))
-                trs.append(tr)
-            if not trs:
-                return None
-            return float(np.mean(trs))
-        except Exception:
-            return None
-
-    # ---------- NEW: SL «зона» как в Pine ----------
+    # ---------- SL «зона» как в TV ----------
     def _calc_sl_with_zone(self, direction: str, entry_price: float) -> Optional[float]:
         """
-        База SL:
-          - если use_prev_candle_sl: long -> low[1], short -> high[1]
-          - elif use_swing_sl: long -> min(low[1], low[sfp_len]), short -> max(high[1], high[sfp_len])
-          - иначе fallback: prev bar low/high.
-        Далее: буфер по тикам (sl_buf_ticks) и опционально ATR*atr_mult.
+        База SL выбирается в порядке приоритета:
+          1) use_sfp_candle_sl=True  -> long: low[0];  short: high[0]
+          2) use_swing_sl=True       -> long: min(low[1], low[sfp_len]); short: max(high[1], high[sfp_len])
+          3) fallback                 -> long: low[1];  short: high[1]
+        Затем добавляется буфер по тикам (sl_buf_ticks).
         Округление: long -> floor_to_tick, short -> ceil_to_tick.
         """
         try:
@@ -159,15 +135,17 @@ class KWINStrategy:
             if len(self.candles_15m) < max(L + 1, 2):
                 return None
 
+            cur = self.candles_15m[0]
             prev = self.candles_15m[1]
-            use_prev = bool(getattr(self.config, "use_prev_candle_sl", False))
+
+            use_sfp_candle = bool(getattr(self.config, "use_sfp_candle_sl", False))
             use_swing = bool(getattr(self.config, "use_swing_sl", True))
 
             tick = float(self.tick_size or 0.01)
             buf_ticks = int(getattr(self.config, "sl_buf_ticks", 40) or 0)
             buf_px = buf_ticks * tick
 
-            # кандидаты от пивота
+            # кандидаты от пивота (для свингового режима)
             pivot_low = None
             pivot_high = None
             if use_swing and len(self.candles_15m) > L:
@@ -177,45 +155,26 @@ class KWINStrategy:
                 except Exception:
                     pivot_low = pivot_high = None
 
-            # базовые уровни
+            # базовые уровни по приоритету
             if direction == "long":
-                base_prev = float(prev["low"])
-                if use_prev:
-                    base = base_prev
+                if use_sfp_candle:
+                    base = float(cur["low"])
                 elif use_swing and pivot_low is not None:
-                    base = min(base_prev, pivot_low)
+                    base = min(float(prev["low"]), float(pivot_low))
                 else:
-                    base = base_prev
-                # применяем буферы
+                    base = float(prev["low"])
                 sl_raw = base - buf_px
-            else:
-                base_prev = float(prev["high"])
-                if use_prev:
-                    base = base_prev
-                elif use_swing and pivot_high is not None:
-                    base = max(base_prev, pivot_high)
-                else:
-                    base = base_prev
-                sl_raw = base + buf_px
-
-            # ATR-буфер (опционально)
-            if bool(getattr(self.config, "use_atr_buffer", False)):
-                atr_mult = float(getattr(self.config, "atr_mult", 0.0) or 0.0)
-                if atr_mult > 0:
-                    atr_val = self._atr_15m(period=14)
-                    if atr_val is not None and atr_val > 0:
-                        if direction == "long":
-                            sl_raw -= atr_mult * atr_val
-                        else:
-                            sl_raw += atr_mult * atr_val
-
-            # округление к тику в правильную сторону
-            if direction == "long":
                 sl = floor_to_tick(sl_raw, tick)
-                # гарантия: SL ниже entry
-                if sl >= entry_price:
+                if sl >= entry_price:  # страхуемся
                     sl = floor_to_tick(entry_price - tick, tick)
             else:
+                if use_sfp_candle:
+                    base = float(cur["high"])
+                elif use_swing and pivot_high is not None:
+                    base = max(float(prev["high"]), float(pivot_high))
+                else:
+                    base = float(prev["high"])
+                sl_raw = base + buf_px
                 sl = ceil_to_tick(sl_raw, tick)
                 if sl <= entry_price:
                     sl = ceil_to_tick(entry_price + tick, tick)
@@ -268,7 +227,7 @@ class KWINStrategy:
             self._ensure_desc(self.candles_1m)
 
             pos = self.state.get_current_position() if self.state else None
-            if pos and pos.get("status") == "open" and getattr(self.config, "use_intrabar", True):
+            if pos and pos.get("status") == "open" and getattr(self.config, "use_intrabar", False):
                 self._update_smart_trailing(pos)
 
             if (not pos) and getattr(self.config, "use_intrabar_entries", False):
@@ -283,9 +242,9 @@ class KWINStrategy:
             if not self.api or not hasattr(self.api, "get_klines"):
                 return
 
-            # >>> ВСТАВКА: динамический объём истории по 15m <<<
-            need_15m = int(getattr(self.config, "days_back", 30)) * 96 + 50  # по ~96 баров на день
-            need_15m = max(200, min(5000, need_15m))  # рамки безопасности
+            # объём истории по 15m
+            need_15m = int(getattr(self.config, "days_back", 30)) * 96 + 50
+            need_15m = max(200, min(5000, need_15m))
 
             # 15m
             kl15 = self.api.get_klines(self.symbol, "15", need_15m) or []
@@ -307,10 +266,9 @@ class KWINStrategy:
             kl1.sort(key=lambda x: x.get("timestamp", 0), reverse=True)
             self.candles_1m = kl1[:lim]
 
-            # >>> ВСТАВКА: однократное «проигрывание» всей истории 15m <<<
+            # однократное «проигрывание» всей истории 15m
             if self.candles_15m and not self._history_replayed:
                 bars_old_to_new = sorted(self.candles_15m, key=lambda x: x.get("timestamp", 0))
-                # очистим и прогоним по одной свече, имитируя закрытие каждого бара
                 self.candles_15m = []
                 self.last_processed_bar_ts = 0
                 for b in bars_old_to_new:
@@ -318,7 +276,7 @@ class KWINStrategy:
                 self._history_replayed = True
                 return
 
-            # стандартное поведение (если уже проиграно)
+            # стандартное поведение
             if self.candles_15m:
                 ts = int(self.candles_15m[0].get("timestamp") or 0)
                 aligned = self._align_15m_ms(ts)
@@ -329,12 +287,11 @@ class KWINStrategy:
                     self.run_cycle()
                 else:
                     pos = self.state.get_current_position() if self.state else None
-                    if pos and pos.get("status") == "open" and getattr(self.config, "use_intrabar", True):
+                    if pos and pos.get("status") == "open" and getattr(self.config, "use_intrabar", False):
                         self._update_smart_trailing(pos)
         except Exception as e:
             print(f"[update_candles] {e}")
-
-    # ---------- ЛОГИКА ВХОДОВ ----------
+    # ---------- ЛОГИКА ВХОДОВ (совместимость) ----------
 
     def on_bar_close(self):
         """Совместимость (основная точка — run_cycle())."""
@@ -472,7 +429,7 @@ class KWINStrategy:
                 ref = float(self.candles_15m[L]["low"])  # low[sfpLen]
                 lo = float(m1["low"]); cl = float(m1["close"])
                 if (lo < ref) and (cl > ref):
-                    if not getattr(self.config, "use_sfp_quality", True) or self._check_bull_sfp_quality({"low": lo, "close": cl}, ref):
+                    if (not getattr(self.config, "use_sfp_quality", True)) or self._check_bull_sfp_quality({"low": lo, "close": cl}, ref):
                         self._process_long_entry(entry_override=cl)
                         return
 
@@ -480,7 +437,7 @@ class KWINStrategy:
                 ref = float(self.candles_15m[L]["high"])  # high[sfpLen]
                 hi = float(m1["high"]); cl = float(m1["close"])
                 if (hi > ref) and (cl < ref):
-                    if not getattr(self.config, "use_sfp_quality", True) or self._check_bear_sfp_quality({"high": hi, "close": cl}, ref):
+                    if (not getattr(self.config, "use_sfp_quality", True)) or self._check_bear_sfp_quality({"high": hi, "close": cl}, ref):
                         self._process_short_entry(entry_override=cl)
                         return
         except Exception as e:
@@ -589,7 +546,7 @@ class KWINStrategy:
             print(f"[validate_position] {e}")
             return False
 
-    # ========== ОБНОВЛЕНО: входы используют SL «зоной» ==========
+    # ========== ВХОДЫ: используем SL «зоной» ==========
     def _process_long_entry(self, entry_override: Optional[float] = None):
         try:
             if len(self.candles_15m) < 2:
@@ -727,11 +684,11 @@ class KWINStrategy:
         except Exception as e:
             print(f"[process_short_entry] {e}")
 
-    # ---------- Трейлинг (без изменений механики) ----------
+    # ---------- Трейлинг ----------
 
     def _get_bar_extremes_for_trailing(self, current_price: float) -> Tuple[float, float]:
         try:
-            if getattr(self.config, "use_intrabar", True) and self.candles_1m:
+            if getattr(self.config, "use_intrabar", False) and self.candles_1m:
                 last = self.candles_1m[0]
                 return float(last["high"]), float(last["low"])
             elif self.candles_15m:
@@ -820,7 +777,11 @@ class KWINStrategy:
                 return True
 
             if hasattr(self.api, "update_position_stop_loss"):
-                ok = self.api.update_position_stop_loss(self.symbol, new_sl)
+                ok = self.api.update_position_stop_loss(
+                    self.symbol,
+                    new_sl,
+                    trigger_by_source=getattr(self.config, "trigger_price_source", "mark"),
+                )
                 if ok:
                     position["stop_loss"] = float(new_sl)
                     if self.state:
@@ -829,7 +790,11 @@ class KWINStrategy:
                     return True
 
             if hasattr(self.api, "modify_order"):
-                _ = self.api.modify_order(symbol=position.get("symbol", self.symbol), stop_loss=float(new_sl))
+                _ = self.api.modify_order(
+                    symbol=position.get("symbol", self.symbol),
+                    stop_loss=float(new_sl),
+                    trigger_by_source=getattr(self.config, "trigger_price_source", "mark"),
+                )
                 position["stop_loss"] = float(new_sl)
                 if self.state:
                     self.state.set_position(position)
@@ -863,6 +828,7 @@ class KWINStrategy:
 
             pos = self.state.get_current_position() if self.state else None
             if pos and pos.get("status") == "open":
+                # Трейл обновляем вне зависимости от use_intrabar; источники экстремумов выбираются внутри
                 self._update_smart_trailing(pos)
                 return
 
