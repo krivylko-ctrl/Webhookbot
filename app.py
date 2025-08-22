@@ -67,17 +67,18 @@ def safe_get_pnl_today(db: Database) -> float:
                     pnl += float(t.get("pnl") or 0.0)
                 except Exception:
                     pass
-        return pnl
+        return float(pnl)
     except Exception:
         return 0.0
 
 def safe_get_price(bybit_api: BybitAPI, symbol: str) -> float:
-    """Достаём цену из разных возможных ключей тикара."""
+    """Достаём цену из разных возможных ключей тикера."""
     try:
         t = bybit_api.get_ticker(symbol) or {}
         for k in ("lastPrice", "last_price", "last", "markPrice", "mark_price"):
-            if k in t and t[k] not in (None, "", 0, "0"):
-                return float(t[k])
+            v = t.get(k)
+            if v not in (None, "", 0, "0"):
+                return float(v)
     except Exception:
         pass
     return 0.0
@@ -104,8 +105,10 @@ def init_components():
     config.risk_pct             = float(getattr(cfg, "RISK_PCT", getattr(config, "risk_pct", 3.0)))
     config.risk_reward          = float(getattr(cfg, "RISK_REWARD", getattr(config, "risk_reward", 1.3)))
 
+    # базовые настройки символа/интрабара
     if hasattr(cfg, "SYMBOL"):
         config.symbol = cfg.SYMBOL
+    config.intrabar_tf = str(getattr(cfg, "INTRABAR_TF", "1"))
 
     # API init
     if getattr(cfg, "BYBIT_API_KEY", None) and getattr(cfg, "BYBIT_API_SECRET", None):
