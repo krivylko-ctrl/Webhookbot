@@ -495,7 +495,7 @@ class KWINStrategy:
 
             return True
         except Exception as e:
-            print(f\"[validate_position] {e}\")
+            print(f\"[validate_position] {e}")
             return False
     # ---------- Cooldown (отключён по ТЗ) ----------
     def _in_cooldown(self, _now_ts_ms: int) -> bool:
