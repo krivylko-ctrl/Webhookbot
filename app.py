@@ -91,7 +91,7 @@ def init_components():
     db = Database()
     state_manager = StateManager(db)
 
-    # Smart Trailing / ARM — строго как в Pine
+    # ---------- Smart Trailing / ARM ----------
     config.enable_smart_trail   = bool(getattr(cfg, "ENABLE_SMART_TRAIL", True))
     config.trailing_perc        = float(getattr(cfg, "TRAILING_PERC", 0.5))
     config.trailing_offset_perc = float(getattr(cfg, "TRAILING_OFFSET_PERC", 0.4))
@@ -102,18 +102,58 @@ def init_components():
     if config.arm_rr_basis not in ("extremum", "last"):
         config.arm_rr_basis = "extremum"
 
+    # ---------- Риск/TP ----------
     config.risk_pct             = float(getattr(cfg, "RISK_PCT", getattr(config, "risk_pct", 3.0)))
     config.risk_reward          = float(getattr(cfg, "RISK_REWARD", getattr(config, "risk_reward", 1.3)))
+    config.use_take_profit      = bool(str(getattr(cfg, "USE_TAKE_PROFIT", getattr(config, "use_take_profit", True))).lower() not in ("0","false","no"))
 
-    # базовые настройки символа/интрабара
+    # ---------- Базовые ----------
     if hasattr(cfg, "SYMBOL"):
         config.symbol = cfg.SYMBOL
     config.intrabar_tf = str(getattr(cfg, "INTRABAR_TF", "1"))
 
-    # API init
+    # ---------- SFP-фильтры (wick/close-back) ----------
+    config.use_sfp_quality = bool(getattr(cfg, "USE_SFP_QUALITY", getattr(config, "use_sfp_quality", True)))
+    config.wick_min_ticks  = int(getattr(cfg, "WICK_MIN_TICKS", getattr(config, "wick_min_ticks", 7)))
+    config.close_back_pct  = float(getattr(cfg, "CLOSE_BACK_PCT", getattr(config, "close_back_pct", 1.0)))
+
+    # ---------- Зональный SL ----------
+    config.use_swing_sl        = bool(getattr(cfg, "USE_SWING_SL", getattr(config, "use_swing_sl", True)))
+    config.use_sfp_candle_sl   = bool(getattr(cfg, "USE_SFP_CANDLE_SL", getattr(config, "use_sfp_candle_sl", False)))
+    config.use_prev_candle_sl  = bool(getattr(cfg, "USE_PREV_CANDLE_SL", getattr(config, "use_prev_candle_sl", False)))
+    config.sl_buf_ticks        = int(getattr(cfg, "SL_BUF_TICKS", getattr(config, "sl_buf_ticks", 40)))
+    config.use_atr_buffer      = bool(getattr(cfg, "USE_ATR_BUFFER", getattr(config, "use_atr_buffer", False)))
+    config.atr_mult            = float(getattr(cfg, "ATR_MULT", getattr(config, "atr_mult", 0.0)))
+
+    # ---------- NEW: Lux SFP (Volume Validation) ----------
+    # Полная совместимость с настройками на скрине TradingView
+    config.enable_bull_sfp         = bool(getattr(cfg, "ENABLE_BULL_SFP", getattr(config, "enable_bull_sfp", True)))
+    config.enable_bear_sfp         = bool(getattr(cfg, "ENABLE_BEAR_SFP", getattr(config, "enable_bear_sfp", True)))
+
+    config.enable_lux_validation   = bool(getattr(cfg, "LUX_ENABLE_VALIDATION", getattr(config, "enable_lux_validation", True)))
+    # варианты: "outside_lt" | "outside_gt" | "none"
+    config.lux_validation_mode     = str(getattr(cfg, "LUX_VALIDATION_MODE", getattr(config, "lux_validation_mode", "outside_gt"))).lower()
+    if config.lux_validation_mode not in ("outside_lt", "outside_gt", "none"):
+        config.lux_validation_mode = "outside_gt"
+
+    # порог «% of Total Volume»
+    config.lux_volume_threshold_pct = float(getattr(cfg, "LUX_VOLUME_THRESHOLD_PCT", getattr(config, "lux_volume_threshold_pct", 10.0)))
+
+    # автоматический выбор LTF
+    config.lux_auto_enabled   = bool(getattr(cfg, "LUX_AUTO_ENABLED", getattr(config, "lux_auto_enabled", False)))
+    config.lux_auto_mlt       = int(getattr(cfg, "LUX_AUTO_MLT", getattr(config, "lux_auto_mlt", 10)))
+    config.lux_ltf            = str(getattr(cfg, "LUX_LTF", getattr(config, "lux_ltf", "1")))   # "1", "3", "5"...
+    config.lux_premium_enabled= bool(getattr(cfg, "LUX_PREMIUM_ENABLED", getattr(config, "lux_premium_enabled", False)))
+
+    # cooldown (чтобы не переворачивался сразу)
+    try:
+        config.cooldown_minutes = int(getattr(cfg, "COOLDOWN_MINUTES", getattr(config, "cooldown_minutes", 0)))
+    except Exception:
+        config.cooldown_minutes = 0
+
+    # ---------- API init ----------
     if getattr(cfg, "BYBIT_API_KEY", None) and getattr(cfg, "BYBIT_API_SECRET", None):
         bybit_api = BybitAPI(cfg.BYBIT_API_KEY, cfg.BYBIT_API_SECRET, testnet=False)
-        # важно: работаем с деривативами (фьючерсами)
         try:
             bybit_api.set_market_type("linear")
         except Exception:
@@ -244,11 +284,11 @@ def show_dashboard(db, state_manager, strategy):
             st.metric("📍 Позиция", "0")
 
     with col3:
-        trades_today = safe_get_trades_today(db)  # <-- безопасно
+        trades_today = safe_get_trades_today(db)
         st.metric("📊 Сделки сегодня", trades_today)
 
     with col4:
-        pnl_today = safe_get_pnl_today(db)       # <-- безопасно
+        pnl_today = safe_get_pnl_today(db)
         st.metric("💵 PnL сегодня", f"${float(pnl_today):.2f}")
 
     st.markdown("### 📈 Статистика за 30 дней")
@@ -386,12 +426,31 @@ def main():
         st.write(f"**Риск:** {config.risk_pct}%")
         st.write(f"**RR:** {config.risk_reward}")
         st.write(f"**Трейлинг:** {'✅' if config.enable_smart_trail else '❌'}")
-        with st.expander("🔧 Smart Trailing / ARM (текущие)"):
+        st.write(f"**Cooldown:** {getattr(config, 'cooldown_minutes', 0)} мин")
+
+        with st.expander("🔧 Smart Trailing / ARM"):
             st.write(f"**Trailing %:** {config.trailing_perc}%")
             st.write(f"**Trailing Offset %:** {config.trailing_offset_perc}%")
             st.write(f"**ARM after RR:** {'Да' if config.use_arm_after_rr else 'Нет'}")
             st.write(f"**ARM basis:** {config.arm_rr_basis}")
             st.write(f"**ARM RR:** {config.arm_rr}")
+
+        with st.expander("🟩🟥 Lux SFP (Volume Validation)"):
+            st.write(f"**Bullish SFP:** {'✅' if getattr(config, 'enable_bull_sfp', True) else '❌'}")
+            st.write(f"**Bearish SFP:** {'✅' if getattr(config, 'enable_bear_sfp', True) else '❌'}")
+            st.write(f"**Validation enabled:** {'✅' if getattr(config, 'enable_lux_validation', True) else '❌'}")
+            st.write(f"**Mode:** {getattr(config, 'lux_validation_mode', 'outside_gt')}")
+            st.write(f"**Volume Threshold %:** {getattr(config, 'lux_volume_threshold_pct', 10.0)}")
+            st.write(f"**Auto LTF:** {'✅' if getattr(config, 'lux_auto_enabled', False) else '❌'} "
+                     f"(mlt={getattr(config, 'lux_auto_mlt', 10)})")
+            st.write(f"**LTF:** {getattr(config, 'lux_ltf', '1')} minute(s)")
+            st.write(f"**Premium:** {'✅' if getattr(config, 'lux_premium_enabled', False) else '❌'}")
+            st.caption("Механика идентична LuxAlgo: проверяем долю объёма фитиля за пределами свинга на LTF.")
+
+        with st.expander("🛡️ Фильтры SFP"):
+            st.write(f"**Фильтр качества:** {'✅' if config.use_sfp_quality else '❌'}")
+            st.write(f"**Мин. глубина фитиля (ticks):** {config.wick_min_ticks}")
+            st.write(f"**Close-back (% of wick):** {config.close_back_pct}")
 
         # Debug: Smart Trail
         with st.expander("🧪 Debug: Trailing state"):
