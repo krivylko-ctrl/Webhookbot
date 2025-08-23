@@ -112,7 +112,7 @@ def main():
         lux_volume_validation = st.selectbox(
             "Validation",
             options=["outside_gt", "outside_lt", "none"],
-            index={"outside_gt":0, "outside_lt":1, "none":2}.get(
+            index={"outside_gt": 0, "outside_lt": 1, "none": 2}.get(
                 str(getattr(config, "lux_volume_validation", "outside_gt")).lower(), 0
             ),
             help="Правило валидации объёма на младшем ТФ (доля объёма ‘вне свинга’ относительно порога)."
@@ -148,7 +148,7 @@ def main():
         lux_ltf = st.selectbox(
             "LTF (ручной)",
             options=["1", "3", "5"],
-            index=["1","3","5"].index(str(getattr(config, "lux_ltf", "1"))),
+            index=["1", "3", "5"].index(str(getattr(config, "lux_ltf", "1"))),
             help="Если Auto выключен — используем этот младший ТФ."
         )
     with l4:
