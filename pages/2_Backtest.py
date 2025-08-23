@@ -145,6 +145,7 @@ def _fetch_aligned_window(
 
 @st.cache_data(show_spinner=False)
 def load_m15_window(_api: BacktestBroker, symbol: str, days: int, sfp_len: int = 2, **kwargs) -> BtData:
+    # обратная совместимость с опечатками
     for alt in ("sfn_len", "sf_len", "sfп_len", "sfpLen"):
         if alt in kwargs and (sfp_len is None or sfp_len == 2):
             try:
@@ -171,7 +172,6 @@ def load_m15_window(_api: BacktestBroker, symbol: str, days: int, sfp_len: int =
 
 @st.cache_data(show_spinner=False)
 def load_m1_day(_api: BacktestBroker, symbol: str, intrabar_tf: str, day_start_ms: int) -> pd.DataFrame:
-    tf_ms = int(intrabar_tf) * 60_000  # noqa: F841
     day_start_ms = _align_floor(day_start_ms, 24 * 60 * 60 * 1000)
     day_end_ms = day_start_ms + 24 * 60 * 60 * 1000 - 1
 
@@ -259,7 +259,6 @@ def derive_lux_ltf_minutes(base_tf_min: int, auto: bool, mlt: int, premium: bool
     rs_sec = max(1, tfC // max(1, int(mlt)))
     if not premium:
         rs_sec = max(60, rs_sec)  # минимум 1m
-    # переводим в ближайшие 1|3|5 минуты
     rs_min = max(1, int(round(rs_sec / 60)))
     if rs_min <= 2:
         return "1"
@@ -273,7 +272,7 @@ def run_backtest(symbol: str,
                  init_equity: float,
                  cfg: Config,
                  price_source_for_logic: str = "last") -> Tuple[Database, StateManager, KWINStrategy]:
-    """15m + интрабар M1 (по дням), Pine-точные входы/трейл, реальные бары Bybit."""
+    """15m + интрабар M1 (по дням), Lux-SFP входы, реальные бары Bybit."""
 
     # отдельная БД под бэктест (полный сброс)
     bt_db_path = f"kwin_backtest_{symbol}.db"
@@ -359,14 +358,11 @@ with st.form("backtest_form"):
 
     # ====== Основные ======
     st.subheader("📌 Основные параметры")
-    c1, c2, c3 = st.columns(3)
+    c1, c2 = st.columns(2)
     with c1:
         risk_reward = st.number_input("TP Risk/Reward Ratio", min_value=0.5, max_value=5.0,
                                       value=float(getattr(cfg, "risk_reward", 1.3)), step=0.1)
     with c2:
-        sfp_len = st.number_input("Swing Length (SFP length)", min_value=1, max_value=10,
-                                  value=int(getattr(cfg, "sfp_len", 2)), step=1)
-    with c3:
         risk_pct = st.number_input("Risk % per trade", min_value=0.1, max_value=10.0,
                                    value=float(getattr(cfg, "risk_pct", 3.0)), step=0.1)
 
@@ -376,11 +372,12 @@ with st.form("backtest_form"):
     st.subheader("✨ Lux SFP (валидация объёма как в LuxAlgo)")
     l1, l2, l3, l4 = st.columns(4)
     with l1:
-        lux_mode = st.selectbox(
+        lux_volume_validation = st.selectbox(
             "Validation",
-            options=["volume_outside_gt", "volume_outside_lt", "none"],
-            index={"volume_outside_gt":0,"volume_outside_lt":1,"none":2}\
-                .get(str(getattr(cfg, "lux_mode", "volume_outside_gt")), 0),
+            options=["outside_gt", "outside_lt", "none"],
+            index={"outside_gt":0,"outside_lt":1,"none":2}.get(
+                str(getattr(cfg, "lux_volume_validation", "outside_gt")).lower(), 0
+            ),
             help="GT: объём за свингом > порога; LT: < порога; None: без проверки."
         )
         lux_swings = st.number_input("Swings", min_value=1, max_value=20,
@@ -402,110 +399,55 @@ with st.form("backtest_form"):
 
     st.markdown("---")
 
-    # ====== Stop-Loss зона ======
-    st.subheader("📌 Stop-Loss Zone (Pine-like)")
-    z1, z2, z3, z4, z5, z6 = st.columns(6)
-    with z1:
-        use_swing_sl = st.checkbox("SL от свинга (pivot)", value=bool(getattr(cfg, "use_swing_sl", True)))
-    with z2:
-        use_prev_candle_sl = st.checkbox("SL от свечи [1]", value=bool(getattr(cfg, "use_prev_candle_sl", False)))
-    with z3:
-        use_sfp_candle_sl = st.checkbox("SL от SFP-свечи [0]", value=bool(getattr(cfg, "use_sfp_candle_sl", False)))
-    with z4:
-        sl_buf_ticks = st.number_input("Буфер к SL (ticks)", min_value=0, max_value=1000,
-                                       value=int(getattr(cfg, "sl_buf_ticks", 40)), step=1)
-    with z5:
-        use_atr_buffer = st.checkbox("ATR-буфер", value=bool(getattr(cfg, "use_atr_buffer", False)))
-    with z6:
-        atr_mult = st.number_input("ATR Mult", min_value=0.0, max_value=10.0,
-                                   value=float(getattr(cfg, "atr_mult", 0.0)), step=0.1)
-
-    tps = st.selectbox("Триггер стопа/тейка (биржа)", options=["mark", "last"],
-                       index=0 if str(getattr(cfg, "trigger_price_source", "mark")).lower() == "mark" else 1)
+    # ====== SL/TP биржевой триггер ======
+    tps = st.selectbox(
+        "Триггер стопа/тейка (биржа)",
+        options=["mark", "last"],
+        index=0 if str(getattr(cfg, "trigger_price_source", "mark")).lower() == "mark" else 1,
+        help="По какой цене биржа срабатывает SL/TP."
+    )
 
     st.markdown("---")
 
-    # ====== Smart Trailing ======
-    st.subheader("📌 Smart Trailing TP")
+    # ====== Smart Trailing / ARM / Bar-trail ======
+    st.subheader("📌 Smart Trailing / ARM / Bar-Trail")
     c4, c5, c6 = st.columns(3)
     with c4:
         enable_smart_trail = st.checkbox("💚 Enable Smart Trailing TP",
                                          value=bool(getattr(cfg, "enable_smart_trail", True)))
+        use_arm_after_rr = st.checkbox("💚 Enable Arm after RR≥X",
+                                       value=bool(getattr(cfg, "use_arm_after_rr", True)))
+        arm_rr = st.number_input("Arm RR (R)", min_value=0.1, max_value=5.0,
+                                 value=float(getattr(cfg, "arm_rr", 0.5)), step=0.1)
     with c5:
         trailing_perc = st.number_input("Trailing %", min_value=0.0, max_value=5.0,
                                         value=float(getattr(cfg, "trailing_perc", 0.5)), step=0.1)
-    with c6:
         trailing_offset_perc = st.number_input("Trailing Offset %", min_value=0.0, max_value=5.0,
                                                value=float(getattr(cfg, "trailing_offset_perc", 0.4)), step=0.1)
-
-    st.markdown("---")
-
-    # ====== ARM RR ======
-    st.subheader("📌 ARM RR")
-    c7, c8 = st.columns(2)
-    with c7:
-        use_arm_after_rr = st.checkbox("💚 Enable Arm after RR≥X",
-                                       value=bool(getattr(cfg, "use_arm_after_rr", True)))
-    with c8:
-        arm_rr = st.number_input("Arm RR (R)", min_value=0.1, max_value=5.0,
-                                 value=float(getattr(cfg, "arm_rr", 0.5)), step=0.1)
-
-    st.markdown("---")
-
-    # ====== Bar-Low/High Smart Trail ======
-    st.subheader("📌 Use Bar-Low/High Smart Trail")
-    c9, c10, c11 = st.columns(3)
-    with c9:
+    with c6:
         use_bar_trail = st.checkbox("💚 Use Bar-Low/High Smart Trail",
                                     value=bool(getattr(cfg, "use_bar_trail", True)))
-    with c10:
         trail_lookback = st.number_input("Trail lookback bars", min_value=1, max_value=300,
                                          value=int(getattr(cfg, "trail_lookback", 50)), step=1)
-    with c11:
         trail_buf_ticks = st.number_input("Trail buffer (ticks)", min_value=0, max_value=500,
                                           value=int(getattr(cfg, "trail_buf_ticks", 40)), step=1)
 
     st.markdown("---")
 
-    # ====== Лимиты позиции ======
-    st.subheader("📌 Лимиты позиции")
+    # ====== Лимиты позиции / комиссия / TP ======
+    st.subheader("📌 Лимиты позиции / комиссия / TP")
     c12, c13 = st.columns(2)
     with c12:
         limit_qty_enabled = st.checkbox("💚 Limit Max Position Qty",
                                         value=bool(getattr(cfg, "limit_qty_enabled", True)))
-    with c13:
         max_qty_manual = st.number_input("Max Qty (ETH)", min_value=0.001, max_value=10_000.0,
                                          value=float(getattr(cfg, "max_qty_manual", 50.0)), step=0.001)
-
-    st.markdown("---")
-
-    # ====== Фильтры SFP (wick/closeback) ======
-    st.subheader("📌 Фильтр SFP (wick + closeback)")
-    c14, c15, c16 = st.columns(3)
-    with c14:
-        use_sfp_quality = st.checkbox("Filter: SFP quality (wick+closeback)",
-                                      value=bool(getattr(cfg, "use_sfp_quality", True)))
-    with c15:
-        wick_min_ticks = st.number_input("SFP: min wick depth (ticks)", min_value=0, max_value=100,
-                                         value=int(getattr(cfg, "wick_min_ticks", 7)), step=1)
-    with c16:
-        close_back_pct = st.number_input("SFP: min close-back % of wick", min_value=0.0, max_value=1.0,
-                                         value=float(getattr(cfg, "close_back_pct", 1.0)), step=0.05)
-
-    st.markdown("---")
-
-    # ====== TP / комиссия ======
-    c17, c18 = st.columns(2)
-    with c17:
         use_take_profit = st.checkbox("Use Take Profit", value=bool(getattr(cfg, "use_take_profit", True)))
-    with c18:
+    with c13:
         taker_fee = st.number_input("Taker fee (decimal)", min_value=0.0, max_value=0.01,
                                     value=float(getattr(cfg, "taker_fee_rate", 0.00055)), step=0.00005)
 
     st.markdown("---")
-
-    # ====== Intrabar entries ======
-    intrabar_entries = st.checkbox("🔁 Intrabar entries (calc_on_every_tick)", value=False)
 
     submitted = st.form_submit_button("🚀 Запустить бэктест", use_container_width=True)
 
@@ -520,11 +462,11 @@ if submitted:
     cfg = Config()
     cfg.symbol = symbol.strip().upper()
     cfg.risk_reward = float(risk_reward)
-    cfg.sfp_len = int(sfp_len)
     cfg.risk_pct = float(risk_pct)
 
-    # ===== Lux SFP ====
-    cfg.lux_mode = str(lux_mode)
+    # ===== Lux SFP (единственный фильтр входа) ====
+    cfg.lux_mode = True  # включаем Lux-режим
+    cfg.lux_volume_validation = str(lux_volume_validation)
     cfg.lux_swings = int(lux_swings)
     cfg.lux_volume_threshold_pct = float(lux_volume_threshold_pct)
     cfg.lux_auto = bool(lux_auto)
@@ -532,6 +474,9 @@ if submitted:
     cfg.lux_ltf = str(lux_ltf)
     cfg.lux_premium = bool(lux_premium)
     cfg.lux_expire_bars = int(lux_expire_bars)
+
+    # Для тёплого старта 15m используем Swings как sfp_len
+    cfg.sfp_len = int(lux_swings)
 
     # Выбираем intrabar_tf в духе Lux
     cfg.intrabar_tf = derive_lux_ltf_minutes(
@@ -542,16 +487,10 @@ if submitted:
         manual_ltf=cfg.lux_ltf
     )
 
-    # ===== SL-зона =====
-    cfg.use_swing_sl = bool(use_swing_sl)
-    cfg.use_prev_candle_sl = bool(use_prev_candle_sl)
-    cfg.use_sfp_candle_sl = bool(use_sfp_candle_sl)
-    cfg.sl_buf_ticks = int(sl_buf_ticks)
-    cfg.use_atr_buffer = bool(use_atr_buffer)
-    cfg.atr_mult = float(atr_mult)
+    # Биржевой триггер SL/TP
     cfg.trigger_price_source = str(tps).lower()
 
-    # ===== Smart trail / ARM / bar-trail / лимиты =====
+    # Smart trail / ARM / bar-trail / лимиты
     cfg.enable_smart_trail = bool(enable_smart_trail)
     cfg.trailing_perc = float(trailing_perc)
     cfg.trailing_offset_perc = float(trailing_offset_perc)
@@ -567,17 +506,14 @@ if submitted:
     cfg.limit_qty_enabled = bool(limit_qty_enabled)
     cfg.max_qty_manual = float(max_qty_manual)
 
-    # ===== фильтры / комиссия / источники цены =====
-    cfg.use_sfp_quality = bool(use_sfp_quality)
-    cfg.wick_min_ticks = int(wick_min_ticks)
-    cfg.close_back_pct = float(close_back_pct)
-
+    # Комиссия / источники цены
     cfg.use_take_profit = bool(use_take_profit)
     cfg.taker_fee_rate = float(taker_fee)
-
     cfg.price_for_logic = str(price_src).lower()
+
+    # Прочее
     cfg.days_back = int(bt_days)
-    cfg.use_intrabar_entries = bool(intrabar_entries)
+    cfg.use_intrabar_entries = False  # интрабар-входы отключены в Lux-режиме
     cfg.start_time_ms = None
 
     with st.spinner("Грузим историю и запускаем бэктест…"):
