@@ -1,4 +1,4 @@
-# kwin_strategy.py  — обновлено: SL от SFP-свечи [0] / свинговый пивот, без ATR/prev[1] + invert_signals
+# kwin_strategy.py  — обновлено: SL от SFP-свечи [0] / свинговый пивот, без ATR/prev[1]
 from __future__ import annotations
 
 import time
@@ -85,11 +85,6 @@ class KWINStrategy:
 
         # одноразовое проигрывание истории 15m
         self._history_replayed: bool = False
-
-        # инверсия сигналов (Long <-> Short)
-        self.invert_signals: bool = bool(getattr(self.config, "invert_signals", False))
-        if self.invert_signals:
-            print("[KWIN] invert_signals = ON — long/short будут меняться местами.")
 
     # ============ ВСПОМОГАТЕЛЬНОЕ ============
 
@@ -297,27 +292,6 @@ class KWINStrategy:
         except Exception as e:
             print(f"[update_candles] {e}")
 
-    # ---------- ХЕЛПЕР ВХОДА С УЧЁТОМ ИНВЕРСИИ ----------
-
-    def _enter_by_signal(self, signal: str, entry_override: Optional[float] = None) -> None:
-        """
-        signal: "long" | "short" — тип СИГНАЛА (по условиям SFP на 15m).
-        При invert_signals=True направление сделки меняется местами.
-        """
-        try:
-            if not self.invert_signals:
-                if signal == "long":
-                    self._process_long_entry(entry_override=entry_override)
-                else:
-                    self._process_short_entry(entry_override=entry_override)
-            else:
-                if signal == "long":
-                    self._process_short_entry(entry_override=entry_override)
-                else:
-                    self._process_long_entry(entry_override=entry_override)
-        except Exception as e:
-            print(f"[enter_by_signal] {e}")
-
     # ---------- ЛОГИКА ВХОДОВ (совместимость) ----------
 
     def on_bar_close(self):
@@ -337,9 +311,9 @@ class KWINStrategy:
             return
 
         if bull and self.can_enter_long:
-            self._enter_by_signal("long")
+            self._process_long_entry()
         elif bear and self.can_enter_short:
-            self._enter_by_signal("short")
+            self._process_short_entry()
 
     # ---------- SFP (Pine-эквивалент) ----------
 
@@ -457,8 +431,7 @@ class KWINStrategy:
                 lo = float(m1["low"]); cl = float(m1["close"])
                 if (lo < ref) and (cl > ref):
                     if (not getattr(self.config, "use_sfp_quality", True)) or self._check_bull_sfp_quality({"low": lo, "close": cl}, ref):
-                        # сигнал "long" → учесть инверсию направления в _enter_by_signal
-                        self._enter_by_signal("long", entry_override=cl)
+                        self._process_long_entry(entry_override=cl)
                         return
 
             if self.can_enter_short and has_bear_pivot:
@@ -466,8 +439,7 @@ class KWINStrategy:
                 hi = float(m1["high"]); cl = float(m1["close"])
                 if (hi > ref) and (cl < ref):
                     if (not getattr(self.config, "use_sfp_quality", True)) or self._check_bear_sfp_quality({"high": hi, "close": cl}, ref):
-                        # сигнал "short" → учесть инверсию направления в _enter_by_signal
-                        self._enter_by_signal("short", entry_override=cl)
+                        self._process_short_entry(entry_override=cl)
                         return
         except Exception as e:
             print(f"[intrabar_entry] {e}")
@@ -907,14 +879,10 @@ class KWINStrategy:
             if (not self._is_in_backtest_window_utc(ts)) or (not self._is_after_cycle_start(ts)):
                 return
 
-            bull = self._detect_bull_sfp()
-            bear = self._detect_bear_sfp()
-
-            # Сначала проверяем "long"-сигнал (bull), затем "short"-сигнал (bear)
-            if bull and self.can_enter_long and not self._in_cooldown(ts):
-                self._enter_by_signal("long")
-            elif bear and self.can_enter_short and not self._in_cooldown(ts):
-                self._enter_by_signal("short")
+            if self._detect_bull_sfp() and self.can_enter_long and not self._in_cooldown(ts):
+                self._process_long_entry()
+            elif self._detect_bear_sfp() and self.can_enter_short and not self._in_cooldown(ts):
+                self._process_short_entry()
         except Exception as e:
             print(f"[run_cycle] {e}")
 
