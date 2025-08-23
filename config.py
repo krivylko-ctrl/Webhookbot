@@ -59,28 +59,29 @@ class Config:
         # ARM (вооружение трейла после достижения RR)
         self.use_arm_after_rr = env("USE_ARM_AFTER_RR", "true").lower() not in ("0", "false", "no")
         self.arm_rr           = max(0.1, float(env("ARM_RR", "0.5")))          # в R, минимально 0.1
-        self.arm_rr_basis     = env("ARM_RR_BASIS", "last").lower()        # "extremum"|"last"
+        self.arm_rr_basis     = env("ARM_RR_BASIS", "last").lower()            # "extremum"|"last"
 
         # Источники цены (по умолчанию триггеры по mark)
         self.price_for_logic      = env("PRICE_FOR_LOGIC", "last").lower()     # "last"|"mark"
         self.trigger_price_source = env("TRIGGER_PRICE_SOURCE", "mark").lower()# "last"|"mark"
 
         # === ЗОНАЛЬНЫЙ СТОП ===
-# переключатели базы SL: свинговый pivot и/или экстремум SFP-свечи [0]
-        self.use_swing_sl       = env("USE_SWING_SL", "false").lower() not in ("0","false","no")
-        self.use_sfp_candle_sl = env("USE_SFP_CANDLE_SL", "false").lower() not in ("0", "false", "no")
-        self.use_prev_candle_sl = env("USE_PREV_CANDLE_SL", "true").lower() not in ("0","false","no")
-        self.sl_buf_ticks       = int(env("SL_BUF_TICKS", "0"))  # если нужен отступ — увеличь
-        self.use_atr_buffer     = env("USE_ATR_BUFFER", "false").lower() not in ("0","false","no")
-        self.atr_mult           = float(env("ATR_MULT", "0.0"))
+        # переключатели базы SL: свинговый pivot и/или экстремум SFP-свечи [0]
+        self.use_swing_sl        = env("USE_SWING_SL", "false").lower() not in ("0","false","no")
+        self.use_sfp_candle_sl   = env("USE_SFP_CANDLE_SL", "false").lower() not in ("0", "false", "no")
+        self.use_prev_candle_sl  = env("USE_PREV_CANDLE_SL", "true").lower() not in ("0","false","no")
+        self.sl_buf_ticks        = int(env("SL_BUF_TICKS", "0"))  # если нужен отступ — увеличь
+        self.use_atr_buffer      = env("USE_ATR_BUFFER", "false").lower() not in ("0","false","no")
+        self.atr_mult            = float(env("ATR_MULT", "0.0"))
 
-# === ИНТРАБАР ===
-        self.use_intrabar         = env("USE_INTRABAR", "true").lower() not in ("0","false","no")   # 1m только для трейлинга
-        self.use_intrabar_entries = env("USE_INTRABAR_ENTRIES", "false").lower() not in ("0","false","no")  # ⛔ входы по M1
-        self.intrabar_tf          = env("INTRABAR_TF", "1")
-        self.intrabar_pull_limit  = int(env("INTRABAR_PULL_LIMIT", "1500"))
-        self.smooth_intrabar      = env("SMOOTH_INTRABAR", "true").lower() not in ("0","false","no")
-        self.intrabar_steps       = int(env("INTRABAR_STEPS", "6"))
+        # === ИНТРАБАР ===
+        # 1m — для трейлинга; входы по M1 отключены по умолчанию
+        self.use_intrabar          = env("USE_INTRABAR", "true").lower() not in ("0","false","no")
+        self.use_intrabar_entries  = env("USE_INTRABAR_ENTRIES", "false").lower() not in ("0","false","no")
+        self.intrabar_tf           = env("INTRABAR_TF", "1")
+        self.intrabar_pull_limit   = int(env("INTRABAR_PULL_LIMIT", "1500"))
+        self.smooth_intrabar       = env("SMOOTH_INTRABAR", "true").lower() not in ("0","false","no")
+        self.intrabar_steps        = int(env("INTRABAR_STEPS", "6"))
 
         # === ОГРАНИЧЕНИЯ ПОЗИЦИИ ===
         self.limit_qty_enabled = env("LIMIT_QTY_ENABLED", "true").lower() not in ("0","false","no")
@@ -96,6 +97,12 @@ class Config:
         self.days_back     = int(env("DAYS_BACK", "30"))
         self.slippage_pct  = float(env("SLIPPAGE_PCT", "0.0"))
         self.latency_ms    = int(env("LATENCY_MS", "0"))
+
+        # === ДОП. ЛОГИКА ===
+        # Инверсия сигналов (Long <-> Short)
+        self.invert_signals = env("INVERT_SIGNALS", "false").lower() not in ("0","false","no")
+        # Кулдаун после закрытия позиции (мин)
+        self.cooldown_minutes = int(env("COOLDOWN_MINUTES", "0"))
 
         # === МАРКЕТ ===
         self.taker_fee_rate = float(env("TAKER_FEE_RATE", "0.00055"))
@@ -173,13 +180,12 @@ class Config:
         if self.arm_rr_basis not in ("extremum", "last"):
             self.arm_rr_basis = "extremum"
 
-        # новые числовые — приводим к корректным диапазонам
+        # числовые — приводим к корректным диапазонам
         try:
             self.sl_buf_ticks = max(0, int(self.sl_buf_ticks))
         except Exception:
             self.sl_buf_ticks = 40
 
-        # числа
         try:
             self.trailing_perc = max(0.0, float(self.trailing_perc))
         except Exception:
@@ -198,6 +204,12 @@ class Config:
             self.intrabar_tf = str(self.intrabar_tf)
         except Exception:
             self.intrabar_tf = "1"
+
+        # кулдаун
+        try:
+            self.cooldown_minutes = max(0, int(self.cooldown_minutes))
+        except Exception:
+            self.cooldown_minutes = 0
 
     # ---------- load/save ----------
 
@@ -262,8 +274,9 @@ class Config:
             "use_intrabar_entries": self.use_intrabar_entries,
             "use_swing_sl": self.use_swing_sl,
             "use_sfp_candle_sl": self.use_sfp_candle_sl,
-            "use_sfp_candle_sl": self.use_sfp_candle_sl,
             "sl_buf_ticks": self.sl_buf_ticks,
+            "use_atr_buffer": self.use_atr_buffer,
+            "atr_mult": self.atr_mult,
 
             # интрабар
             "use_intrabar": self.use_intrabar,
@@ -282,6 +295,10 @@ class Config:
             "days_back": self.days_back,
             "slippage_pct": self.slippage_pct,
             "latency_ms": self.latency_ms,
+
+            # доп. логика
+            "invert_signals": self.invert_signals,
+            "cooldown_minutes": self.cooldown_minutes,
 
             # маркет/ограничения
             "limit_qty_enabled": self.limit_qty_enabled,
@@ -318,6 +335,8 @@ class Config:
                 raise ValueError("trigger_price_source invalid")
             if self.sl_buf_ticks < 0:
                 raise ValueError("sl_buf_ticks must be >= 0")
+            if self.cooldown_minutes < 0:
+                raise ValueError("cooldown_minutes must be >= 0")
             return True
         except Exception as e:
             print(f"Config validation error: {e}")
