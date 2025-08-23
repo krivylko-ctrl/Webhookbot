@@ -83,6 +83,22 @@ def safe_get_price(bybit_api: BybitAPI, symbol: str) -> float:
         pass
     return 0.0
 
+# ===== Lux SFP: выбор LTF (как в Lux) =====
+def derive_lux_ltf_minutes(base_tf_min: int, auto: bool, mlt: int, premium: bool, manual_ltf: str) -> str:
+    """Возвращает строку минут для интрабара с логикой Lux."""
+    if not auto:
+        return str(manual_ltf)
+    tfC = base_tf_min * 60  # сек
+    rs_sec = max(1, tfC // max(1, int(mlt)))
+    if not premium:
+        rs_sec = max(60, rs_sec)  # минимум 1m
+    rs_min = max(1, int(round(rs_sec / 60)))
+    if rs_min <= 2:
+        return "1"
+    if rs_min <= 4:
+        return "3"
+    return "5"
+
 # ==================== ИНИЦИАЛИЗАЦИЯ РЕСУРСОВ ====================
 
 @st.cache_resource
@@ -110,25 +126,34 @@ def init_components():
     # ---------- Базовые ----------
     if hasattr(cfg, "SYMBOL"):
         config.symbol = cfg.SYMBOL
-    config.intrabar_tf = str(getattr(cfg, "INTRABAR_TF", "1"))
 
     # ---------- Lux SFP (Единственный триггер входов) ----------
     config.lux_mode = True  # включён всегда
+
     # режим валидации объёма фитиля за свингом: outside_gt / outside_lt / none
     mode_env = str(getattr(cfg, "LUX_VALIDATION_MODE", getattr(config, "lux_volume_validation", "outside_gt"))).lower()
     if mode_env not in ("outside_gt", "outside_lt", "none"):
         mode_env = "outside_gt"
-    config.lux_volume_validation   = mode_env
+    config.lux_volume_validation    = mode_env
     config.lux_volume_threshold_pct = float(getattr(cfg, "LUX_VOLUME_THRESHOLD_PCT", getattr(config, "lux_volume_threshold_pct", 10.0)))
-    config.lux_swings              = int(getattr(cfg, "LUX_SWINGS", getattr(config, "lux_swings", 2)))
-    config.lux_auto                = bool(getattr(cfg, "LUX_AUTO_ENABLED", getattr(config, "lux_auto", False)))
-    config.lux_mlt                 = int(getattr(cfg, "LUX_AUTO_MLT", getattr(config, "lux_mlt", 10)))
-    config.lux_ltf                 = str(getattr(cfg, "LUX_LTF", getattr(config, "lux_ltf", "1")))
-    config.lux_premium             = bool(getattr(cfg, "LUX_PREMIUM_ENABLED", getattr(config, "lux_premium", False)))
-    config.lux_expire_bars         = int(getattr(cfg, "LUX_EXPIRE_BARS", getattr(config, "lux_expire_bars", 500)))
+    config.lux_swings               = int(getattr(cfg, "LUX_SWINGS", getattr(config, "lux_swings", 2)))
+    config.lux_auto                 = bool(getattr(cfg, "LUX_AUTO_ENABLED", getattr(config, "lux_auto", False)))
+    config.lux_mlt                  = int(getattr(cfg, "LUX_AUTO_MLT", getattr(config, "lux_mlt", 10)))
+    config.lux_ltf                  = str(getattr(cfg, "LUX_LTF", getattr(config, "lux_ltf", "1")))
+    config.lux_premium              = bool(getattr(cfg, "LUX_PREMIUM_ENABLED", getattr(config, "lux_premium", False)))
+    config.lux_expire_bars          = int(getattr(cfg, "LUX_EXPIRE_BARS", getattr(config, "lux_expire_bars", 500)))
 
-    # Важно: warm-up для истории (синхрон с стратегией)
+    # warm-up для истории (как в стратегии)
     config.sfp_len = int(config.lux_swings)
+
+    # выбор интрабара в духе Lux
+    config.intrabar_tf = derive_lux_ltf_minutes(
+        base_tf_min=15,
+        auto=config.lux_auto,
+        mlt=config.lux_mlt,
+        premium=config.lux_premium,
+        manual_ltf=config.lux_ltf
+    )
 
     # ---------- API init ----------
     if getattr(cfg, "BYBIT_API_KEY", None) and getattr(cfg, "BYBIT_API_SECRET", None):
@@ -155,10 +180,10 @@ def init_components():
     strategy = KWINStrategy(config, bybit_api, state_manager, db)
     return config, db, state_manager, bybit_api, strategy
 
-# ---------- ФОНОВЫЙ ЦИКЛ (15m + 1m интрабар + equity) ----------
+# ---------- ФОНОВЫЙ ЦИКЛ (15m + LTF интрабар + equity) ----------
 def _bg_bot_loop(bybit_api, strategy: KWINStrategy, state_manager: StateManager, config: Config, poll_sec: float = 2.0):
     last_15m_ts = 0
-    last_1m_ts  = 0
+    last_ltf_ts = 0
     loop_i = 0
 
     while getattr(st.session_state, "bot_running", False):
@@ -188,23 +213,23 @@ def _bg_bot_loop(bybit_api, strategy: KWINStrategy, state_manager: StateManager,
             except Exception:
                 pass
 
-            # 2) Интрабар (обычно 1m) — для Smart Trail
+            # 2) Интрабар (LTF, обычно 1m) — для Smart Trail и LTF-валидации
             try:
                 intrabar_tf = str(getattr(config, "intrabar_tf", "1"))
-                kl1 = bybit_api.get_klines(config.symbol, intrabar_tf, 3) if hasattr(bybit_api, "get_klines") else []
-                if kl1:
-                    df1 = pd.DataFrame(kl1).sort_values("timestamp")
-                    last1 = df1.iloc[-1].to_dict()
-                    ts1 = int(last1.get("timestamp", 0))
-                    if ts1 and ts1 != last_1m_ts:
+                kl_ltf = bybit_api.get_klines(config.symbol, intrabar_tf, 3) if hasattr(bybit_api, "get_klines") else []
+                if kl_ltf:
+                    df_ltf = pd.DataFrame(kl_ltf).sort_values("timestamp")
+                    last_ltf = df_ltf.iloc[-1].to_dict()
+                    ts_ltf = int(last_ltf.get("timestamp", 0))
+                    if ts_ltf and ts_ltf != last_ltf_ts:
                         strategy.on_bar_close_1m({
-                            "timestamp": int(last1["timestamp"]),
-                            "open": float(last1["open"]),
-                            "high": float(last1["high"]),
-                            "low":  float(last1["low"]),
-                            "close": float(last1["close"])
+                            "timestamp": int(last_ltf["timestamp"]),
+                            "open": float(last_ltf["open"]),
+                            "high": float(last_ltf["high"]),
+                            "low":  float(last_ltf["low"]),
+                            "close": float(last_ltf["close"])
                         })
-                        last_1m_ts = ts1
+                        last_ltf_ts = ts_ltf
             except Exception:
                 pass
 
@@ -420,7 +445,7 @@ def main():
             st.write(f"**Swings (len):** {getattr(config, 'lux_swings', 2)}")
             st.write(f"**Auto LTF:** {'✅' if getattr(config, 'lux_auto', False) else '❌'} "
                      f"(mlt={getattr(config, 'lux_mlt', 10)})")
-            st.write(f"**LTF:** {getattr(config, 'lux_ltf', '1')} minute(s)")
+            st.write(f"**LTF (эффективный):** {getattr(config, 'intrabar_tf', '1')} мин")
             st.write(f"**Premium:** {'✅' if getattr(config, 'lux_premium', False) else '❌'}")
             st.write(f"**Expire bars:** {getattr(config, 'lux_expire_bars', 500)}")
             st.caption("Триггер входа — только Lux SFP. Вход по закрытию 15м; SL — на экстремуме SFP-свечи с буфером.")
