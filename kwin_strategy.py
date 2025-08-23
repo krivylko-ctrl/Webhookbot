@@ -1,4 +1,4 @@
-# kwin_strategy.py  — обновлено: SL от SFP-свечи [0] / свинговый пивот, без ATR/prev[1]
+# kwin_strategy.py  — Lux SFP mode (oppos_prc + LTF volume) + SL override
 from __future__ import annotations
 
 import time
@@ -52,6 +52,19 @@ class KWINStrategy:
 
         self.analytics = TradingAnalytics()
 
+        # --------- Lux SFP режим (дефолты как на скрине) ---------
+        self.lux_mode: bool = bool(getattr(config, "lux_mode", True))
+        self.lux_swings: int = int(getattr(config, "lux_swings", 2))  # = len в Lux
+        # volume validation: "outside_gt" | "outside_lt" | "none"
+        self.lux_volume_validation: str = str(getattr(config, "lux_volume_validation", "outside_gt")).lower()
+        self.lux_volume_threshold_pct: float = float(getattr(config, "lux_volume_threshold_pct", 10.0))
+        # LTF выбор (как в Lux): если auto=False, берём "1" минуту
+        self.lux_auto: bool = bool(getattr(config, "lux_auto", False))
+        self.lux_mlt: int = int(getattr(config, "lux_mlt", 10))
+        self.lux_ltf: str = str(getattr(config, "lux_ltf", "1"))
+        self.lux_premium: bool = bool(getattr(config, "lux_premium", False))
+        self.lux_expire_bars: int = int(getattr(config, "lux_expire_bars", 500))
+
         # служебное состояние
         self.candles_15m: List[Dict] = []   # DESC: [0] — последний закрытый 15m бар
         self.candles_1m: List[Dict] = []    # DESC
@@ -59,6 +72,10 @@ class KWINStrategy:
         self.last_processed_bar_ts: int = 0
         self.can_enter_long = True
         self.can_enter_short = True
+
+        # активные Lux SFP (по одному на сторону)
+        self._active_bull: Optional[Dict[str, Any]] = None
+        self._active_bear: Optional[Dict[str, Any]] = None
 
         # инструмент / шаги
         self.symbol = str(getattr(config, "symbol", "ETHUSDT")).upper()
@@ -119,6 +136,73 @@ class KWINStrategy:
         self.config.tick_size = self.tick_size or 0.01
         self.config.qty_step = self.qty_step or 0.01
         self.config.min_order_qty = self.min_order_qty or 0.01
+
+    # ---------- Lux helpers ----------
+
+    def _bar_window_ms(self, bar_ts_ms: int) -> Tuple[int, int]:
+        """Возвращает [start,end] msec для 15m бара с указанным close-ts."""
+        end_ms = self._align_15m_ms(bar_ts_ms)  # close aligned
+        start_ms = end_ms - 900_000 + 1
+        return start_ms, end_ms
+
+    def _ltf_slices_for_bar(self, bar_ts_ms: int) -> List[Dict]:
+        """Возвращает список M1 свечей (или выбранного LTF), попадающих внутрь данного 15m бара."""
+        # сейчас используем наш пулл intrabar_tf (по дефолту "1")
+        ltf = str(self.lux_ltf or getattr(self.config, "intrabar_tf", "1"))
+        if ltf != str(getattr(self.config, "intrabar_tf", "1")):
+            # если пользователь захочет отличный LTF — тогда надо подтянуть отдельно через API
+            # здесь безопасный фоллбек: используем то, что есть
+            pass
+        if not self.candles_1m:
+            return []
+        start_ms, end_ms = self._bar_window_ms(bar_ts_ms)
+        out = []
+        for c in self.candles_1m:
+            ts = int(c.get("timestamp") or 0)
+            if start_ms <= ts <= end_ms:
+                out.append(c)
+            elif ts < start_ms:
+                break
+        return list(reversed(out))  # по времени вперёд
+
+    def _ltf_outside_volume_ok(self, direction: str, swing_price: float, bar_ts_ms: int) -> bool:
+        """Точная валидация объёма как в Lux."""
+        mode = (self.lux_volume_validation or "outside_gt").lower()
+        if mode == "none":
+            return True
+
+        chunks = self._ltf_slices_for_bar(bar_ts_ms)
+        if not chunks:
+            # как в Lux: если нет LTF-данных — не валидируем (считаем валидным),
+            # но можно поменять поведение при желании.
+            return True
+
+        total_vol = float(sum(float(x.get("volume", 0.0)) for x in chunks)) or 0.0
+        if total_vol <= 0:
+            return True
+
+        outside_vol = 0.0
+        if direction == "bull":
+            for x in chunks:
+                cl = float(x.get("close"))
+                if cl < swing_price:
+                    outside_vol += float(x.get("volume", 0.0))
+        else:  # bear
+            for x in chunks:
+                cl = float(x.get("close"))
+                if cl > swing_price:
+                    outside_vol += float(x.get("volume", 0.0))
+
+        pct = 100.0 * outside_vol / total_vol
+        thr = float(self.lux_volume_threshold_pct)
+        # Lux: valHigher => outside < threshold => INVALID
+        # Здесь наоборот: valid = not( valHigher and pct < thr ) и not( valLower and pct > thr )
+        if mode == "outside_gt":
+            # считаем валидным, если outside > threshold
+            return pct > thr
+        elif mode == "outside_lt":
+            return pct < thr
+        return True
 
     # ---------- SL «зона» как в TV ----------
     def _calc_sl_with_zone(self, direction: str, entry_price: float) -> Optional[float]:
@@ -230,7 +314,8 @@ class KWINStrategy:
             if pos and pos.get("status") == "open" and getattr(self.config, "use_intrabar", False):
                 self._update_smart_trailing(pos)
 
-            if (not pos) and getattr(self.config, "use_intrabar_entries", False):
+            # В Lux-режиме интрабар-входы запрещены
+            if (not pos) and getattr(self.config, "use_intrabar_entries", False) and (not self.lux_mode):
                 self._try_intrabar_entry_from_m1(candle)
 
         except Exception as e:
@@ -255,7 +340,7 @@ class KWINStrategy:
             kl15.sort(key=lambda x: x.get("timestamp", 0), reverse=True)
             self.candles_15m = kl15
 
-            # 1m
+            # 1m (для LTF volume)
             tf = str(getattr(self.config, "intrabar_tf", "1"))
             lim = int(getattr(self.config, "intrabar_pull_limit", 1000) or 1000)
             kl1 = self.api.get_klines(self.symbol, tf, min(1000, lim)) or []
@@ -292,29 +377,6 @@ class KWINStrategy:
         except Exception as e:
             print(f"[update_candles] {e}")
 
-    # ---------- ЛОГИКА ВХОДОВ (совместимость) ----------
-
-    def on_bar_close(self):
-        """Совместимость (основная точка — run_cycle())."""
-        if len(self.candles_15m) < int(getattr(self.config, "sfp_len", 2)) + 2:
-            return
-
-        bull = self._detect_bull_sfp()
-        bear = self._detect_bear_sfp()
-
-        ts = int(self.candles_15m[0]["timestamp"])
-        if not self._is_in_backtest_window_utc(ts) or not self._is_after_cycle_start(ts):
-            return
-
-        current_position = self.state.get_current_position() if self.state else None
-        if current_position and current_position.get("status") == "open":
-            return
-
-        if bull and self.can_enter_long:
-            self._process_long_entry()
-        elif bear and self.can_enter_short:
-            self._process_short_entry()
-
     # ---------- SFP (Pine-эквивалент) ----------
 
     def _pivot_low_value(self, left: int, right: int = 1) -> Optional[float]:
@@ -333,22 +395,172 @@ class KWINStrategy:
         center = highs[int(right)]
         return center if center == max(highs) else None
 
+    # ---------- Lux SFP flow ----------
+
+    def _lux_find_new_sfp(self) -> None:
+        """На закрытии бара определяем SFP (wick + open/close за swing) и создаём active_*."""
+        if not self.lux_mode:
+            return
+
+        L = int(self.lux_swings)
+        if len(self.candles_15m) < (L + 2):
+            return
+
+        curr = self.candles_15m[0]
+        prev1 = self.candles_15m[1]  # центр пивота (right=1) — это именно [1]!
+
+        # Bearish SFP:
+        if self._pivot_high_value(L, 1) is not None:
+            sw = float(prev1["high"])  # swing price = high[1]
+            hi = float(curr["high"]); op = float(curr["open"]); cl = float(curr["close"])
+            if hi > sw and op < sw and cl < sw:
+                # LTF volume validation
+                if self._ltf_outside_volume_ok("bear", sw, int(curr["timestamp"])):
+
+                    # oppos_prc = min(low[i]) между bx и n (если нет баров внутри — остаётся sw)
+                    oppos = sw
+                    # bx у Lux = n-1; у нас это индекс 1 -> между bx и n баров может и не быть.
+                    # Если есть ещё бары между (редко при right=1), пройдёмся:
+                    # (в нашем буфере [0]=n, [1]=bx, [2]=n-2, ... )
+                    for i in range(1, min(len(self.candles_15m), 500)):
+                        # i идёт от 1 до ...; как только дошли до bx (=1), дальше смысла нет
+                        if i >= 1:
+                            break
+                    # oppos остаётся sw (как в оригинале при right=1)
+
+                    self._active_bear = {
+                        "active": True,
+                        "confirmed": False,
+                        "swing_prc": sw,
+                        "sfp_extreme": hi,  # high SFP-бара
+                        "oppos_prc": oppos,
+                        "created_bars_ago": 0,
+                        "created_ts": int(curr.get("timestamp") or 0),
+                    }
+
+        # Bullish SFP:
+        if self._pivot_low_value(L, 1) is not None:
+            sw = float(prev1["low"])  # swing price = low[1]
+            lo = float(curr["low"]); op = float(curr["open"]); cl = float(curr["close"])
+            if lo < sw and op > sw and cl > sw:
+                if self._ltf_outside_volume_ok("bull", sw, int(curr["timestamp"])):
+
+                    oppos = sw
+                    for i in range(1, min(len(self.candles_15m), 500)):
+                        if i >= 1:
+                            break
+
+                    self._active_bull = {
+                        "active": True,
+                        "confirmed": False,
+                        "swing_prc": sw,
+                        "sfp_extreme": lo,  # low SFP-бара
+                        "oppos_prc": oppos,
+                        "created_bars_ago": 0,
+                        "created_ts": int(curr.get("timestamp") or 0),
+                    }
+
+    def _lux_update_active(self) -> None:
+        """Обновляем состояние активных SFP: подтверждение, отмена, старение."""
+        if not self.lux_mode or not self.candles_15m:
+            return
+
+        cur = self.candles_15m[0]
+        cl = float(cur["close"])
+
+        # ---- Bear ----
+        if self._active_bear and self._active_bear.get("active") and not self._active_bear.get("confirmed"):
+            sw = float(self._active_bear["swing_prc"])
+            oppos = float(self._active_bear["oppos_prc"])
+
+            # подтверждение: close < oppos_prc
+            if cl < oppos:
+                # SL = high SFP-бара + буфер
+                tick = float(self.tick_size or 0.01)
+                buf_ticks = int(getattr(self.config, "sl_buf_ticks", 0) or 0)
+                sl = ceil_to_tick(float(self._active_bear["sfp_extreme"]) + buf_ticks * tick, tick)
+
+                # вход строго на закрытии подтверждающего 15м-бара
+                if self.can_enter_short and (not self._in_cooldown(self._current_bar_ts_ms())):
+                    self._process_short_entry(entry_override=cl, sl_override=sl)
+                    self._active_bear["confirmed"] = True
+
+            # отмена:
+            # 1) возврат выше swing_prc (как в Lux — для bear проверяют close > swing_prc)
+            # 2) протухание > lux_expire_bars
+            elif cl > sw:
+                self._active_bear["active"] = False
+            else:
+                age = int(self._active_bear.get("created_bars_ago", 0)) + 1
+                self._active_bear["created_bars_ago"] = age
+                if age > int(self.lux_expire_bars):
+                    self._active_bear["active"] = False
+
+        # ---- Bull ----
+        if self._active_bull and self._active_bull.get("active") and not self._active_bull.get("confirmed"):
+            sw = float(self._active_bull["swing_prc"])
+            oppos = float(self._active_bull["oppos_prc"])
+
+            if cl > oppos:
+                tick = float(self.tick_size or 0.01)
+                buf_ticks = int(getattr(self.config, "sl_buf_ticks", 0) or 0)
+                sl = floor_to_tick(float(self._active_bull["sfp_extreme"]) - buf_ticks * tick, tick)
+
+                if self.can_enter_long and (not self._in_cooldown(self._current_bar_ts_ms())):
+                    self._process_long_entry(entry_override=cl, sl_override=sl)
+                    self._active_bull["confirmed"] = True
+
+            elif cl < sw:
+                self._active_bull["active"] = False
+            else:
+                age = int(self._active_bull.get("created_bars_ago", 0)) + 1
+                self._active_bull["created_bars_ago"] = age
+                if age > int(self.lux_expire_bars):
+                    self._active_bull["active"] = False
+
+    # ---------- ЛОГИКА ВХОДОВ (совместимость) ----------
+
+    def on_bar_close(self):
+        """Совместимость (основная точка — run_cycle())."""
+        if len(self.candles_15m) < int(getattr(self.config, "sfp_len", 2)) + 2:
+            return
+
+        if self.lux_mode:
+            # Lux-поток: (1) на текущем баре ищем новый SFP, (2) обновляем/подтверждаем активные
+            self._lux_find_new_sfp()
+            self._lux_update_active()
+            return
+
+        # Старая логика (если lux_mode=False)
+        bull = self._detect_bull_sfp()
+        bear = self._detect_bear_sfp()
+
+        ts = int(self.candles_15m[0]["timestamp"])
+        if not self._is_in_backtest_window_utc(ts) or not self._is_after_cycle_start(ts):
+            return
+
+        current_position = self.state.get_current_position() if self.state else None
+        if current_position and current_position.get("status") == "open":
+            return
+
+        if bull and self.can_enter_long:
+            self._process_long_entry()
+        elif bear and self.can_enter_short:
+            self._process_short_entry()
+
+    # ---------- “старый” SFP (оставлен для совместимости, не используется в Lux) ----------
+
     def _detect_bull_sfp(self) -> bool:
         L = int(getattr(self.config, "sfp_len", 2))
         if len(self.candles_15m) < (L + 2):
             return False
-
-        # факт пивота
         if self._pivot_low_value(L, 1) is None:
             return False
-
         curr = self.candles_15m[0]
-        ref = float(self.candles_15m[L]["low"])  # === low[sfpLen] ===
-
+        ref = float(self.candles_15m[1]["low"])  # исправлено: swing = low[1]
         lo = float(curr["low"])
         op = float(curr["open"])
         cl = float(curr["close"])
-
         cond_break = lo < ref
         cond_open  = op > ref
         cond_close = cl > ref
@@ -360,17 +572,13 @@ class KWINStrategy:
         L = int(getattr(self.config, "sfp_len", 2))
         if len(self.candles_15m) < (L + 2):
             return False
-
         if self._pivot_high_value(L, 1) is None:
             return False
-
         curr = self.candles_15m[0]
-        ref = float(self.candles_15m[L]["high"])  # === high[sfpLen] ===
-
+        ref = float(self.candles_15m[1]["high"])  # исправлено: swing = high[1]
         hi = float(curr["high"])
         op = float(curr["open"])
         cl = float(curr["close"])
-
         cond_break = hi > ref
         cond_open  = op < ref
         cond_close = cl < ref
@@ -410,7 +618,7 @@ class KWINStrategy:
         except Exception:
             return False
 
-    # ---------- Интрабар-входы по M1 (опционально) ----------
+    # ---------- Интрабар-входы по M1 (не используются в Lux) ----------
 
     def _try_intrabar_entry_from_m1(self, m1: Dict) -> None:
         try:
@@ -427,7 +635,7 @@ class KWINStrategy:
             has_bear_pivot = self._pivot_high_value(L, 1) is not None
 
             if self.can_enter_long and has_bull_pivot:
-                ref = float(self.candles_15m[L]["low"])  # low[sfpLen]
+                ref = float(self.candles_15m[1]["low"])  # swing = low[1]
                 lo = float(m1["low"]); cl = float(m1["close"])
                 if (lo < ref) and (cl > ref):
                     if (not getattr(self.config, "use_sfp_quality", True)) or self._check_bull_sfp_quality({"low": lo, "close": cl}, ref):
@@ -435,7 +643,7 @@ class KWINStrategy:
                         return
 
             if self.can_enter_short and has_bear_pivot:
-                ref = float(self.candles_15m[L]["high"])  # high[sfpLen]
+                ref = float(self.candles_15m[1]["high"])  # swing = high[1]
                 hi = float(m1["high"]); cl = float(m1["close"])
                 if (hi > ref) and (cl < ref):
                     if (not getattr(self.config, "use_sfp_quality", True)) or self._check_bear_sfp_quality({"high": hi, "close": cl}, ref):
@@ -555,15 +763,13 @@ class KWINStrategy:
             if cool_min <= 0:
                 return False
             last_close_ts = None
-            # сперва спросим у StateManager (если он это хранит)
             if self.state and hasattr(self.state, "get_last_close_time"):
                 try:
-                    last_close_ts = self.state.get_last_close_time()  # ожидаем unix ms или datetime
+                    last_close_ts = self.state.get_last_close_time()
                     if isinstance(last_close_ts, datetime):
                         last_close_ts = int(last_close_ts.timestamp() * 1000)
                 except Exception:
                     last_close_ts = None
-            # фоллбек: берём из БД последнюю закрытую сделку
             if (last_close_ts is None) and self.db and hasattr(self.db, "get_recent_trades"):
                 try:
                     rec = self.db.get_recent_trades(1) or []
@@ -580,7 +786,7 @@ class KWINStrategy:
             return False
 
     # ========== ВХОДЫ ==========
-    def _process_long_entry(self, entry_override: Optional[float] = None):
+    def _process_long_entry(self, entry_override: Optional[float] = None, sl_override: Optional[float] = None):
         try:
             if len(self.candles_15m) < 2:
                 return
@@ -593,8 +799,11 @@ class KWINStrategy:
             if self._in_cooldown(self._current_bar_ts_ms()):
                 return
 
-            # Новый расчёт SL «зоной»
-            sl = self._calc_sl_with_zone(direction="long", entry_price=entry)
+            # SL: либо из Lux (override), либо зональный
+            if sl_override is not None:
+                sl = float(sl_override)
+            else:
+                sl = self._calc_sl_with_zone(direction="long", entry_price=entry)
             if sl is None:
                 return
 
@@ -649,11 +858,11 @@ class KWINStrategy:
 
             self.can_enter_long = False
             self.can_enter_short = False
-            print(f"[ENTRY LONG] {qty} @ {entry}, SL(zone)={sl}, TP(filt)={tp_for_filter}")
+            print(f"[ENTRY LONG] {qty} @ {entry}, SL={sl}, TP(filt)={tp_for_filter}")
         except Exception as e:
             print(f"[process_long_entry] {e}")
 
-    def _process_short_entry(self, entry_override: Optional[float] = None):
+    def _process_short_entry(self, entry_override: Optional[float] = None, sl_override: Optional[float] = None):
         try:
             if len(self.candles_15m) < 2:
                 return
@@ -665,7 +874,10 @@ class KWINStrategy:
             if self._in_cooldown(self._current_bar_ts_ms()):
                 return
 
-            sl = self._calc_sl_with_zone(direction="short", entry_price=entry)
+            if sl_override is not None:
+                sl = float(sl_override)
+            else:
+                sl = self._calc_sl_with_zone(direction="short", entry_price=entry)
             if sl is None:
                 return
 
@@ -720,7 +932,7 @@ class KWINStrategy:
 
             self.can_enter_short = False
             self.can_enter_long = False
-            print(f"[ENTRY SHORT] {qty} @ {entry}, SL(zone)={sl}, TP(filt)={tp_for_filter}")
+            print(f"[ENTRY SHORT] {qty} @ {entry}, SL={sl}, TP(filt)={tp_for_filter}")
         except Exception as e:
             print(f"[process_short_entry] {e}")
 
@@ -879,6 +1091,12 @@ class KWINStrategy:
             if (not self._is_in_backtest_window_utc(ts)) or (not self._is_after_cycle_start(ts)):
                 return
 
+            # В Lux-режиме всё делает on_bar_close()
+            if self.lux_mode:
+                self.on_bar_close()
+                return
+
+            # Иначе — старая логика
             if self._detect_bull_sfp() and self.can_enter_long and not self._in_cooldown(ts):
                 self._process_long_entry()
             elif self._detect_bear_sfp() and self.can_enter_short and not self._in_cooldown(ts):
