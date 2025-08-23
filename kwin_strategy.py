@@ -473,7 +473,8 @@ class KWINStrategy:
             return None
 
     def _validate_position_requirements(self, entry_price: float, stop_loss: float,
-                                        take_profit: Optional[float], quantity: float) -> bool:
+                                    take_profit: Optional[float], quantity: float) -> bool:
+    
         try:
             if quantity is None or float(quantity) <= 0:
                 return False
@@ -483,19 +484,19 @@ class KWINStrategy:
             stop_size = abs(float(entry_price) - float(stop_loss))
             if stop_size <= 0:
                 return False
+
+        # (опционально) держим расчёт TP для последующих модулей,
+        # но НЕ фильтруем по net profit
             rr = float(getattr(self.config, "risk_reward", 1.3))
-            tp_calc = float(entry_price) + stop_size * rr if entry_price >= stop_loss else float(entry_price) - stop_size * rr
+            if entry_price >= stop_loss:  # long
+                _ = float(entry_price) + stop_size * rr
+            else:                         # short
+                _ = float(entry_price) - stop_size * rr
 
-            taker = float(getattr(self.config, "taker_fee_rate", 0.00055))
-            gross = abs(tp_calc - float(entry_price)) * float(quantity)
-            fees = float(entry_price) * float(quantity) * taker * 2.0
-            net = gross - fees
-            min_net = float(getattr(self.config, "min_net_profit", 1.2))
-            return net >= min_net
+            return True
         except Exception as e:
-            print(f"[validate_position] {e}")
+            print(f\"[validate_position] {e}\")
             return False
-
     # ---------- Cooldown (отключён по ТЗ) ----------
     def _in_cooldown(self, _now_ts_ms: int) -> bool:
         return False
