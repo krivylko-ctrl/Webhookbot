@@ -114,6 +114,68 @@ def main():
 
     st.markdown("---")
 
+    # =========================== Lux SFP ===========================
+    st.subheader("✨ Lux SFP (как в LuxAlgo)")
+
+    l1, l2, l3, l4 = st.columns(4)
+    with l1:
+        lux_mode = st.selectbox(
+            "Validation",
+            options=["volume_outside_gt", "volume_outside_lt", "none"],
+            index={"volume_outside_gt":0,"volume_outside_lt":1,"none":2}\
+                .get(str(getattr(config, "lux_mode", "volume_outside_gt")), 0),
+            help="Правило валидации объёма: доля объёма фитиля вне свинга относительно порога."
+        )
+        lux_swings = st.number_input(
+            "Swings",
+            min_value=1, max_value=20,
+            value=int(getattr(config, "lux_swings", 2)),
+            step=1,
+            help="Аналог len в Lux: сдвиг свинга для построения уровня."
+        )
+    with l2:
+        lux_volume_threshold_pct = st.number_input(
+            "Volume Threshold %",
+            min_value=0.0, max_value=100.0,
+            value=float(getattr(config, "lux_volume_threshold_pct", 10.0)),
+            step=0.5,
+            help="% от суммарного объёма бара на младшем ТФ, приходящийся на ‘фитиль за свингом’."
+        )
+        lux_auto = st.checkbox(
+            "Auto (ресемплинг LTF)",
+            value=bool(getattr(config, "lux_auto", False)),
+            help="Автоматический расчёт LTF из текущего ТФ (как у Lux)."
+        )
+    with l3:
+        lux_mlt = st.number_input(
+            "Auto mlt",
+            min_value=1, max_value=120,
+            value=int(getattr(config, "lux_mlt", 10)),
+            step=1,
+            help="Делитель для авто-выбора LTF (секунды текущего ТФ / mlt)."
+        )
+        lux_ltf = st.selectbox(
+            "LTF (ручной)",
+            options=["1", "3", "5"],
+            index=["1","3","5"].index(str(getattr(config, "lux_ltf", "1"))),
+            help="Если Auto выключен — используем этот младший ТФ."
+        )
+    with l4:
+        lux_premium = st.checkbox(
+            "Premium",
+            value=bool(getattr(config, "lux_premium", False)),
+            help="Ограничивает минимальный интервал LTF (как в Lux)."
+        )
+        lux_expire_bars = st.number_input(
+            "Expire bars",
+            min_value=10, max_value=2000,
+            value=int(getattr(config, "lux_expire_bars", 500)),
+            step=10,
+            help="Через сколько баров уровень SFP перестаёт быть активным (визуальная совместимость)."
+        )
+
+    st.markdown("---")
+
     # =========================== Фильтры (из Pine) ===========================
     st.subheader("🛡️ Фильтры SFP")
 
@@ -146,7 +208,7 @@ def main():
 
     # ======================= Stop-Loss Zone (Pine-like) =======================
     st.subheader("📌 Stop-Loss Zone (Pine-like)")
-    z1, z2, z3, z4, z5 = st.columns(5)
+    z1, z2, z3, z4, z5, z6 = st.columns(6)
     with z1:
         use_swing_sl = st.checkbox(
             "SL от свинга (pivot)",
@@ -160,6 +222,12 @@ def main():
             help="База SL — high[1]/low[1] (предыдущая свеча)."
         )
     with z3:
+        use_sfp_candle_sl = st.checkbox(
+            "SL от SFP-свечи [0]",
+            value=bool(getattr(config, "use_sfp_candle_sl", False)),
+            help="База SL — экстремум текущей SFP-свечи."
+        )
+    with z4:
         sl_buf_ticks = st.number_input(
             "Буфер к SL (ticks)",
             min_value=0,
@@ -168,13 +236,13 @@ def main():
             step=1,
             help="Отступ от базы в тик-сайзах, добавляемый к SL."
         )
-    with z4:
+    with z5:
         use_atr_buffer = st.checkbox(
             "ATR-буфер",
             value=bool(getattr(config, "use_atr_buffer", False)),
             help="Добавлять к SL дополнительную подушку ATR*mult."
         )
-    with z5:
+    with z6:
         atr_mult = st.number_input(
             "ATR Mult",
             min_value=0.0,
@@ -189,7 +257,7 @@ def main():
     # =============================== Smart Trailing ================================
     st.subheader("🎯 Smart Trailing")
 
-    t1, t2, t3 = st.columns(3)
+    t1, t2 = st.columns(2)
     with t1:
         enable_smart_trail = st.checkbox(
             "Включить Smart Trailing",
@@ -216,37 +284,13 @@ def main():
             help="extremum — считаем от экстремума бара; last — от текущей цены"
         )
     with t2:
-        # Эти поля будут сохранены в config.json (если они есть в Config.to_dict)
-        trailing_basis = st.selectbox(
-            "Базис трейла",
-            options=["risk_r", "entry_pct"],
-            index=0 if str(getattr(config, "trailing_basis", "risk_r")) == "risk_r" else 1,
-            help="risk_r — дистанция в R (риск-юнитах), entry_pct — проценты от цены входа."
-        )
-        trailing_r = st.number_input(
-            "Trailing (в R)",
-            min_value=0.0,
-            max_value=5.0,
-            value=float(getattr(config, "trailing_r", 0.5)),
-            step=0.1,
-            help="Дистанция трейла в R (используется при базисе risk_r)."
-        )
-        trailing_offset_r = st.number_input(
-            "Offset (в R)",
-            min_value=0.0,
-            max_value=5.0,
-            value=float(getattr(config, "trailing_offset_r", 0.0)),
-            step=0.1,
-            help="Дополнительный отступ в R при базисе risk_r."
-        )
-    with t3:
         trailing_perc = st.number_input(
             "Процент трейлинга (%)",
             min_value=0.0,
             max_value=5.0,
             value=float(getattr(config, 'trailing_perc', 0.5)),
             step=0.1,
-            help="Процент от цены входа (используется при базисе entry_pct)."
+            help="Процент от цены входа (аналог твоего текущего механизма)."
         )
         trailing_offset_perc = st.number_input(
             "Offset трейлинга (%)",
@@ -254,10 +298,8 @@ def main():
             max_value=5.0,
             value=float(getattr(config, 'trailing_offset_perc', 0.4)),
             step=0.1,
-            help="Дополнительный отступ (используется при базисе entry_pct)."
+            help="Дополнительный отступ."
         )
-        # совместимость
-        st.caption("Если выбран базис risk_r — проценты игнорируются, и наоборот.")
 
     st.markdown("---")
 
@@ -321,15 +363,26 @@ def main():
                 config.taker_fee_rate = float(taker_fee_rate)
                 config.use_take_profit = bool(use_take_profit)
 
-                # SFP
+                # SFP (базовые фильтры)
                 config.sfp_len = int(sfp_len)
                 config.use_sfp_quality = bool(use_sfp_quality)
                 config.wick_min_ticks = int(wick_min_ticks)
                 config.close_back_pct = float(close_back_pct)
 
+                # Lux SFP
+                config.lux_mode = str(lux_mode)
+                config.lux_swings = int(lux_swings)
+                config.lux_volume_threshold_pct = float(lux_volume_threshold_pct)
+                config.lux_auto = bool(lux_auto)
+                config.lux_mlt = int(lux_mlt)
+                config.lux_ltf = str(lux_ltf)
+                config.lux_premium = bool(lux_premium)
+                config.lux_expire_bars = int(lux_expire_bars)
+
                 # SL zone
                 config.use_swing_sl = bool(use_swing_sl)
                 config.use_prev_candle_sl = bool(use_prev_candle_sl)
+                config.use_sfp_candle_sl = bool(use_sfp_candle_sl)
                 config.sl_buf_ticks = int(sl_buf_ticks)
                 config.use_atr_buffer = bool(use_atr_buffer)
                 config.atr_mult = float(atr_mult)
@@ -339,11 +392,6 @@ def main():
                 config.use_arm_after_rr = bool(use_arm_after_rr)
                 config.arm_rr = float(arm_rr)
                 config.arm_rr_basis = str(arm_rr_basis)
-
-                # Базис трейла
-                config.trailing_basis = str(trailing_basis)
-                config.trailing_r = float(trailing_r)
-                config.trailing_offset_r = float(trailing_offset_r)
                 config.trailing_perc = float(trailing_perc)
                 config.trailing_offset_perc = float(trailing_offset_perc)
                 config.trailing_offset = float(trailing_offset_perc)  # alias
