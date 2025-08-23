@@ -105,12 +105,24 @@ class Database:
                 timestamp TEXT DEFAULT (datetime('now'))
             )
         """)
+        # Индексы для скорости
+        c.execute("CREATE INDEX IF NOT EXISTS idx_trades_status ON trades(status)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_trades_entry_time ON trades(entry_time)")
+        c.execute("CREATE INDEX IF NOT EXISTS idx_trades_exit_time  ON trades(exit_time)")
         self.conn.commit()
 
     # -------------------------- Trades --------------------------
     def save_trade(self, trade: Dict) -> int:
         with self._lock:
             try:
+                # Унификация qty/quantity: если пришёл size — примем как quantity
+                qty = trade.get("quantity", None)
+                if qty in (None, "", 0) and ("size" in trade):
+                    try:
+                        qty = float(trade.get("size"))
+                    except Exception:
+                        qty = trade.get("size")
+
                 c = self.conn.cursor()
                 c.execute("""
                     INSERT INTO trades (
@@ -124,8 +136,8 @@ class Database:
                     _f(trade.get("exit_price")),
                     _f(trade.get("stop_loss")),
                     _f(trade.get("take_profit")),
-                    _f(trade.get("quantity")),
-                    _f(trade.get("qty")),
+                    _f(qty),
+                    _f(trade.get("qty")),  # буферное поле на всякий случай
                     _f(trade.get("pnl")),
                     _f(trade.get("rr")),
                     _to_iso(trade.get("entry_time") or datetime.utcnow()),
@@ -168,7 +180,7 @@ class Database:
                 net_pnl = gross - (fee_in + fee_out)
 
                 rr = None
-                if stop_loss and stop_loss != 0:
+                if stop_loss not in (None, 0.0):
                     risk = abs(entry_price - stop_loss)
                     if risk > 0:
                         rr = abs(exit_price - entry_price) / risk
@@ -214,6 +226,31 @@ class Database:
             c = self.conn.cursor()
             c.execute("SELECT * FROM trades ORDER BY entry_time ASC")
             return [dict(r) for r in c.fetchall()]
+
+    # -------------------------- Aggregates for UI --------------------------
+    def get_trades_count_today(self) -> int:
+        """Количество сделок, открытых сегодня (UTC) — для дашборда."""
+        with self._lock:
+            c = self.conn.cursor()
+            start = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
+            c.execute(
+                "SELECT COUNT(1) FROM trades WHERE entry_time >= ?",
+                (_to_iso(start),),
+            )
+            row = c.fetchone()
+            return int(row[0] if row and row[0] is not None else 0)
+
+    def get_pnl_today(self) -> float:
+        """Сумма PnL закрытых сделок за сегодня (UTC)."""
+        with self._lock:
+            c = self.conn.cursor()
+            start = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
+            c.execute(
+                "SELECT COALESCE(SUM(pnl), 0.0) FROM trades WHERE status = 'closed' AND exit_time >= ?",
+                (_to_iso(start),),
+            )
+            row = c.fetchone()
+            return float(row[0] if row and row[0] is not None else 0.0)
 
     # -------------------------- Equity --------------------------
     def save_equity_snapshot(self, equity: float):
@@ -271,8 +308,10 @@ class Database:
     def save_bot_state(self, state: Dict[str, Any]):
         with self._lock:
             c = self.conn.cursor()
-            c.execute("INSERT OR REPLACE INTO bot_state (id, state_data, updated_at) VALUES (1, ?, ?)",
-                      (json.dumps(_normalize_json(state)), _to_iso(datetime.utcnow())))
+            c.execute(
+                "INSERT OR REPLACE INTO bot_state (id, state_data, updated_at) VALUES (1, ?, ?)",
+                (json.dumps(_normalize_json(state)), _to_iso(datetime.utcnow()))
+            )
             self.conn.commit()
 
     def get_config(self) -> Dict[str, Any]:
@@ -285,8 +324,10 @@ class Database:
     def save_config(self, cfg: Dict[str, Any]):
         with self._lock:
             c = self.conn.cursor()
-            c.execute("INSERT OR REPLACE INTO config (id, config_data, updated_at) VALUES (1, ?, ?)",
-                      (json.dumps(_normalize_json(cfg)), _to_iso(datetime.utcnow())))
+            c.execute(
+                "INSERT OR REPLACE INTO config (id, config_data, updated_at) VALUES (1, ?, ?)",
+                (json.dumps(_normalize_json(cfg)), _to_iso(datetime.utcnow()))
+            )
             self.conn.commit()
 
     # --------------------- Экспорт/Импорт ---------------------
