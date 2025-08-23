@@ -49,8 +49,27 @@ class Database:
         self.db_path = ":memory:" if memory else db_path
         self.conn = sqlite3.connect(self.db_path, check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
+        # Улучшаем стабильность/параллелизм
+        try:
+            self.conn.execute("PRAGMA journal_mode=WAL;")
+            self.conn.execute("PRAGMA synchronous=NORMAL;")
+            self.conn.execute("PRAGMA foreign_keys=ON;")
+        except Exception:
+            pass
         self._lock = threading.RLock()
         self._init_schema()
+
+    def __del__(self):
+        try:
+            self.conn.close()
+        except Exception:
+            pass
+
+    def close(self):
+        try:
+            self.conn.close()
+        except Exception:
+            pass
 
     # -------------------------- Схема --------------------------
     def _init_schema(self) -> None:
@@ -345,11 +364,16 @@ class Database:
         for tr in dump.get("trades", []):
             self.save_trade(tr)
         for e in dump.get("equity", []):
-            self.save_equity_snapshot(e["equity"])
+            # пишем синхронно, чтобы порядок сохранился
+            with self._lock:
+                c = self.conn.cursor()
+                c.execute("INSERT INTO equity_history (equity, timestamp) VALUES (?, ?)",
+                          (_f(e.get("equity")), _to_iso(e.get("timestamp") or datetime.utcnow())))
+                self.conn.commit()
         self.save_bot_state(dump.get("state", {}))
         self.save_config(dump.get("config", {}))
         for lg in dump.get("logs", []):
-            self.save_log(lg["level"], lg["message"], lg.get("module"))
+            self.save_log(lg.get("level", "info"), lg.get("message", ""), lg.get("module"))
 
     def drop_and_recreate(self):
         with self._lock:
