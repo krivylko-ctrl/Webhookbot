@@ -100,7 +100,7 @@ class Config:
 
         # === ДОП. ЛОГИКА ===
         # Инверсия сигналов (Long <-> Short)
-        self.invert_signals = env("INVERT_SIGNALS", "false").lower() not in ("0","false","no")
+        self.invert_signals = env("INVERT_SIGNALS", "true").lower() not in ("0","false","no")
         # Кулдаун после закрытия позиции (мин)
         self.cooldown_minutes = int(env("COOLDOWN_MINUTES", "0"))
 
