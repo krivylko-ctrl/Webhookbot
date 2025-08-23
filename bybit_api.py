@@ -35,7 +35,6 @@ class BybitAPI:
             self.ws_url = "wss://stream.bybit.com/v5/public/linear"
 
         self.session = requests.Session()
-        # полезные заголовки для стабильности (иногда CF/edge лучше пропускает с UA)
         self.session.headers.update({
             "User-Agent": "KWINBot/1.0 (+https://example.local)",
             "Accept": "application/json",
@@ -50,7 +49,11 @@ class BybitAPI:
     def _sorted_qs(params: Dict[str, Any]) -> str:
         if not params:
             return ""
-        items = [(k, "" if v is None else str(v)) for k, v in params.items()]
+        items = []
+        for k, v in params.items():
+            if isinstance(v, (list, tuple)):
+                v = ",".join(map(str, v))
+            items.append((k, "" if v is None else str(v)))
         items.sort(key=lambda kv: kv[0])
         return urlencode(items)
 
@@ -92,7 +95,6 @@ class BybitAPI:
                     "X-BAPI-RECV-WINDOW": "5000",
                 })
 
-            # сшиваем сессии: используем общий session для keep-alive
             if method.upper() == "GET":
                 r = self.session.get(url, params=params, headers=headers, timeout=timeout)
             elif method.upper() == "POST":
@@ -103,7 +105,6 @@ class BybitAPI:
 
             r.raise_for_status()
             resp = r.json()
-            # удобная диагностика, если retCode != 0
             if isinstance(resp, dict) and resp.get("retCode") not in (0, "0", None):
                 try:
                     print(f"[BybitAPI] {method} {endpoint} retCode={resp.get('retCode')} retMsg={resp.get('retMsg')}")
@@ -120,12 +121,18 @@ class BybitAPI:
     @staticmethod
     def _map_trigger_by(source: str) -> str:
         s = str(source).lower()
-        # v5 ожидает 'MarkPrice' / 'LastPrice' / (редко 'IndexPrice')
         if s.startswith("mark"):
             return "MarkPrice"
         if s.startswith("index"):
             return "IndexPrice"
         return "LastPrice"
+
+    @staticmethod
+    def _to_float(x, default=0.0) -> float:
+        try:
+            return float(x)
+        except Exception:
+            return float(default)
 
     # ==================== конфиг ====================
 
@@ -134,6 +141,7 @@ class BybitAPI:
         m = (market_type or "linear").lower()
         self.market_type = m
         base = "stream-testnet" if self.testnet else "stream"
+        # Эндпоинт WS зависит от категории
         self.ws_url = f"wss://{base}.bybit.com/v5/public/{m}"
 
     def force_linear(self):
@@ -152,20 +160,14 @@ class BybitAPI:
                 return int(int(result["timeNano"]) / 1_000_000_000)
         return None
 
-    def _to_float(self, x, default=0.0) -> float:
-        try:
-            return float(x)
-        except Exception:
-            return float(default)
-
     def get_klines(self, symbol: str, interval: str, limit: int = 200) -> Optional[List[Dict]]:
         """
-        Последние N свечей по категории self.market_type (по умолчанию — linear).
+        Последние N свечей по категории self.market_type.
         interval: строка минут ("1","3","5","15","60",...).
         Возвращает список по возрастанию timestamp (мс).
         """
         params = {
-            "category": self.market_type,          # <— важно: фьючерсы
+            "category": self.market_type,
             "symbol": (symbol or "").upper(),
             "interval": str(interval),
             "limit": int(limit),
@@ -178,7 +180,6 @@ class BybitAPI:
                 return []
             out: List[Dict] = []
             for it in lst:
-                # Формат v5: [start(ms), open, high, low, close, volume, turnover]
                 try:
                     out.append({
                         "timestamp": int(it[0]),
@@ -192,7 +193,6 @@ class BybitAPI:
                     continue
             out.sort(key=lambda x: x["timestamp"])
             return out
-        # retCode != 0
         print(f"[BybitAPI] get_klines error: {resp.get('retCode')} {resp.get('retMsg')}")
         return None
 
@@ -206,7 +206,7 @@ class BybitAPI:
         limit: int = 1000
     ) -> Optional[List[Dict]]:
         """
-        Чтение свечей с окнами времени (start/end в мс). Удобно для бэктеста.
+        Чтение свечей с окнами времени (start/end в мс). Удобно для бэктеста и LTF-валидации.
         Возвращает по возрастанию timestamp (мс).
         """
         params = {
@@ -240,6 +240,11 @@ class BybitAPI:
             return out
         print(f"[BybitAPI] get_klines_window error: {resp.get('retCode')} {resp.get('retMsg')}")
         return None
+
+    # Удобный алиас: ровно то же, что window, но с более читаемым именем
+    def get_klines_between(self, symbol: str, interval: str, start_ms: int, end_ms: int, limit: int = 1000) -> List[Dict]:
+        rows = self.get_klines_window(symbol, interval, start_ms=start_ms, end_ms=end_ms, limit=limit) or []
+        return rows
 
     def get_ticker(self, symbol: str) -> Optional[Dict]:
         params = {"category": self.market_type, "symbol": (symbol or "").upper()}
@@ -275,12 +280,11 @@ class BybitAPI:
             lst = (resp.get("result") or {}).get("list") or []
             if not lst:
                 print(f"[BybitAPI] instruments-info empty for {params}")
-            # В ответе уже есть priceFilter/lotSizeFilter — стратегия ожидает именно их.
             return lst[0] if lst else None
         print(f"[BybitAPI] instruments-info error: {resp.get('retCode')} {resp.get('retMsg')}")
         return None
 
-    # ==================== приватные ====================
+    # ==================== приватные (trade/account) ====================
 
     def get_wallet_balance(self, account_type: str = "UNIFIED") -> Optional[Dict]:
         params = {"accountType": account_type}
@@ -368,7 +372,6 @@ class BybitAPI:
         resp = self._send_request("POST", "/v5/position/trading-stop", params, requires_auth=True)
         if resp.get("retCode") == 0:
             return True
-        # Для безопасности — логируем ответ
         try:
             print(f"[BybitAPI] update_position_stop_loss failed: {resp.get('retMsg')}")
         except Exception:
@@ -392,7 +395,7 @@ class BybitAPI:
         прозрачно фолбэкнемся на обновление SL/TP по позиции (trading-stop),
         что соответствует тому, как стратегия пытается обновить SL.
         """
-        # Если нет id/linkId и меняем только SL/TP — фолбэк на trading-stop
+        # Фолбэк — только SL/TP без id
         if (order_id is None and order_link_id is None) and (stop_loss is not None or take_profit is not None) and price is None and qty is None:
             ok_sl = True
             ok_tp = True
@@ -414,7 +417,7 @@ class BybitAPI:
                         pass
             return {"ok": (ok_sl and ok_tp)}
 
-        # Иначе — обычный amend ордера
+        # Иначе — обычный amend
         params: Dict[str, str] = {
             "category": self.market_type,
             "symbol": (symbol or "").upper(),
@@ -428,8 +431,6 @@ class BybitAPI:
         if qty is not None:
             params["qty"] = str(qty)
 
-        # В /order/amend нельзя прямо слать SL/TP, поэтому, если они пришли вместе с ID,
-        # сначала амендим ордер (цена/кол-во), затем через trading-stop обновим SL/TP.
         resp = self._send_request("POST", "/v5/order/amend", params, requires_auth=True)
         if resp.get("retCode") != 0:
             print(f"[BybitAPI] order/amend error: {resp.get('retCode')} {resp.get('retMsg')}")
@@ -456,7 +457,7 @@ class BybitAPI:
     # ==================== WebSocket ====================
 
     def start_websocket(self, on_message: Optional[Callable] = None):
-        """Запуск WS с авто-переподключением."""
+        """Запуск WS с авто-переподключением (публичный стрим категории market_type)."""
         from websocket import WebSocketApp
 
         def on_ws_message(ws, message):
@@ -491,7 +492,7 @@ class BybitAPI:
         threading.Thread(target=self.ws.run_forever, daemon=True).start()
 
     def subscribe_kline(self, symbol: str, interval: str, callback: Callable):
-        """Подписка на kline (возвращаются только закрытые бары)."""
+        """Подписка на kline (возвращаются только закрытые бары через поле confirm=True)."""
         if not self.ws:
             self.start_websocket()
         topic = f"kline.{interval}.{(symbol or '').upper()}"
