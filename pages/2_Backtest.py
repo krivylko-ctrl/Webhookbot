@@ -72,7 +72,6 @@ class BacktestBroker:
         return {"ok": True, "filled": True, "msg": "backtest fill"}
 
     def update_position_stop_loss(self, symbol: str, new_sl: float, **_kwargs):
-        # Совместимость сигнатуры с реальным API (приходит trigger_by_source и др.)
         return True
 
     def modify_order(self, **_kwargs):
@@ -99,10 +98,9 @@ def _align_ceil(ts_ms: int, tf_ms: int) -> int:
 
 
 def _norm_ts_ms(df: pd.DataFrame, col: str = "timestamp") -> pd.DataFrame:
-    """Приводим timestamp к миллисекундам, если пришли секунды."""
     if col in df.columns and not df.empty:
         mx = pd.to_numeric(df[col], errors="coerce").max()
-        if pd.notna(mx) and mx < 1_000_000_000_000:  # секунды
+        if pd.notna(mx) and mx < 1_000_000_000_000:
             df[col] = pd.to_numeric(df[col], errors="coerce") * 1000
     return df
 
@@ -116,13 +114,6 @@ def _fetch_aligned_window(
     limit: int = 1000,
     overlap_bars: int = 2,
 ) -> List[Dict]:
-    """
-    Универсальный лоадер через broker.get_klines_window с:
-      • выравниванием start/end к сетке ТФ,
-      • чанками с перекрытием (overlap_bars),
-      • дедупом и сортировкой,
-      • нормализацией timestamp в мс.
-    """
     tf_ms = int(interval) * 60_000
     start_ms = _align_floor(start_ms, tf_ms)
     end_ms = _align_ceil(end_ms, tf_ms) - 1
@@ -134,10 +125,9 @@ def _fetch_aligned_window(
         chunk_end = min(end_ms, cursor + step_ms - 1)
         rows = _api.get_klines_window(symbol, interval, start_ms=cursor, end_ms=chunk_end, limit=limit) or []
         if rows:
-            # в dict-форму и ms-нормализация
             for r in rows:
                 ts = int(r.get("timestamp") or r.get("open_time") or 0)
-                if ts and ts < 1_000_000_000_000:  # сек -> мс
+                if ts and ts < 1_000_000_000_000:
                     ts *= 1000
                 out.append({
                     "timestamp": ts,
@@ -149,21 +139,12 @@ def _fetch_aligned_window(
                 })
         cursor = chunk_end + 1
 
-    # дедуп + сортировка
     out = sorted({b["timestamp"]: b for b in out if b["timestamp"]}.values(), key=lambda x: x["timestamp"])
     return out
 
 
 @st.cache_data(show_spinner=False)
 def load_m15_window(_api: BacktestBroker, symbol: str, days: int, sfp_len: int = 2, **kwargs) -> BtData:
-    """
-    15m история по ЖЁСТКОМУ окну времени + тёплый старт для пивотов.
-    Возвращаем DataFrame по возрастанию времени.
-
-    Совместимость: принимаем ошибочные ключи ('sfn_len', 'sfп_len', 'sf_len', 'sfpLen')
-    и тихо маппим их на sfp_len.
-    """
-    # --- совместимость с опечатками ключа ---
     for alt in ("sfn_len", "sf_len", "sfп_len", "sfpLen"):
         if alt in kwargs and (sfp_len is None or sfp_len == 2):
             try:
@@ -171,17 +152,14 @@ def load_m15_window(_api: BacktestBroker, symbol: str, days: int, sfp_len: int =
             except Exception:
                 pass
 
-    # окно бэктеста: [UTC-полночь - days, now]
     utc_midnight = _utc_midnight()
     start_dt = utc_midnight - timedelta(days=int(days))
     end_dt = datetime.now(timezone.utc)
 
-    # warm-up: L + 2 + 10 баров 15m
     warmup_15m = int(sfp_len) + 12
     start_ms = int(start_dt.timestamp() * 1000) - warmup_15m * 15 * 60 * 1000
     end_ms = int(end_dt.timestamp() * 1000)
 
-    # надёжная подгрузка с выравниванием и перекрытием
     raw = _fetch_aligned_window(_api, symbol, "15", start_ms=start_ms, end_ms=end_ms, limit=1000, overlap_bars=2)
     df = pd.DataFrame(raw or [])
     if df.empty:
@@ -193,10 +171,6 @@ def load_m15_window(_api: BacktestBroker, symbol: str, days: int, sfp_len: int =
 
 @st.cache_data(show_spinner=False)
 def load_m1_day(_api: BacktestBroker, symbol: str, intrabar_tf: str, day_start_ms: int) -> pd.DataFrame:
-    """
-    Минутки/интрабар за ОДИН ДЕНЬ: [day_start .. day_start+24h], с выравниванием и перекрытием.
-    Кэшируется поминутно по дням => ~N запросов на N дней.
-    """
     tf_ms = int(intrabar_tf) * 60_000  # noqa: F841
     day_start_ms = _align_floor(day_start_ms, 24 * 60 * 60 * 1000)
     day_end_ms = day_start_ms + 24 * 60 * 60 * 1000 - 1
@@ -210,14 +184,9 @@ def load_m1_day(_api: BacktestBroker, symbol: str, intrabar_tf: str, day_start_m
 
 
 def iter_m1_between_by_day(_api: BacktestBroker, symbol: str, intrabar_tf: str, t_from: int, t_to: int) -> List[Dict]:
-    """
-    Возвращает список m1-свечей строго в (t_from, t_to], подгружая данные
-    суточными пачками и вырезая нужный интервал. Время — в МИЛЛИСЕКУНДАХ.
-    """
     if t_to <= t_from:
         return []
 
-    # нормализуем к UTC-полуночам исходя из t_from/t_to
     from_dt = datetime.utcfromtimestamp(int(t_from) / 1000).replace(tzinfo=timezone.utc)
     to_dt   = datetime.utcfromtimestamp(int(t_to)   / 1000).replace(tzinfo=timezone.utc)
 
@@ -281,6 +250,24 @@ def simulate_exits_on_m1(state: StateManager, db: Database, cfg: Config, m1: Dic
             _book_close_and_update_equity(state, db, cfg, pos, tp, "TP"); return
 
 
+# ===== Lux SFP: выбор LTF (как в Lux) =====
+def derive_lux_ltf_minutes(base_tf_min: int, auto: bool, mlt: int, premium: bool, manual_ltf: str) -> str:
+    """Возвращает строку минут для интрабара с логикой Lux."""
+    if not auto:
+        return str(manual_ltf)
+    tfC = base_tf_min * 60  # сек
+    rs_sec = max(1, tfC // max(1, int(mlt)))
+    if not premium:
+        rs_sec = max(60, rs_sec)  # минимум 1m
+    # переводим в ближайшие 1|3|5 минуты
+    rs_min = max(1, int(round(rs_sec / 60)))
+    if rs_min <= 2:
+        return "1"
+    if rs_min <= 4:
+        return "3"
+    return "5"
+
+
 def run_backtest(symbol: str,
                  days: int,
                  init_equity: float,
@@ -288,7 +275,7 @@ def run_backtest(symbol: str,
                  price_source_for_logic: str = "last") -> Tuple[Database, StateManager, KWINStrategy]:
     """15m + интрабар M1 (по дням), Pine-точные входы/трейл, реальные бары Bybit."""
 
-    # отдельная БД под бэктест (полный сброс перед стартом)
+    # отдельная БД под бэктест (полный сброс)
     bt_db_path = f"kwin_backtest_{symbol}.db"
     db = Database(db_path=bt_db_path)
     db.drop_and_recreate()
@@ -303,10 +290,10 @@ def run_backtest(symbol: str,
 
     # стратегия
     cfg.price_for_logic = str(price_source_for_logic).lower()
-    cfg.start_time_ms = None                    # не ограничиваем «isActive» в bt
+    cfg.start_time_ms = None
     strat = KWINStrategy(cfg, api=broker, state_manager=state, db=db)
 
-    # 15m история (с выравниванием и тёплым стартом)
+    # 15m история
     data15 = load_m15_window(broker, symbol, days=int(days), sfp_len=int(getattr(cfg, "sfp_len", 2)))
     if data15.m15.empty:
         st.error("Не удалось загрузить 15m историю.")
@@ -321,7 +308,6 @@ def run_backtest(symbol: str,
         t_curr = int(bar["timestamp"])
         t_next = int(m15.iloc[i + 1]["timestamp"])
 
-        # «текущая» цена — клоуз 15m
         broker.set_current_price(symbol, float(bar["close"]))
 
         strat.on_bar_close_15m({
@@ -332,7 +318,6 @@ def run_backtest(symbol: str,
             "close": float(bar["close"]),
         })
 
-        # интрабары из кэша "по дням"
         m1_set = iter_m1_between_by_day(broker, symbol, intrabar_tf, t_curr, t_next)
         for m1 in m1_set:
             broker.set_current_price(symbol, float(m1["close"]))
@@ -345,7 +330,6 @@ def run_backtest(symbol: str,
             })
             simulate_exits_on_m1(state, db, cfg, m1)
 
-    # если осталась открытая позиция — закроем по последнему close 15m
     pos = state.get_current_position()
     if pos and pos.get("status") == "open":
         last_close = float(m15.iloc[-1]["close"])
@@ -369,7 +353,6 @@ with st.form("backtest_form"):
     with c0c:
         price_src = st.selectbox("Источник цены для логики", options=["last", "mark"], index=0)
     with c0d:
-        # Убрали 39 дней из списка
         bt_days = st.selectbox("Период бэктеста (дней)", [7, 14, 30, 60], index=2)
 
     st.markdown("---")
@@ -389,25 +372,56 @@ with st.form("backtest_form"):
 
     st.markdown("---")
 
-    # ====== Stop-Loss зона (Pine-подход) ======
+    # ====== Lux SFP ======
+    st.subheader("✨ Lux SFP (валидация объёма как в LuxAlgo)")
+    l1, l2, l3, l4 = st.columns(4)
+    with l1:
+        lux_mode = st.selectbox(
+            "Validation",
+            options=["volume_outside_gt", "volume_outside_lt", "none"],
+            index={"volume_outside_gt":0,"volume_outside_lt":1,"none":2}\
+                .get(str(getattr(cfg, "lux_mode", "volume_outside_gt")), 0),
+            help="GT: объём за свингом > порога; LT: < порога; None: без проверки."
+        )
+        lux_swings = st.number_input("Swings", min_value=1, max_value=20,
+                                     value=int(getattr(cfg, "lux_swings", 2)), step=1)
+    with l2:
+        lux_volume_threshold_pct = st.number_input("Volume Threshold %", min_value=0.0, max_value=100.0,
+                                                   value=float(getattr(cfg, "lux_volume_threshold_pct", 10.0)),
+                                                   step=0.5)
+        lux_auto = st.checkbox("Auto (LTF)", value=bool(getattr(cfg, "lux_auto", False)))
+    with l3:
+        lux_mlt = st.number_input("Auto mlt", min_value=1, max_value=120,
+                                  value=int(getattr(cfg, "lux_mlt", 10)), step=1)
+        lux_ltf = st.selectbox("LTF (ручной)", options=["1", "3", "5"],
+                               index=["1","3","5"].index(str(getattr(cfg, "lux_ltf", "1"))))
+    with l4:
+        lux_premium = st.checkbox("Premium", value=bool(getattr(cfg, "lux_premium", False)))
+        lux_expire_bars = st.number_input("Expire bars", min_value=10, max_value=2000,
+                                          value=int(getattr(cfg, "lux_expire_bars", 500)), step=10)
+
+    st.markdown("---")
+
+    # ====== Stop-Loss зона ======
     st.subheader("📌 Stop-Loss Zone (Pine-like)")
-    z1, z2, z3, z4, z5 = st.columns(5)
+    z1, z2, z3, z4, z5, z6 = st.columns(6)
     with z1:
         use_swing_sl = st.checkbox("SL от свинга (pivot)", value=bool(getattr(cfg, "use_swing_sl", True)))
     with z2:
-        use_prev_candle_sl = st.checkbox("SL от SFP-свечи [0]", value=False)  # дефолт выкл.
+        use_prev_candle_sl = st.checkbox("SL от свечи [1]", value=bool(getattr(cfg, "use_prev_candle_sl", False)))
     with z3:
+        use_sfp_candle_sl = st.checkbox("SL от SFP-свечи [0]", value=bool(getattr(cfg, "use_sfp_candle_sl", False)))
+    with z4:
         sl_buf_ticks = st.number_input("Буфер к SL (ticks)", min_value=0, max_value=1000,
                                        value=int(getattr(cfg, "sl_buf_ticks", 40)), step=1)
-    with z4:
-        use_atr_buffer = st.checkbox("ATR-буфер", value=bool(getattr(cfg, "use_atr_buffer", False)))
     with z5:
+        use_atr_buffer = st.checkbox("ATR-буфер", value=bool(getattr(cfg, "use_atr_buffer", False)))
+    with z6:
         atr_mult = st.number_input("ATR Mult", min_value=0.0, max_value=10.0,
                                    value=float(getattr(cfg, "atr_mult", 0.0)), step=0.1)
 
     tps = st.selectbox("Триггер стопа/тейка (биржа)", options=["mark", "last"],
-                       index=0 if str(getattr(cfg, "trigger_price_source", "mark")).lower() == "mark" else 1,
-                       help="По какой цене биржа срабатывает SL/TP. Рекомендуется Mark.")
+                       index=0 if str(getattr(cfg, "trigger_price_source", "mark")).lower() == "mark" else 1)
 
     st.markdown("---")
 
@@ -465,7 +479,7 @@ with st.form("backtest_form"):
 
     st.markdown("---")
 
-    # ====== Фильтры SFP ======
+    # ====== Фильтры SFP (wick/closeback) ======
     st.subheader("📌 Фильтр SFP (wick + closeback)")
     c14, c15, c16 = st.columns(3)
     with c14:
@@ -498,32 +512,50 @@ with st.form("backtest_form"):
 
 # ========================= запуск бэктеста =========================
 if submitted:
-    # полный сброс кэша перед каждым запуском (пробиваем @st.cache_data/@st.cache_resource)
     try: st.cache_data.clear()
     except Exception: pass
     try: st.cache_resource.clear()
     except Exception: pass
 
-    # применяем значения в конфиг
     cfg = Config()
     cfg.symbol = symbol.strip().upper()
     cfg.risk_reward = float(risk_reward)
     cfg.sfp_len = int(sfp_len)
     cfg.risk_pct = float(risk_pct)
 
-    # ===== SL-зона (новые параметры) ====
+    # ===== Lux SFP ====
+    cfg.lux_mode = str(lux_mode)
+    cfg.lux_swings = int(lux_swings)
+    cfg.lux_volume_threshold_pct = float(lux_volume_threshold_pct)
+    cfg.lux_auto = bool(lux_auto)
+    cfg.lux_mlt = int(lux_mlt)
+    cfg.lux_ltf = str(lux_ltf)
+    cfg.lux_premium = bool(lux_premium)
+    cfg.lux_expire_bars = int(lux_expire_bars)
+
+    # Выбираем intrabar_tf в духе Lux
+    cfg.intrabar_tf = derive_lux_ltf_minutes(
+        base_tf_min=15,
+        auto=cfg.lux_auto,
+        mlt=cfg.lux_mlt,
+        premium=cfg.lux_premium,
+        manual_ltf=cfg.lux_ltf
+    )
+
+    # ===== SL-зона =====
     cfg.use_swing_sl = bool(use_swing_sl)
     cfg.use_prev_candle_sl = bool(use_prev_candle_sl)
+    cfg.use_sfp_candle_sl = bool(use_sfp_candle_sl)
     cfg.sl_buf_ticks = int(sl_buf_ticks)
     cfg.use_atr_buffer = bool(use_atr_buffer)
     cfg.atr_mult = float(atr_mult)
-    cfg.trigger_price_source = str(tps).lower()  # "mark" | "last"
+    cfg.trigger_price_source = str(tps).lower()
 
     # ===== Smart trail / ARM / bar-trail / лимиты =====
     cfg.enable_smart_trail = bool(enable_smart_trail)
     cfg.trailing_perc = float(trailing_perc)
     cfg.trailing_offset_perc = float(trailing_offset_perc)
-    cfg.trailing_offset = float(trailing_offset_perc)  # alias
+    cfg.trailing_offset = float(trailing_offset_perc)
 
     cfg.use_arm_after_rr = bool(use_arm_after_rr)
     cfg.arm_rr = float(arm_rr)
@@ -544,10 +576,9 @@ if submitted:
     cfg.taker_fee_rate = float(taker_fee)
 
     cfg.price_for_logic = str(price_src).lower()
-    cfg.intrabar_tf = "1"
     cfg.days_back = int(bt_days)
     cfg.use_intrabar_entries = bool(intrabar_entries)
-    cfg.start_time_ms = None  # никаких ограничений «isActive» в бэктесте
+    cfg.start_time_ms = None
 
     with st.spinner("Грузим историю и запускаем бэктест…"):
         db, state, strat = run_backtest(
