@@ -22,7 +22,7 @@ def main():
     # Загружаем текущую конфигурацию (внутри она подтягивает config.json, если есть)
     config = Config()
 
-    # ========================= Идентификатор инструмента / источники =========================
+    # ========================= Инструмент / источники =========================
     st.subheader("🧩 Инструмент и источники цен")
     i1, i2, i3 = st.columns(3)
     with i1:
@@ -44,7 +44,7 @@ def main():
 
     st.markdown("---")
 
-    # ========================= Основные настройки торговли =========================
+    # ========================= Основные =========================
     st.subheader("🎯 Основные настройки торговли")
 
     col1, col2, col3 = st.columns(3)
@@ -90,41 +90,32 @@ def main():
             value=bool(getattr(config, "use_take_profit", True))
         )
     with col3:
-        sfp_len = st.number_input(
-            "SFP Length",
-            min_value=1,
-            max_value=10,
-            value=int(getattr(config, 'sfp_len', 2)),
-            help="Длина для поиска Swing Failure Pattern (как в Pine)"
-        )
-        intrabar_tf = st.selectbox(
-            "Интрабар TF",
-            options=["1", "3", "5"],
-            index=["1","3","5"].index(str(getattr(config, "intrabar_tf", "1"))),
-            help="Таймфрейм для интрабарной логики/данных."
-        )
-
-        # ===== Включить интрабар-трейл/обновления (по умолчанию ВКЛ, если конфиг ещё не сохранён) =====
-        config_file = os.path.join(ROOT_DIR, "config.json")
-        default_intrabar = True if not os.path.exists(config_file) else bool(getattr(config, "use_intrabar", True))
-        use_intrabar = st.checkbox(
-            "Включить интрабар-трейл/обновления",
-            value=default_intrabar
-        )
+        # SFP Length и Intrabar TF убраны — управляются через Lux (Swings/LTF)
+        st.write("")
+        st.caption("Параметры SFP (Swings, LTF) задаются в блоке **Lux SFP** ниже.")
 
     st.markdown("---")
 
     # =========================== Lux SFP ===========================
     st.subheader("✨ Lux SFP (как в LuxAlgo)")
 
+    l0, = st.columns(1)
+    with l0:
+        lux_enabled = st.checkbox(
+            "Включить Lux SFP",
+            value=bool(getattr(config, "lux_mode", True)),
+            help="Главный фильтр входа. При включении старая валидация входа отключена."
+        )
+
     l1, l2, l3, l4 = st.columns(4)
     with l1:
-        lux_mode = st.selectbox(
+        lux_volume_validation = st.selectbox(
             "Validation",
-            options=["volume_outside_gt", "volume_outside_lt", "none"],
-            index={"volume_outside_gt":0,"volume_outside_lt":1,"none":2}\
-                .get(str(getattr(config, "lux_mode", "volume_outside_gt")), 0),
-            help="Правило валидации объёма: доля объёма фитиля вне свинга относительно порога."
+            options=["outside_gt", "outside_lt", "none"],
+            index={"outside_gt":0, "outside_lt":1, "none":2}.get(
+                str(getattr(config, "lux_volume_validation", "outside_gt")).lower(), 0
+            ),
+            help="Правило валидации объёма на младшем ТФ (доля объёма ‘вне свинга’ относительно порога)."
         )
         lux_swings = st.number_input(
             "Swings",
@@ -139,7 +130,7 @@ def main():
             min_value=0.0, max_value=100.0,
             value=float(getattr(config, "lux_volume_threshold_pct", 10.0)),
             step=0.5,
-            help="% от суммарного объёма бара на младшем ТФ, приходящийся на ‘фитиль за свингом’."
+            help="% от суммарного объёма LTF-бара, приходящаяся на ‘вне свинга’."
         )
         lux_auto = st.checkbox(
             "Auto (ресемплинг LTF)",
@@ -171,90 +162,12 @@ def main():
             min_value=10, max_value=2000,
             value=int(getattr(config, "lux_expire_bars", 500)),
             step=10,
-            help="Через сколько баров уровень SFP перестаёт быть активным (визуальная совместимость)."
+            help="Через сколько баров уровень SFP перестаёт быть активным."
         )
 
     st.markdown("---")
 
-    # =========================== Фильтры (из Pine) ===========================
-    st.subheader("🛡️ Фильтры SFP")
-
-    f1, f2, f3 = st.columns(3)
-    with f1:
-        use_sfp_quality = st.checkbox(
-            "Фильтр качества SFP (wick + close-back)",
-            value=bool(getattr(config, 'use_sfp_quality', True)),
-            help="Включить фильтры качества SFP"
-        )
-    with f2:
-        wick_min_ticks = st.number_input(
-            "Минимальная глубина фитиля (в тиках)",
-            min_value=0,
-            max_value=100,
-            value=int(getattr(config, 'wick_min_ticks', 7)),
-            help="Минимальная глубина фитиля для валидного SFP (в тик-сайзах инструмента)"
-        )
-    with f3:
-        close_back_pct = st.number_input(
-            "Close-back (0.0 … 1.0)",
-            min_value=0.0,
-            max_value=1.0,
-            value=float(getattr(config, 'close_back_pct', 1.0)),
-            step=0.05,
-            help="Требуемая доля возврата закрытия относительно глубины фитиля (как в Pine)"
-        )
-
-    st.markdown("---")
-
-    # ======================= Stop-Loss Zone (Pine-like) =======================
-    st.subheader("📌 Stop-Loss Zone (Pine-like)")
-    z1, z2, z3, z4, z5, z6 = st.columns(6)
-    with z1:
-        use_swing_sl = st.checkbox(
-            "SL от свинга (pivot)",
-            value=bool(getattr(config, "use_swing_sl", True)),
-            help="База SL — свинговый high/low (pivot)."
-        )
-    with z2:
-        use_prev_candle_sl = st.checkbox(
-            "SL от свечи [1]",
-            value=bool(getattr(config, "use_prev_candle_sl", False)),
-            help="База SL — high[1]/low[1] (предыдущая свеча)."
-        )
-    with z3:
-        use_sfp_candle_sl = st.checkbox(
-            "SL от SFP-свечи [0]",
-            value=bool(getattr(config, "use_sfp_candle_sl", False)),
-            help="База SL — экстремум текущей SFP-свечи."
-        )
-    with z4:
-        sl_buf_ticks = st.number_input(
-            "Буфер к SL (ticks)",
-            min_value=0,
-            max_value=2000,
-            value=int(getattr(config, "sl_buf_ticks", 40)),
-            step=1,
-            help="Отступ от базы в тик-сайзах, добавляемый к SL."
-        )
-    with z5:
-        use_atr_buffer = st.checkbox(
-            "ATR-буфер",
-            value=bool(getattr(config, "use_atr_buffer", False)),
-            help="Добавлять к SL дополнительную подушку ATR*mult."
-        )
-    with z6:
-        atr_mult = st.number_input(
-            "ATR Mult",
-            min_value=0.0,
-            max_value=10.0,
-            value=float(getattr(config, "atr_mult", 0.0)),
-            step=0.1,
-            help="Множитель ATR для дополнительного буфера к SL (если включено)."
-        )
-
-    st.markdown("---")
-
-    # =============================== Smart Trailing ================================
+    # =============================== Smart Trailing ===============================
     st.subheader("🎯 Smart Trailing")
 
     t1, t2 = st.columns(2)
@@ -262,26 +175,24 @@ def main():
         enable_smart_trail = st.checkbox(
             "Включить Smart Trailing",
             value=bool(getattr(config, 'enable_smart_trail', True)),
-            help="Умный трейлинг SL (аналог Pine-логики)"
+            help="Умный трейлинг SL (аналог Pine-логики)."
         )
         use_arm_after_rr = st.checkbox(
             "Арминг трейла после достижения RR",
             value=bool(getattr(config, 'use_arm_after_rr', True)),
-            help="Активировать трейлинг только после достижения заданного RR"
+            help="Активировать трейлинг только после достижения заданного RR."
         )
         arm_rr = st.number_input(
             "RR для арминга",
             min_value=0.1,
             max_value=5.0,
             value=float(getattr(config, 'arm_rr', 0.5)),
-            step=0.1,
-            help="Минимальное значение R, после которого включается трейл"
+            step=0.1
         )
         arm_rr_basis = st.selectbox(
             "База расчёта RR для арминга",
             options=["extremum", "last"],
-            index=0 if str(getattr(config, "arm_rr_basis", "extremum")).lower() == "extremum" else 1,
-            help="extremum — считаем от экстремума бара; last — от текущей цены"
+            index=0 if str(getattr(config, "arm_rr_basis", "extremum")).lower() == "extremum" else 1
         )
     with t2:
         trailing_perc = st.number_input(
@@ -289,16 +200,14 @@ def main():
             min_value=0.0,
             max_value=5.0,
             value=float(getattr(config, 'trailing_perc', 0.5)),
-            step=0.1,
-            help="Процент от цены входа (аналог твоего текущего механизма)."
+            step=0.1
         )
         trailing_offset_perc = st.number_input(
             "Offset трейлинга (%)",
             min_value=0.0,
             max_value=5.0,
             value=float(getattr(config, 'trailing_offset_perc', 0.4)),
-            step=0.1,
-            help="Дополнительный отступ."
+            step=0.1
         )
 
     st.markdown("---")
@@ -330,28 +239,13 @@ def main():
 
     st.markdown("---")
 
-    # =============================== Контроль перезаходов ===============================
-    st.subheader("🧊 Cooldown после закрытия позиции")
-    cd1 = st.number_input(
-        "Cooldown (минуты)",
-        min_value=0,
-        max_value=240,
-        value=int(getattr(config, "cooldown_minutes", 0)),
-        step=1,
-        help="Запрещать новые входы в течение N минут после закрытия позиции (чтобы не переворачиваться сразу)."
-    )
-
-    st.markdown("---")
-
     # ============================== Сохранение ==============================
     c1, c2, c3 = st.columns([1, 2, 1])
     with c2:
         if st.button("💾 Сохранить настройки", type="primary", use_container_width=True):
             try:
-                # Обновляем объект конфигурации
-                config.symbol = str(symbol).upper()
-
                 # Источники
+                config.symbol = str(symbol).upper()
                 config.price_for_logic = str(price_for_logic).lower()
                 config.trigger_price_source = str(trigger_price_source).lower()
 
@@ -363,29 +257,16 @@ def main():
                 config.taker_fee_rate = float(taker_fee_rate)
                 config.use_take_profit = bool(use_take_profit)
 
-                # SFP (базовые фильтры)
-                config.sfp_len = int(sfp_len)
-                config.use_sfp_quality = bool(use_sfp_quality)
-                config.wick_min_ticks = int(wick_min_ticks)
-                config.close_back_pct = float(close_back_pct)
-
                 # Lux SFP
-                config.lux_mode = str(lux_mode)
+                config.lux_mode = bool(lux_enabled)
                 config.lux_swings = int(lux_swings)
+                config.lux_volume_validation = str(lux_volume_validation)
                 config.lux_volume_threshold_pct = float(lux_volume_threshold_pct)
                 config.lux_auto = bool(lux_auto)
                 config.lux_mlt = int(lux_mlt)
                 config.lux_ltf = str(lux_ltf)
                 config.lux_premium = bool(lux_premium)
                 config.lux_expire_bars = int(lux_expire_bars)
-
-                # SL zone
-                config.use_swing_sl = bool(use_swing_sl)
-                config.use_prev_candle_sl = bool(use_prev_candle_sl)
-                config.use_sfp_candle_sl = bool(use_sfp_candle_sl)
-                config.sl_buf_ticks = int(sl_buf_ticks)
-                config.use_atr_buffer = bool(use_atr_buffer)
-                config.atr_mult = float(atr_mult)
 
                 # Smart trailing
                 config.enable_smart_trail = bool(enable_smart_trail)
@@ -401,28 +282,24 @@ def main():
                 config.trail_lookback = int(trail_lookback)
                 config.trail_buf_ticks = int(trail_buf_ticks)
 
-                # Интрабар/TF
-                config.intrabar_tf = str(intrabar_tf)
-                config.use_intrabar = bool(use_intrabar)
+                # Удалённые блоки НЕ сохраняем и не трогаем:
+                # - старая SFP-валидация
+                # - Stop-Loss Zone
+                # - Cooldown
+                # - SFP Length / Intrabar TF
 
-                # Cooldown
-                config.cooldown_minutes = int(cd1)
-
-                # Нормализация и валидация перед сохранением
                 ok = config.validate()
                 if not ok:
                     st.error("❌ Валидация конфигурации не пройдена. Проверь значения.")
                 else:
                     config.save_config()
                     st.success("✅ Настройки успешно сохранены и будут применены в торговле!")
-
             except Exception as e:
                 st.error(f"❌ Ошибка сохранения: {e}")
 
     # ============================== Просмотр текущих ==============================
     st.markdown("---")
     st.subheader("📋 Текущая конфигурация")
-
     with st.expander("Показать все параметры (config.json)"):
         try:
             st.json(config.to_dict())
