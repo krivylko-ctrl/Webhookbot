@@ -482,8 +482,8 @@ class KWINStrategy:
 
                 stop_size = abs(float(entry_price) - float(stop_loss))
                 if stop_size <= 0:
-                return False
-
+                    return False
+  
             rr = float(getattr(self.config, "risk_reward", 1.3))
             if entry_price >= stop_loss:  # long
                 tp_calc = float(entry_price) + stop_size * rr
