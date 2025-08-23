@@ -1,4 +1,3 @@
-
 from __future__ import annotations
 
 from typing import Dict, Any
@@ -47,7 +46,6 @@ class Config:
         self.risk_pct     = float(env("RISK_PCT", "3.0"))
 
         # === Управление TP ===
-        # True — в бэктесте учитываем TP-выходы; False — игнорируем TP
         self.use_take_profit = env("USE_TAKE_PROFIT", "false").lower() not in ("0", "false", "no")
 
         # === SMART TRAILING ===
@@ -60,22 +58,35 @@ class Config:
         # ARM (вооружение трейла после достижения RR)
         self.use_arm_after_rr = env("USE_ARM_AFTER_RR", "true").lower() not in ("0", "false", "no")
         self.arm_rr           = max(0.1, float(env("ARM_RR", "0.5")))          # в R, минимально 0.1
-        self.arm_rr_basis     = env("ARM_RR_BASIS", "last").lower()        # "extremum"|"last"
+        self.arm_rr_basis     = env("ARM_RR_BASIS", "last").lower()            # "extremum"|"last"
 
         # Источники цены (по умолчанию триггеры по mark)
         self.price_for_logic      = env("PRICE_FOR_LOGIC", "last").lower()     # "last"|"mark"
         self.trigger_price_source = env("TRIGGER_PRICE_SOURCE", "mark").lower()# "last"|"mark"
 
         # === ЗОНАЛЬНЫЙ СТОП ===
-# переключатели базы SL: свинговый pivot и/или экстремум SFP-свечи [0]
-        self.use_swing_sl       = env("USE_SWING_SL", "false").lower() not in ("0","false","no")
-        self.use_sfp_candle_sl = env("USE_SFP_CANDLE_SL", "false").lower() not in ("0", "false", "no")
-        self.use_prev_candle_sl = env("USE_PREV_CANDLE_SL", "true").lower() not in ("0","false","no")
-        self.sl_buf_ticks       = int(env("SL_BUF_TICKS", "0"))  # если нужен отступ — увеличь
-        self.use_atr_buffer     = env("USE_ATR_BUFFER", "false").lower() not in ("0","false","no")
-        self.atr_mult           = float(env("ATR_MULT", "0.0"))
+        # переключатели базы SL: свинговый pivot и/или экстремум SFP-свечи [0]
+        self.use_swing_sl        = env("USE_SWING_SL", "false").lower() not in ("0","false","no")
+        self.use_sfp_candle_sl   = env("USE_SFP_CANDLE_SL", "false").lower() not in ("0", "false", "no")
+        self.use_prev_candle_sl  = env("USE_PREV_CANDLE_SL", "true").lower() not in ("0","false","no")
+        self.sl_buf_ticks        = int(env("SL_BUF_TICKS", "0"))  # если нужен отступ — увеличь
+        self.use_atr_buffer      = env("USE_ATR_BUFFER", "false").lower() not in ("0","false","no")
+        self.atr_mult            = float(env("ATR_MULT", "0.0"))
 
-# === ИНТРАБАР ===
+        # === ЛОГИКА LUX SFP (по умолчанию включена) ===
+        self.lux_mode                   = env("LUX_MODE", "true").lower() not in ("0","false","no")
+        self.lux_swings                 = int(env("LUX_SWINGS", "2"))               # Swings
+        # "outside_gt" | "outside_lt" | "none"  (соответствует валидатору Lux)
+        self.lux_volume_validation      = env("LUX_VOLUME_VALIDATION", "outside_gt").lower()
+        self.lux_volume_threshold_pct   = float(env("LUX_VOLUME_THRESHOLD_PCT", "10.0"))
+        # Авто-выбор LTF в Lux. Мы оставляем выключенным по умолчанию и используем LTF=1m
+        self.lux_auto                   = env("LUX_AUTO", "false").lower() not in ("0","false","no")
+        self.lux_mlt                    = int(env("LUX_MLT", "10"))                 # множитель для авто (на будущее)
+        self.lux_ltf                    = env("LUX_LTF", "1")                       # "1" минута
+        self.lux_premium                = env("LUX_PREMIUM", "false").lower() not in ("0","false","no")
+        self.lux_expire_bars            = int(env("LUX_EXPIRE_BARS", "500"))
+
+        # === ИНТРАБАР ===
         self.use_intrabar         = env("USE_INTRABAR", "true").lower() not in ("0","false","no")   # 1m только для трейлинга
         self.use_intrabar_entries = env("USE_INTRABAR_ENTRIES", "false").lower() not in ("0","false","no")  # ⛔ входы по M1
         self.intrabar_tf          = env("INTRABAR_TF", "1")
@@ -87,7 +98,7 @@ class Config:
         self.limit_qty_enabled = env("LIMIT_QTY_ENABLED", "true").lower() not in ("0","false","no")
         self.max_qty_manual    = float(env("MAX_QTY_MANUAL", "50.0"))
 
-        # === ФИЛЬТРЫ SFP ===
+        # === ФИЛЬТРЫ SFP (для старой логики) ===
         self.use_sfp_quality = env("USE_SFP_QUALITY", "true").lower() not in ("0","false","no")
         self.wick_min_ticks  = int(env("WICK_MIN_TICKS", "7"))
         self.close_back_pct  = float(env("CLOSE_BACK_PCT", "1.0"))  # [0..1]
@@ -155,8 +166,6 @@ class Config:
         # здравые шаги для ETH/BTC
         sym = (self.symbol or "").upper()
         if sym in ("ETHUSDT", "BTCUSDT"):
-            # эти шаги потом будут уточнены через API (instrument info),
-            # но для локального UI дадим разумные значения.
             self.qty_step = max(self.qty_step, 0.001)
             self.min_order_qty = max(self.min_order_qty, 0.001)
             self.tick_size = max(self.tick_size, 0.01)
@@ -178,7 +187,7 @@ class Config:
         try:
             self.sl_buf_ticks = max(0, int(self.sl_buf_ticks))
         except Exception:
-            self.sl_buf_ticks = 40
+            self.sl_buf_ticks = 0
 
         # числа
         try:
@@ -199,6 +208,31 @@ class Config:
             self.intrabar_tf = str(self.intrabar_tf)
         except Exception:
             self.intrabar_tf = "1"
+
+        # ---- Lux поля ----
+        self.lux_volume_validation = (self.lux_volume_validation or "outside_gt").lower()
+        if self.lux_volume_validation not in ("outside_gt", "outside_lt", "none"):
+            self.lux_volume_validation = "outside_gt"
+
+        try:
+            self.lux_volume_threshold_pct = max(0.0, min(100.0, float(self.lux_volume_threshold_pct)))
+        except Exception:
+            self.lux_volume_threshold_pct = 10.0
+
+        try:
+            self.lux_swings = max(1, int(self.lux_swings))
+        except Exception:
+            self.lux_swings = 2
+
+        try:
+            self.lux_expire_bars = max(1, int(self.lux_expire_bars))
+        except Exception:
+            self.lux_expire_bars = 500
+
+        try:
+            self.lux_ltf = str(self.lux_ltf or "1")
+        except Exception:
+            self.lux_ltf = "1"
 
     # ---------- load/save ----------
 
@@ -260,20 +294,32 @@ class Config:
 
             # зональный SL
             "use_prev_candle_sl": self.use_prev_candle_sl,
-            "use_intrabar_entries": self.use_intrabar_entries,
             "use_swing_sl": self.use_swing_sl,
             "use_sfp_candle_sl": self.use_sfp_candle_sl,
-            "use_sfp_candle_sl": self.use_sfp_candle_sl,
             "sl_buf_ticks": self.sl_buf_ticks,
+            "use_atr_buffer": self.use_atr_buffer,
+            "atr_mult": self.atr_mult,
+
+            # Lux SFP
+            "lux_mode": self.lux_mode,
+            "lux_swings": self.lux_swings,
+            "lux_volume_validation": self.lux_volume_validation,   # "outside_gt" | "outside_lt" | "none"
+            "lux_volume_threshold_pct": self.lux_volume_threshold_pct,
+            "lux_auto": self.lux_auto,
+            "lux_mlt": self.lux_mlt,
+            "lux_ltf": self.lux_ltf,
+            "lux_premium": self.lux_premium,
+            "lux_expire_bars": self.lux_expire_bars,
 
             # интрабар
             "use_intrabar": self.use_intrabar,
+            "use_intrabar_entries": self.use_intrabar_entries,
             "intrabar_tf": str(self.intrabar_tf),
             "intrabar_pull_limit": self.intrabar_pull_limit,
             "smooth_intrabar": self.smooth_intrabar,
             "intrabar_steps": self.intrabar_steps,
 
-            # фильтры
+            # фильтры (для старой логики SFP)
             "use_sfp_quality": self.use_sfp_quality,
             "wick_min_ticks": self.wick_min_ticks,
             "close_back_pct": self.close_back_pct,
@@ -319,6 +365,17 @@ class Config:
                 raise ValueError("trigger_price_source invalid")
             if self.sl_buf_ticks < 0:
                 raise ValueError("sl_buf_ticks must be >= 0")
+
+            # Lux checks
+            if self.lux_volume_validation not in ("outside_gt", "outside_lt", "none"):
+                raise ValueError("lux_volume_validation invalid")
+            if not (0.0 <= self.lux_volume_threshold_pct <= 100.0):
+                raise ValueError("lux_volume_threshold_pct must be in [0..100]")
+            if self.lux_swings < 1:
+                raise ValueError("lux_swings must be >= 1")
+            if self.lux_expire_bars < 1:
+                raise ValueError("lux_expire_bars must be >= 1")
+
             return True
         except Exception as e:
             print(f"Config validation error: {e}")
