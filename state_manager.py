@@ -1,7 +1,7 @@
 # state_manager.py
 from __future__ import annotations
 from typing import Dict, Optional, Any
-from datetime import datetime
+from datetime import datetime, timezone
 from threading import RLock
 
 from database import Database
@@ -15,6 +15,7 @@ class StateManager:
       • текущую позицию (direction, quantity, entry_price, stop_loss, take_profit,
         armed, trail_anchor, entry_time_ts, status)
       • статус бота
+      • last_close_time_ms — метка времени (UTC, мс) последнего закрытия позиции (для кулдауна)
     Состояние периодически/при изменениях сохраняется в БД через Database.save_bot_state().
     """
 
@@ -25,6 +26,7 @@ class StateManager:
         self._equity: float = 100.0
         self._bot_status: str = "stopped"
         self._current_position: Optional[Dict[str, Any]] = None
+        self._last_close_time_ms: Optional[int] = None  # <-- для кулдауна входов
 
         self._load_state()
 
@@ -38,6 +40,12 @@ class StateManager:
                 self._current_position = state.get("position") or None
                 self._equity = float(state.get("equity", 100.0))
                 self._bot_status = str(state.get("status", "stopped"))
+                lct = state.get("last_close_time_ms") or state.get("last_close_time")
+                if lct is not None:
+                    try:
+                        self._last_close_time_ms = int(lct)
+                    except Exception:
+                        self._last_close_time_ms = None
         except Exception as e:
             print(f"[StateManager] Error loading state: {e}")
 
@@ -49,6 +57,7 @@ class StateManager:
                     "position": self._current_position,
                     "equity": float(self._equity),
                     "status": self._bot_status,
+                    "last_close_time_ms": int(self._last_close_time_ms) if self._last_close_time_ms else None,
                     "updated_at": datetime.utcnow().replace(microsecond=0).isoformat(),
                 }
             self.db.save_bot_state(payload)
@@ -99,7 +108,10 @@ class StateManager:
 
                 # Унификация объёма: size -> quantity
                 if "size" in pos and "quantity" not in pos:
-                    pos["quantity"] = pos.pop("size")
+                    try:
+                        pos["quantity"] = float(pos.pop("size"))
+                    except Exception:
+                        pos["quantity"] = pos.pop("size")
 
                 self._current_position = pos
         self._save_state()
@@ -134,7 +146,8 @@ class StateManager:
         """
         Закрыть текущую позицию и синхронизировать это с БД.
         PnL / RR считаются в Database.update_trade_exit().
-        После закрытия — обновляем equity на величину чистого PnL последней сделки (реинвест).
+        После закрытия — (1) обновляем equity на величину чистого PnL последней сделки (реинвест),
+        (2) проставляем last_close_time_ms (UTC now в мс) — нужно для кулдауна входов.
         """
         pos = self.get_current_position()
         if not pos:
@@ -154,7 +167,7 @@ class StateManager:
             print(f"[StateManager] Error closing trade in DB: {e}")
             return
 
-        # Применяем чистый PnL последней сделки к equity (сложный процент)
+        # Применяем чистый PnL последней сделки к equity
         try:
             trades = self.db.get_recent_trades(limit=1)
             if trades:
@@ -163,12 +176,31 @@ class StateManager:
                 if pnl is not None:
                     with self._lock:
                         self._equity = float(self._equity) + float(pnl)
-                    self._save_state()
         except Exception as e:
             print(f"[StateManager] Error applying PnL to equity: {e}")
 
+        # Обновляем last_close_time_ms (UTC now → ms)
+        try:
+            now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+        except Exception:
+            now_ms = int(datetime.utcnow().timestamp() * 1000)
+        self.set_last_close_time(now_ms)
+
         # Локально чистим позицию
         self.clear_position()
+
+    # ----------------- Cooldown helpers -----------------
+
+    def get_last_close_time(self) -> Optional[int]:
+        """Возвращает unix ms последнего закрытия позиции (или None)."""
+        with self._lock:
+            return None if self._last_close_time_ms is None else int(self._last_close_time_ms)
+
+    def set_last_close_time(self, ts_ms: Optional[int]) -> None:
+        """Явно проставить unix ms последнего закрытия позиции и сохранить состояние."""
+        with self._lock:
+            self._last_close_time_ms = None if ts_ms is None else int(ts_ms)
+        self._save_state()
 
     # ----------------- Helpers -----------------
 
@@ -207,5 +239,6 @@ class StateManager:
                 "bot_status": self._bot_status,
                 "position_open": self._current_position is not None,
                 "position": None if self._current_position is None else dict(self._current_position),
+                "last_close_time_ms": int(self._last_close_time_ms) if self._last_close_time_ms else None,
                 "timestamp": datetime.utcnow().replace(microsecond=0).isoformat(),
             }
