@@ -42,8 +42,12 @@ class BybitAPI:
             "Accept": "application/json",
         })
 
+        # WS
         self.ws = None
+        self._ws_lock = threading.RLock()
         self.ws_callbacks: Dict[str, Callable] = {}
+        self._ws_subscriptions: set[str] = set()
+        self._ws_should_run = False
 
     # ==================== внутренняя утилита подписи ====================
 
@@ -162,7 +166,26 @@ class BybitAPI:
                 return int(int(result["timeNano"]) / 1_000_000_000)
         return None
 
-    def get_klines(self, symbol: str, interval: str, limit: int = 200) -> Optional[List[Dict]]:
+    def _dedup_and_sort_kl(self, rows: List[Dict]) -> List[Dict]:
+        """Дедуп по timestamp и сортировка по возрастанию — детерминизм для бэктеста."""
+        uniq: Dict[int, Dict] = {}
+        for r in rows or []:
+            try:
+                ts = int(r.get("timestamp") or 0)
+                if ts:
+                    uniq[ts] = {
+                        "timestamp": ts,
+                        "open":  self._to_float(r.get("open")),
+                        "high":  self._to_float(r.get("high")),
+                        "low":   self._to_float(r.get("low")),
+                        "close": self._to_float(r.get("close")),
+                        "volume": self._to_float(r.get("volume")),
+                    }
+            except Exception:
+                continue
+        return sorted(uniq.values(), key=lambda x: x["timestamp"])
+
+    def get_klines(self, symbol: str, interval: str, limit: int = 200) -> List[Dict]:
         """
         Последние N свечей по категории self.market_type.
         interval: строка минут ("1","3","5","15","60",...).
@@ -177,9 +200,6 @@ class BybitAPI:
         resp = self._send_request("GET", "/v5/market/kline", params, requires_auth=False)
         if resp.get("retCode") == 0:
             lst = ((resp.get("result") or {}).get("list") or [])
-            if not lst:
-                print(f"[BybitAPI] get_klines returned empty list for {params}")
-                return []
             out: List[Dict] = []
             for it in lst:
                 try:
@@ -193,10 +213,9 @@ class BybitAPI:
                     })
                 except Exception:
                     continue
-            out.sort(key=lambda x: x["timestamp"])
-            return out
+            return self._dedup_and_sort_kl(out)
         print(f"[BybitAPI] get_klines error: {resp.get('retCode')} {resp.get('retMsg')}")
-        return None
+        return []
 
     def get_klines_window(
         self,
@@ -206,25 +225,36 @@ class BybitAPI:
         start_ms: Optional[int] = None,
         end_ms: Optional[int] = None,
         limit: int = 1000
-    ) -> Optional[List[Dict]]:
+    ) -> List[Dict]:
         """
         Чтение свечей с окнами времени (start/end в мс). Возвращает по возрастанию timestamp.
+        Реализована пагинация по cursor до полного покрытия окна.
         """
         params = {
             "category": self.market_type,
             "symbol": (symbol or "").upper(),
             "interval": str(interval),
-            "limit": int(limit),
+            "limit": int(min(max(1, limit), 1000)),  # по докам макс 1000
         }
         if start_ms is not None:
             params["start"] = int(start_ms)
         if end_ms is not None:
             params["end"] = int(end_ms)
 
-        resp = self._send_request("GET", "/v5/market/kline", params, requires_auth=False)
-        if resp.get("retCode") == 0:
-            lst = ((resp.get("result") or {}).get("list") or [])
-            out: List[Dict] = []
+        out: List[Dict] = []
+        safety_pages = 0
+        cursor: Optional[str] = None
+
+        while True:
+            q = dict(params)
+            if cursor:
+                q["cursor"] = cursor
+            resp = self._send_request("GET", "/v5/market/kline", q, requires_auth=False)
+            if resp.get("retCode") != 0:
+                print(f"[BybitAPI] get_klines_window error: {resp.get('retCode')} {resp.get('retMsg')}")
+                break
+            result = resp.get("result") or {}
+            lst = result.get("list") or []
             for it in lst:
                 try:
                     out.append({
@@ -237,10 +267,14 @@ class BybitAPI:
                     })
                 except Exception:
                     continue
-            out.sort(key=lambda x: x["timestamp"])
-            return out
-        print(f"[BybitAPI] get_klines_window error: {resp.get('retCode')} {resp.get('retMsg')}")
-        return None
+
+            cursor = result.get("nextPageCursor")
+            safety_pages += 1
+            # Условия выхода: нет курсора или превысили разумный лимит страниц
+            if not cursor or safety_pages > 200:
+                break
+
+        return self._dedup_and_sort_kl(out)
 
     # Алиас
     def get_klines_between(self, symbol: str, interval: str, start_ms: int, end_ms: int, limit: int = 1000) -> List[Dict]:
@@ -462,8 +496,21 @@ class BybitAPI:
     # ==================== WebSocket ====================
 
     def start_websocket(self, on_message: Optional[Callable] = None):
-        """Запуск WS с авто-переподключением (публичный стрим категории market_type)."""
+        """Запуск WS с авто-переподключением (публичный стрим категории market_type).
+           На реконнекте выполняем ре-сабскрайб и держим пинг."""
         from websocket import WebSocketApp
+
+        def _resubscribe(ws):
+            # безопасно переотправляем все темы
+            with self._ws_lock:
+                topics = list(self._ws_subscriptions)
+            if not topics:
+                return
+            try:
+                ws.send(json.dumps({"op": "subscribe", "args": topics}))
+                print(f"[WS] Resubscribed: {topics}")
+            except Exception as e:
+                print(f"[WS] resubscribe error: {e}")
 
         def on_ws_message(ws, message):
             try:
@@ -481,11 +528,24 @@ class BybitAPI:
 
         def on_ws_close(ws, *_):
             print("WS closed — reconnecting...")
+            self._ws_should_run = False
             time.sleep(2)
+            # автоперезапуск
             self.start_websocket(on_message)
 
         def on_ws_open(ws):
             print("WS connection opened")
+            _resubscribe(ws)
+            # пинг-поток
+            def _pinger():
+                while self._ws_should_run:
+                    try:
+                        ws.send(json.dumps({"op": "ping"}))
+                    except Exception:
+                        break
+                    time.sleep(15)
+            self._ws_should_run = True
+            threading.Thread(target=_pinger, daemon=True).start()
 
         self.ws = WebSocketApp(
             self.ws_url,
@@ -513,6 +573,16 @@ class BybitAPI:
         except Exception:
             return None
 
+    def _subscribe_topics(self, topics: List[str]):
+        with self._ws_lock:
+            for t in topics:
+                self._ws_subscriptions.add(t)
+        try:
+            if self.ws:
+                self.ws.send(json.dumps({"op": "subscribe", "args": topics}))
+        except Exception as e:
+            print(f"WS send error: {e}")
+
     def subscribe_kline(self, symbol: str, interval: str, callback: Callable[[Dict], None]):
         """
         Подписка на kline. В callback отдаём УЖЕ ГОТОВЫЙ candle-словарь
@@ -534,9 +604,4 @@ class BybitAPI:
                 print(f"kline callback error: {e}")
 
         self.ws_callbacks[topic] = _cb
-        msg = {"op": "subscribe", "args": [topic]}
-        try:
-            if self.ws:
-                self.ws.send(json.dumps(msg))
-        except Exception as e:
-            print(f"WS send error: {e}")
+        self._subscribe_topics([topic])
