@@ -143,7 +143,8 @@ def _fetch_aligned_window(
     return out
 
 
-@st.cache_data(show_spinner=False)
+# cache: BacktestBroker не хэшируемый — даём кастомный hash_func
+@st.cache_data(show_spinner=False, hash_funcs={BacktestBroker: lambda _b: "bt-broker"})
 def load_m15_window(_api: BacktestBroker, symbol: str, days: int, sfp_len: int = 2, **kwargs) -> BtData:
     # обратная совместимость с опечатками
     for alt in ("sfn_len", "sf_len", "sfп_len", "sfpLen"):
@@ -170,7 +171,7 @@ def load_m15_window(_api: BacktestBroker, symbol: str, days: int, sfp_len: int =
     return BtData(m15=df)
 
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False, hash_funcs={BacktestBroker: lambda _b: "bt-broker"})
 def load_m1_day(_api: BacktestBroker, symbol: str, intrabar_tf: str, day_start_ms: int) -> pd.DataFrame:
     day_start_ms = _align_floor(day_start_ms, 24 * 60 * 60 * 1000)
     day_end_ms = day_start_ms + 24 * 60 * 60 * 1000 - 1
@@ -220,15 +221,16 @@ def _compute_net_pnl(pos: Dict, exit_price: float, fee_rate: float) -> float:
 
 
 def _book_close_and_update_equity(state: StateManager, db: Database, cfg: Config, pos: Dict, exit_px: float, reason: str):
+    """
+    ВАЖНО: StateManager.close_position() САМ добавляет PnL к equity (по данным из БД).
+    Здесь мы только делаем снапшот equity в историю, без повторного прибавления.
+    """
     state.close_position(exit_price=float(exit_px), exit_reason=reason)
-    net = _compute_net_pnl(pos, exit_px, float(getattr(cfg, "taker_fee_rate", 0.00055)))
-    new_eq = float(state.get_equity()) + net
-    state.set_equity(new_eq)
-    db.save_equity_snapshot(new_eq)
+    db.save_equity_snapshot(float(state.get_equity()))
 
 
 def simulate_exits_on_m1(state: StateManager, db: Database, cfg: Config, m1: Dict):
-    """Биржевой приоритет: сначала SL, потом TP."""
+    """Биржевой приоритет: сначала SL, потом TP (аутентично бирже/TV)."""
     pos = state.get_current_position()
     if not pos or pos.get("status") != "open":
         return
@@ -558,7 +560,7 @@ if submitted:
         if not eq:
             st.info("Нет истории equity."); return
         df = pd.DataFrame(eq)
-        df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce")
+        df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce", utc=True).dt.tz_convert(None)
         fig = go.Figure()
         fig.add_trace(go.Scatter(x=df["timestamp"], y=df["equity"], mode="lines", name="Equity"))
         fig.update_layout(height=340, margin=dict(l=10, r=10, t=30, b=10))
