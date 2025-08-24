@@ -1,4 +1,4 @@
-streamlit==1.27.2
+streamlit==1.32.0
 flask==2.3.3
 gunicorn==21.2.0
 requests==2.31.0
@@ -6,8 +6,8 @@ websocket-client==1.6.1
 websockets==11.0.3
 python-dateutil==2.8.2
 pandas==2.0.3
-numpy==1.24.4
-SQLAlchemy==2.0.19
+numpy==1.26.4
+SQLAlchemy==2.0.20
 python-dotenv==1.0.0
 plotly==5.17.0
 matplotlib==3.7.2
