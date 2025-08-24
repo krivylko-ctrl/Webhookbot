@@ -1,8 +1,9 @@
 from __future__ import annotations
 
-from typing import Dict, Any
+from typing import Dict, Any, Optional
 import json
 import os
+from datetime import datetime, timezone
 
 # -------------------- ENV helpers --------------------
 
@@ -32,7 +33,10 @@ def must_have():
 # =====================================================
 
 class Config:
-    """Конфигурация стратегии KWIN (эквивалент TV inputs, Pine v5)"""
+    """Конфигурация стратегии KWIN (эквивалент TV inputs, Pine v5).
+       Содержит настройки для dual-SFP: Lux SFP + Classic 15m SFP (OR),
+       15m gate, fee-filter(1R), once-per-swing, barPriority, dir-lock.
+    """
 
     def __init__(self):
         # === ОСНОВНЫЕ ПАРАМЕТРЫ СТРАТЕГИИ ===
@@ -42,7 +46,7 @@ class Config:
 
         # Риск/TP
         self.risk_reward  = float(env("RISK_REWARD", "1.3"))
-        self.sfp_len      = 2
+        self.sfp_len      = 2                           # длина свинга для Classic 15m SFP
         self.risk_pct     = float(env("RISK_PCT", "3.0"))
 
         # === Управление TP ===
@@ -52,37 +56,35 @@ class Config:
         self.enable_smart_trail   = env("ENABLE_SMART_TRAIL", "true").lower() not in ("0", "false", "no")
         self.smart_trail_mode     = env("SMART_TRAIL_MODE", "pine").lower()  # "pine"|"legacy" (на будущее)
         self.trailing_perc        = float(env("TRAILING_PERC", "0.5"))         # %
-        self.trailing_offset_perc = float(env("TRAILING_OFFSET_PERC", "0.3"))  # %
+        self.trailing_offset_perc = float(env("TRAILING_OFFSET_PERC", "0.4"))  # % (синхроним с alias ниже)
         self.trailing_offset      = self.trailing_offset_perc                  # alias для совместимости
 
         # ARM (вооружение трейла после достижения RR)
         self.use_arm_after_rr = env("USE_ARM_AFTER_RR", "true").lower() not in ("0", "false", "no")
         self.arm_rr           = max(0.1, float(env("ARM_RR", "0.5")))          # в R, минимально 0.1
-        self.arm_rr_basis     = env("ARM_RR_BASIS", "last").lower()            # "extremum"|"last"
+        self.arm_rr_basis     = env("ARM_RR_BASIS", "extremum").lower()        # "extremum"|"last"
 
         # Источники цены (по умолчанию триггеры по mark)
         self.price_for_logic      = env("PRICE_FOR_LOGIC", "last").lower()     # "last"|"mark"
         self.trigger_price_source = env("TRIGGER_PRICE_SOURCE", "mark").lower()# "last"|"mark"
 
         # === ЗОНАЛЬНЫЙ СТОП ===
-        # переключатели базы SL: свинговый pivot и/или экстремум SFP-свечи [0]
         self.use_swing_sl        = env("USE_SWING_SL", "false").lower() not in ("0","false","no")
         self.use_sfp_candle_sl   = env("USE_SFP_CANDLE_SL", "false").lower() not in ("0", "false", "no")
         self.use_prev_candle_sl  = env("USE_PREV_CANDLE_SL", "true").lower() not in ("0","false","no")
-        self.sl_buf_ticks        = int(env("SL_BUF_TICKS", "0"))  # если нужен отступ — увеличь
+        self.sl_buf_ticks        = int(env("SL_BUF_TICKS", "0"))
         self.use_atr_buffer      = env("USE_ATR_BUFFER", "false").lower() not in ("0","false","no")
         self.atr_mult            = float(env("ATR_MULT", "0.0"))
 
-        # === ЛОГИКА LUX SFP (по умолчанию включена) ===
+        # === LUX SFP ===
         self.lux_mode                   = env("LUX_MODE", "true").lower() not in ("0","false","no")
-        self.lux_swings                 = int(env("LUX_SWINGS", "2"))               # Swings
-        # "outside_gt" | "outside_lt" | "none"  (соответствует валидатору Lux)
-        self.lux_volume_validation      = env("LUX_VOLUME_VALIDATION", "outside_gt").lower()
+        self.lux_swings                 = int(env("LUX_SWINGS", "2"))
+        # "outside_gt" | "outside_lt" | "none"
+        self.lux_volume_validation      = env("LUX_VOLUME_VALIDATION", "none").lower()
         self.lux_volume_threshold_pct   = float(env("LUX_VOLUME_THRESHOLD_PCT", "10.0"))
-        # Авто-выбор LTF в Lux. Мы оставляем выключенным по умолчанию и используем LTF=1m
         self.lux_auto                   = env("LUX_AUTO", "false").lower() not in ("0","false","no")
-        self.lux_mlt                    = int(env("LUX_MLT", "10"))                 # множитель для авто (на будущее)
-        self.lux_ltf                    = env("LUX_LTF", "1")                       # "1" минута
+        self.lux_mlt                    = int(env("LUX_MLT", "10"))
+        self.lux_ltf                    = env("LUX_LTF", "1")
         self.lux_premium                = env("LUX_PREMIUM", "false").lower() not in ("0","false","no")
         self.lux_expire_bars            = int(env("LUX_EXPIRE_BARS", "500"))
 
@@ -98,25 +100,39 @@ class Config:
         self.limit_qty_enabled = env("LIMIT_QTY_ENABLED", "true").lower() not in ("0","false","no")
         self.max_qty_manual    = float(env("MAX_QTY_MANUAL", "50.0"))
 
-        # === ФИЛЬТРЫ SFP (для старой логики) ===
+        # === ФИЛЬТРЫ SFP (на будущее; Lux-версии могут их игнорировать) ===
         self.use_sfp_quality = env("USE_SFP_QUALITY", "true").lower() not in ("0","false","no")
         self.wick_min_ticks  = int(env("WICK_MIN_TICKS", "7"))
         self.close_back_pct  = float(env("CLOSE_BACK_PCT", "1.0"))  # [0..1]
 
-        # === БЭКТЕСТ/ЭФФЕКТЫ ИСПОЛНЕНИЯ ===
+        # === БЭКТЕСТ/ОКНО ===
         self.period_choice = env("PERIOD_CHOICE", "30")  # "30"|"60"|"180"
         self.days_back     = int(env("DAYS_BACK", "30"))
+        # фиксированный Cycle Start Time (UTC) — совместим с Pine:
+        # приоритет: START_TIME_MS (unix ms) > START_TIME_ISO (YYYY-MM-DD HH:MM[:SS][Z])
+        self.start_time_ms: Optional[int] = self._parse_start_time_ms(
+            env("START_TIME_MS", ""), env("START_TIME_ISO", "")
+        )
+
+        # === Исполнение (на будущее) ===
         self.slippage_pct  = float(env("SLIPPAGE_PCT", "0.0"))
         self.latency_ms    = int(env("LATENCY_MS", "0"))
 
         # === МАРКЕТ ===
         self.taker_fee_rate = float(env("TAKER_FEE_RATE", "0.00055"))
-        self.min_net_profit = float(env("MIN_NET_PROFIT", "1.2"))
+        self.min_net_profit = float(env("MIN_NET_PROFIT", "2.0"))
         self.min_order_qty  = float(env("MIN_ORDER_QTY", "0.01"))
         self.qty_step       = float(env("QTY_STEP", "0.01"))
         self.tick_size      = float(env("TICK_SIZE", "0.01"))
 
-        # Совместимость со старой логикой bar-trail (активно не меняем механику)
+        # === DUAL-SFP ДОП. НАСТРОЙКИ ===
+        self.use_fee_filter     = env("USE_FEE_FILTER", "true").lower() not in ("0","false","no")
+        self.use_once_per_swing = env("USE_ONCE_PER_SWING", "true").lower() not in ("0","false","no")
+        # "Prefer Bear" | "Prefer Bull" | "Skip"
+        self.bar_priority       = self._normalize_bar_priority(env("BAR_PRIORITY", "Skip"))
+        self.use_dir_lock       = env("USE_DIR_LOCK", "true").lower() not in ("0","false","no")
+
+        # Совместимость со старой логикой bar-trail
         self.use_bar_trail   = env("USE_BAR_TRAIL", "true").lower() not in ("0","false","no")
         self.trail_lookback  = int(env("TRAIL_LOOKBACK", "50"))
         self.trail_buf_ticks = int(env("TRAIL_BUF_TICKS", "40"))
@@ -127,6 +143,35 @@ class Config:
         self.load_config()
         self._update_days_back()
         self._normalize_derived()
+
+    # ---------- helpers ----------
+
+    def _parse_start_time_ms(self, v_ms: str, v_iso: str) -> Optional[int]:
+        """Парсинг START_TIME_MS (unix ms) либо START_TIME_ISO ('YYYY-MM-DD HH:MM[:SS][Z]')."""
+        try:
+            if v_ms and v_ms.strip().isdigit():
+                return int(v_ms.strip())
+        except Exception:
+            pass
+        v = (v_iso or "").strip()
+        if not v:
+            return None
+        try:
+            vv = v.replace("Z", "+00:00")
+            dt = datetime.fromisoformat(vv)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)  # трактуем как UTC
+            return int(dt.timestamp() * 1000)
+        except Exception:
+            return None
+
+    def _normalize_bar_priority(self, raw: str) -> str:
+        r = (raw or "").strip().lower().replace("_", " ")
+        if r in ("prefer bear", "bear"):
+            return "Prefer Bear"
+        if r in ("prefer bull", "bull"):
+            return "Prefer Bull"
+        return "Skip"
 
     # ---------- normalizers ----------
 
@@ -210,9 +255,9 @@ class Config:
             self.intrabar_tf = "1"
 
         # ---- Lux поля ----
-        self.lux_volume_validation = (self.lux_volume_validation or "outside_gt").lower()
+        self.lux_volume_validation = (self.lux_volume_validation or "none").lower()
         if self.lux_volume_validation not in ("outside_gt", "outside_lt", "none"):
-            self.lux_volume_validation = "outside_gt"
+            self.lux_volume_validation = "none"
 
         try:
             self.lux_volume_threshold_pct = max(0.0, min(100.0, float(self.lux_volume_threshold_pct)))
@@ -233,6 +278,9 @@ class Config:
             self.lux_ltf = str(self.lux_ltf or "1")
         except Exception:
             self.lux_ltf = "1"
+
+        # ---- Dual-SFP поля ----
+        self.bar_priority = self._normalize_bar_priority(self.bar_priority)
 
     # ---------- load/save ----------
 
@@ -327,6 +375,7 @@ class Config:
             # бэктест/исполнение
             "period_choice": self.period_choice,
             "days_back": self.days_back,
+            "start_time_ms": self.start_time_ms,
             "slippage_pct": self.slippage_pct,
             "latency_ms": self.latency_ms,
 
@@ -338,6 +387,12 @@ class Config:
             "min_order_qty": self.min_order_qty,
             "qty_step": self.qty_step,
             "tick_size": self.tick_size,
+
+            # dual-sfp
+            "use_fee_filter": self.use_fee_filter,
+            "use_once_per_swing": self.use_once_per_swing,
+            "bar_priority": self.bar_priority,
+            "use_dir_lock": self.use_dir_lock,
 
             # совместимость (bar-trail)
             "use_bar_trail": self.use_bar_trail,
@@ -375,6 +430,18 @@ class Config:
                 raise ValueError("lux_swings must be >= 1")
             if self.lux_expire_bars < 1:
                 raise ValueError("lux_expire_bars must be >= 1")
+
+            # Market
+            if self.taker_fee_rate < 0:
+                raise ValueError("taker_fee_rate must be >= 0")
+            if self.min_net_profit < 0:
+                raise ValueError("min_net_profit must be >= 0")
+
+            # Dual-SFP
+            if self.bar_priority not in ("Prefer Bear", "Prefer Bull", "Skip"):
+                raise ValueError("bar_priority must be one of: Prefer Bear | Prefer Bull | Skip")
+            if self.start_time_ms is not None and int(self.start_time_ms) < 0:
+                raise ValueError("start_time_ms must be >= 0 (unix ms)")
 
             return True
         except Exception as e:
