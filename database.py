@@ -28,6 +28,27 @@ def _to_iso(ts) -> Optional[str]:
         return str(ts)
 
 
+def _parse_iso(s: Optional[str]) -> Optional[datetime]:
+    """Надёжный парсер ISO-строк, возвращает UTC-naive (как мы их храним)."""
+    if not s:
+        return None
+    try:
+        # пробуем стандартный fromisoformat
+        dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+        if dt.tzinfo is not None:
+            dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
+        return dt
+    except Exception:
+        try:
+            # fallback: попытка unix
+            f = float(s)
+            if f > 1e12:
+                f = f / 1000.0
+            return datetime.utcfromtimestamp(f).replace(microsecond=0)
+        except Exception:
+            return None
+
+
 def _f(x, default: float = 0.0) -> float:
     try:
         return float(x)
@@ -278,6 +299,54 @@ class Database:
             )
             row = c.fetchone()
             return float(row[0] if row and row[0] is not None else 0.0)
+
+    def get_performance_stats(self, days: int = 30) -> Dict[str, Any]:
+        """
+        Сводка для UI: win_rate, avg_rr, avg_hold_time (часы).
+        Берём сделки за последние `days` дней; учитываем только закрытые для метрик,
+        требующих exit_time (hold time).
+        """
+        with self._lock:
+            cutoff = datetime.utcnow() - timedelta(days=int(days))
+            cutoff_iso = _to_iso(cutoff)
+
+            c = self.conn.cursor()
+            # все сделки за период (для total)
+            c.execute(
+                "SELECT direction, status, rr, pnl, entry_time, exit_time "
+                "FROM trades WHERE entry_time >= ? ORDER BY entry_time ASC",
+                (cutoff_iso,)
+            )
+            rows = [dict(r) for r in c.fetchall()]
+
+        total = len(rows)
+        closed = [r for r in rows if str(r.get("status", "")).lower() == "closed"]
+        wins = [r for r in closed if _f(r.get("pnl"), 0.0) > 0.0]
+        losses = [r for r in closed if _f(r.get("pnl"), 0.0) < 0.0]
+
+        # win rate
+        win_rate = (len(wins) / len(closed) * 100.0) if closed else 0.0
+
+        # avg rr
+        rr_vals = [_f(r.get("rr")) for r in closed if r.get("rr") not in (None, "")]
+        avg_rr = (sum(rr_vals) / len(rr_vals)) if rr_vals else 0.0
+
+        # avg hold time (часы)
+        hold_hours = []
+        for r in closed:
+            et = _parse_iso(r.get("entry_time"))
+            xt = _parse_iso(r.get("exit_time"))
+            if et and xt and xt >= et:
+                hold_hours.append((xt - et).total_seconds() / 3600.0)
+        avg_hold = (sum(hold_hours) / len(hold_hours)) if hold_hours else 0.0
+
+        return {
+            "total": total,
+            "closed": len(closed),
+            "win_rate": round(win_rate, 2),
+            "avg_rr": round(avg_rr, 3),
+            "avg_hold_time": round(avg_hold, 3),
+        }
 
     # -------------------------- Equity --------------------------
     def save_equity_snapshot(self, equity: float):
