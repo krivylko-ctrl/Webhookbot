@@ -12,6 +12,7 @@ from state_manager import StateManager
 from database import Database
 from config import Config
 import config as cfg
+from analytics import TradingAnalytics  # <-- используем аналитику вместо несуществующего db.get_performance_stats
 
 # -------------------- НАСТРОЙКА СТРАНИЦЫ --------------------
 st.set_page_config(
@@ -20,7 +21,7 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="expanded"
 )
-st.title("Kwin Trading Bot")
+st.title("KWIN Trading Bot")
 
 # -------------------- ПРОВЕРКА ENV --------------------
 try:
@@ -271,7 +272,7 @@ def _stop_bot_thread():
 
 # ==================== ВИЗУАЛИЗАЦИИ ====================
 
-def show_dashboard(db, state_manager, strategy):
+def show_dashboard(db: Database, state_manager: StateManager, strategy: KWINStrategy):
     col1, col2, col3, col4 = st.columns(4)
 
     eq = state_manager.get_equity() or 0.0
@@ -296,19 +297,24 @@ def show_dashboard(db, state_manager, strategy):
         st.metric("💵 PnL сегодня", f"${float(pnl_today):.2f}")
 
     st.markdown("### 📈 Статистика за 30 дней")
+    # Используем TradingAnalytics (совместимо с остальными страницами)
     try:
-        stats = db.get_performance_stats(days=30) or {}
+        analytics = TradingAnalytics(db_path=db.db_path if hasattr(db, "db_path") else "kwin_bot.db")
+        stats = analytics.get_comprehensive_stats(days_back=30) or {}
     except Exception:
         stats = {}
+
     c1, c2, c3 = st.columns(3)
     with c1:
-        st.metric("🎯 Win Rate", f"{float(stats.get('win_rate', 0)):.1f}%")
+        st.metric("🎯 Win Rate", f"{(stats.get('winrate') or {}).get('total', 0)}%")
     with c2:
-        st.metric("📊 Avg RR", f"{float(stats.get('avg_rr', 0)):.2f}")
+        rr = stats.get("risk_reward") or {}
+        st.metric("📊 Avg RR", f"{rr.get('avg_rr', 0):.2f}")
     with c3:
-        st.metric("⏱️ Avg Hold Time", f"{float(stats.get('avg_hold_time', 0)):.1f}h")
+        dd = stats.get("drawdown") or {}
+        st.metric("⏱️ Max DD", f"{dd.get('max_drawdown', 0):.2f}%")
 
-def show_chart(bybit_api, db, strategy):
+def show_chart(bybit_api, db: Database, strategy: KWINStrategy):
     symbol = getattr(strategy.config, "symbol", "ETHUSDT")
     st.markdown(f"### 📈 График {symbol}")
     if bybit_api:
@@ -317,6 +323,7 @@ def show_chart(bybit_api, db, strategy):
             if klines:
                 df = pd.DataFrame(klines)
                 if "timestamp" in df.columns:
+                    # Bybit v5 kline timestamp — уже в миллисекундах; на всякий случай coerce
                     df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms', errors='coerce')
                 fig = go.Figure(data=[go.Candlestick(
                     x=df['timestamp'],
@@ -348,7 +355,7 @@ def show_chart(bybit_api, db, strategy):
         except Exception as e:
             st.error(f"Ошибка загрузки графика: {e}")
 
-def show_equity_curve(db):
+def show_equity_curve(db: Database):
     st.markdown("### 💰 Кривая Equity")
     try:
         eq = db.get_equity_history(days=30)
@@ -366,7 +373,7 @@ def show_equity_curve(db):
     else:
         st.info("Нет данных для отображения кривой equity")
 
-def show_trades_table(db):
+def show_trades_table(db: Database):
     st.markdown("### 📋 История сделок")
     try:
         trades = db.get_recent_trades(100)
@@ -376,10 +383,12 @@ def show_trades_table(db):
         df = pd.DataFrame(trades)
         if 'entry_time' in df.columns: df['entry_time'] = pd.to_datetime(df['entry_time'], errors='coerce')
         if 'exit_time' in df.columns:  df['exit_time']  = pd.to_datetime(df['exit_time'], errors='coerce')
-        for col in ('pnl', 'rr', 'entry_price', 'exit_price', 'quantity'):
+        for col in ('pnl', 'rr', 'entry_price', 'exit_price', 'quantity', 'qty'):
             if col in df.columns: df[col] = pd.to_numeric(df[col], errors='coerce')
-        cols = [c for c in ['entry_time','direction','entry_price','exit_price','quantity','pnl','rr','status'] if c in df.columns]
-        st.dataframe(df[cols].round(4), use_container_width=True)
+        if "quantity" not in df.columns and "qty" in df.columns:
+            df["quantity"] = df["qty"]
+        cols = [c for c in ['entry_time','direction','entry_price','exit_price','quantity','pnl','rr','status','exit_reason'] if c in df.columns]
+        st.dataframe(df[cols].round(6), use_container_width=True)
     else:
         st.info("Нет сделок для отображения")
 
