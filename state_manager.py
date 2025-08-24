@@ -20,14 +20,17 @@ class StateManager:
     Состояние периодически/при изменениях сохраняется в БД через Database.save_bot_state().
     """
 
-    def __init__(self, db: Database):
+    def __init__(self, db: Database, taker_fee_rate: float = 0.00055):
         self.db = db
         self._lock = RLock()
 
         self._equity: float = 100.0
         self._bot_status: str = "stopped"
         self._current_position: Optional[Dict[str, Any]] = None
-        self._last_close_time_ms: Optional[int] = None  # <-- для кулдауна входов
+        self._last_close_time_ms: Optional[int] = None  # для кулдауна входов
+
+        # комиссия биржи (используем такую же, как и database.update_trade_exit)
+        self._fee_rate: float = float(taker_fee_rate)
 
         self._load_state()
 
@@ -109,7 +112,6 @@ class StateManager:
                     pos["trail_anchor"] = pos.get("entry_price")
 
                 # Унификация объёма: size <-> quantity
-                # (храним оба ключа для совместимости с UI/БД)
                 if "size" in pos and "quantity" not in pos:
                     try:
                         pos["quantity"] = float(pos["size"])
@@ -120,6 +122,14 @@ class StateManager:
                         pos["size"] = float(pos["quantity"])
                     except Exception:
                         pos["size"] = pos["quantity"]
+
+                # Числовые поля (на всякий)
+                for k in ("entry_price", "stop_loss", "take_profit"):
+                    if k in pos and pos[k] is not None:
+                        try:
+                            pos[k] = float(pos[k])
+                        except Exception:
+                            pass
 
                 self._current_position = pos
         self._save_state()
@@ -133,7 +143,10 @@ class StateManager:
     def update_position_stop_loss(self, new_sl: float) -> None:
         with self._lock:
             if self._current_position:
-                self._current_position["stop_loss"] = float(new_sl)
+                try:
+                    self._current_position["stop_loss"] = float(new_sl)
+                except Exception:
+                    self._current_position["stop_loss"] = new_sl
         self._save_state()
 
     def update_position_armed(self, armed: bool) -> None:
@@ -145,7 +158,10 @@ class StateManager:
     def update_trail_anchor(self, anchor: float) -> None:
         with self._lock:
             if self._current_position:
-                self._current_position["trail_anchor"] = float(anchor)
+                try:
+                    self._current_position["trail_anchor"] = float(anchor)
+                except Exception:
+                    self._current_position["trail_anchor"] = anchor
         self._save_state()
 
     # ----------------- Close position -----------------
@@ -153,15 +169,32 @@ class StateManager:
     def close_position(self, exit_price: float, exit_reason: str = "manual") -> None:
         """
         Закрыть текущую позицию и синхронизировать это с БД.
-        PnL / RR считаются в Database.update_trade_exit().
-        После закрытия — (1) обновляем equity на величину чистого PnL последней сделки (реинвест),
-        (2) проставляем last_close_time_ms (UTC now в мс) — нужно для кулдауна входов.
+        Net PnL считаем локально (как в Database.update_trade_exit) и прибавляем к equity.
+        Затем обновляем запись сделки в БД (она посчитает то же самое).
+        После закрытия — проставляем last_close_time_ms (UTC now, мс) и чистим локальную позицию.
         """
         pos = self.get_current_position()
         if not pos:
             return
 
-        # Закрываем сделку в БД
+        # --- 1) Локальный net PnL (без ожидания чтения из БД)
+        try:
+            entry = float(pos.get("entry_price") or 0.0)
+            qty   = float(pos.get("size") or pos.get("quantity") or 0.0)
+            side  = (pos.get("direction") or "").lower()
+            exit_px = float(exit_price if exit_price is not None else entry)
+
+            if qty > 0 and entry > 0:
+                gross = (exit_px - entry) * qty if side == "long" else (entry - exit_px) * qty
+                fee_in  = entry * qty * self._fee_rate
+                fee_out = exit_px * qty * self._fee_rate
+                net_pnl = gross - (fee_in + fee_out)
+                with self._lock:
+                    self._equity = float(self._equity) + float(net_pnl)
+        except Exception as e:
+            print(f"[StateManager] Error computing local PnL: {e}")
+
+        # --- 2) Обновляем сделку в БД (БД тоже посчитает net PnL, что ок)
         try:
             self.db.update_trade_exit(
                 {
@@ -169,32 +202,20 @@ class StateManager:
                     "exit_time": datetime.utcnow(),
                     "exit_reason": exit_reason,
                     "status": "closed",
-                }
+                },
+                fee_rate=self._fee_rate,
             )
         except Exception as e:
             print(f"[StateManager] Error closing trade in DB: {e}")
-            return
 
-        # Применяем чистый PnL последней сделки к equity
-        try:
-            trades = self.db.get_recent_trades(limit=1)
-            if trades:
-                last = trades[0]
-                pnl = last.get("pnl")
-                if pnl is not None:
-                    with self._lock:
-                        self._equity = float(self._equity) + float(pnl)
-        except Exception as e:
-            print(f"[StateManager] Error applying PnL to equity: {e}")
-
-        # Обновляем last_close_time_ms (UTC now → ms)
+        # --- 3) Обновляем last_close_time_ms (UTC now → ms)
         try:
             now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
         except Exception:
             now_ms = int(datetime.utcnow().timestamp() * 1000)
         self.set_last_close_time(now_ms)
 
-        # Локально чистим позицию
+        # --- 4) Локально чистим позицию
         self.clear_position()
 
     # ----------------- Cooldown helpers -----------------
