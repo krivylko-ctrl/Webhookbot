@@ -1,5 +1,6 @@
-# state_manager.py
+# state_manager.py — совместимая версия для KWINStrategy / TrailEngine
 from __future__ import annotations
+
 from typing import Dict, Optional, Any
 from datetime import datetime, timezone
 from threading import RLock
@@ -12,7 +13,7 @@ class StateManager:
     Потокобезопасный стор состояния бота.
     Хранит:
       • equity
-      • текущую позицию (direction, quantity, entry_price, stop_loss, take_profit,
+      • текущую позицию (direction, quantity/size, entry_price, stop_loss, take_profit,
         armed, trail_anchor, entry_time_ts, status)
       • статус бота
       • last_close_time_ms — метка времени (UTC, мс) последнего закрытия позиции (для кулдауна)
@@ -99,6 +100,7 @@ class StateManager:
                 self._current_position = None
             else:
                 pos = dict(position)
+
                 # Дефолты/нормализация
                 pos.setdefault("status", "open")
                 pos.setdefault("armed", False)
@@ -106,12 +108,18 @@ class StateManager:
                 if pos.get("trail_anchor") is None:
                     pos["trail_anchor"] = pos.get("entry_price")
 
-                # Унификация объёма: size -> quantity
+                # Унификация объёма: size <-> quantity
+                # (храним оба ключа для совместимости с UI/БД)
                 if "size" in pos and "quantity" not in pos:
                     try:
-                        pos["quantity"] = float(pos.pop("size"))
+                        pos["quantity"] = float(pos["size"])
                     except Exception:
-                        pos["quantity"] = pos.pop("size")
+                        pos["quantity"] = pos["size"]
+                if "quantity" in pos and "size" not in pos:
+                    try:
+                        pos["size"] = float(pos["quantity"])
+                    except Exception:
+                        pos["size"] = pos["quantity"]
 
                 self._current_position = pos
         self._save_state()
@@ -227,6 +235,11 @@ class StateManager:
     def get_position_quantity(self) -> Optional[float]:
         with self._lock:
             return None if not self._current_position else self._current_position.get("quantity")
+
+    # алиас для совместимости с кодом, где ожидали size
+    def get_position_size(self) -> Optional[float]:
+        with self._lock:
+            return None if not self._current_position else self._current_position.get("size")
 
     def is_position_armed(self) -> bool:
         with self._lock:
