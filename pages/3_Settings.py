@@ -245,9 +245,9 @@ def main():
         if st.button("💾 Сохранить настройки", type="primary", use_container_width=True):
             try:
                 # Источники
-                config.symbol = str(symbol).upper()
-                config.price_for_logic = str(price_for_logic).lower()
-                config.trigger_price_source = str(trigger_price_source).lower()
+                config.symbol = str(symbol).upper().strip()
+                config.price_for_logic = str(price_for_logic).lower().strip()
+                config.trigger_price_source = str(trigger_price_source).lower().strip()
 
                 # Риск/ограничения
                 config.risk_pct = float(risk_pct)
@@ -282,18 +282,16 @@ def main():
                 config.trail_lookback = int(trail_lookback)
                 config.trail_buf_ticks = int(trail_buf_ticks)
 
-                # Удалённые блоки НЕ сохраняем и не трогаем:
-                # - старая SFP-валидация
-                # - Stop-Loss Zone
-                # - Cooldown
-                # - SFP Length / Intrabar TF
-
                 ok = config.validate()
                 if not ok:
                     st.error("❌ Валидация конфигурации не пройдена. Проверь значения.")
                 else:
                     config.save_config()
+                    # Переинициализируем для чистоты отображения
+                    fresh = Config()
                     st.success("✅ Настройки успешно сохранены и будут применены в торговле!")
+                    with st.expander("Показать сохранённый снимок config.json"):
+                        st.json(fresh.to_dict())
             except Exception as e:
                 st.error(f"❌ Ошибка сохранения: {e}")
 
