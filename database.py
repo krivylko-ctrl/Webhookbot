@@ -1,3 +1,4 @@
+# database.py
 import sqlite3
 import json
 from typing import Dict, List, Optional, Any
@@ -8,6 +9,7 @@ import threading
 # ========================= Вспомогательные =========================
 
 def _to_iso(ts) -> Optional[str]:
+    """Унифицируем хранение времени: всегда ISO (UTC, без микросекунд)."""
     if ts is None:
         return None
     if isinstance(ts, datetime):
@@ -16,7 +18,8 @@ def _to_iso(ts) -> Optional[str]:
         return ts.replace(microsecond=0).isoformat()
     try:
         if isinstance(ts, (int, float)):
-            if ts > 1e12:  # миллисекунды
+            # поддержка unix в мс
+            if ts > 1e12:
                 ts = ts / 1000.0
             dt = datetime.utcfromtimestamp(float(ts))
             return dt.replace(microsecond=0).isoformat()
@@ -33,6 +36,7 @@ def _f(x, default: float = 0.0) -> float:
 
 
 def _normalize_json(obj: Any) -> Any:
+    """Гарантируем json-совместимость для вложенных структур/дат."""
     if isinstance(obj, datetime):
         return _to_iso(obj)
     if isinstance(obj, dict):
@@ -49,7 +53,7 @@ class Database:
         self.db_path = ":memory:" if memory else db_path
         self.conn = sqlite3.connect(self.db_path, check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
-        # Улучшаем стабильность/параллелизм
+        # Базовые тюнинги под многопоточность и стабильность
         try:
             self.conn.execute("PRAGMA journal_mode=WAL;")
             self.conn.execute("PRAGMA synchronous=NORMAL;")
@@ -124,7 +128,7 @@ class Database:
                 timestamp TEXT DEFAULT (datetime('now'))
             )
         """)
-        # Индексы для скорости
+        # Индексы
         c.execute("CREATE INDEX IF NOT EXISTS idx_trades_status ON trades(status)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_trades_entry_time ON trades(entry_time)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_trades_exit_time  ON trades(exit_time)")
@@ -132,9 +136,10 @@ class Database:
 
     # -------------------------- Trades --------------------------
     def save_trade(self, trade: Dict) -> int:
+        """Создать запись сделки (открытие). Возвращает ID."""
         with self._lock:
             try:
-                # Унификация qty/quantity: если пришёл size — примем как quantity
+                # qty / quantity унификация
                 qty = trade.get("quantity", None)
                 if qty in (None, "", 0) and ("size" in trade):
                     try:
@@ -156,13 +161,13 @@ class Database:
                     _f(trade.get("stop_loss")),
                     _f(trade.get("take_profit")),
                     _f(qty),
-                    _f(trade.get("qty")),  # буферное поле на всякий случай
+                    _f(trade.get("qty")),  # на всякий случай отдельное поле
                     _f(trade.get("pnl")),
                     _f(trade.get("rr")),
                     _to_iso(trade.get("entry_time") or datetime.utcnow()),
                     _to_iso(trade.get("exit_time")),
                     trade.get("exit_reason"),
-                    trade.get("status", "open"),
+                    str(trade.get("status", "open")),
                 ))
                 self.conn.commit()
                 return int(c.lastrowid or 0)
@@ -174,6 +179,9 @@ class Database:
         return self.save_trade(trade)
 
     def update_trade_exit(self, trade_data: Dict, fee_rate: float = 0.00055):
+        """
+        Обновляет последнюю открытую сделку (или по id) на закрытие и считает net PnL с комиссиями.
+        """
         with self._lock:
             try:
                 c = self.conn.cursor()
@@ -189,7 +197,7 @@ class Database:
                 entry_price = _f(tr.get("entry_price"), 0.0)
                 stop_loss   = _f(tr.get("stop_loss"))
                 qty         = _f(tr.get("quantity")) or _f(tr.get("qty"), 0.0)
-                side        = tr.get("direction")
+                side        = (tr.get("direction") or "").lower()
                 exit_price  = _f(trade_data.get("exit_price"), entry_price)
 
                 # === Net PnL с комиссиями ===
@@ -273,14 +281,18 @@ class Database:
 
     # -------------------------- Equity --------------------------
     def save_equity_snapshot(self, equity: float):
+        """Асинхронный write, чтобы не блокировать основной поток."""
         def _worker(eq):
             try:
                 with self._lock:
                     c = self.conn.cursor()
-                    c.execute("INSERT INTO equity_history (equity, timestamp) VALUES (?, ?)",
-                              (_f(eq, 0.0), _to_iso(datetime.utcnow())))
+                    c.execute(
+                        "INSERT INTO equity_history (equity, timestamp) VALUES (?, ?)",
+                        (_f(eq, 0.0), _to_iso(datetime.utcnow()))
+                    )
                     self.conn.commit()
             except Exception:
+                # не шумим в фоне
                 pass
         threading.Thread(target=_worker, args=(equity,), daemon=True).start()
 
@@ -300,7 +312,7 @@ class Database:
             c = self.conn.cursor()
             c.execute(
                 "INSERT INTO logs (level, message, module, timestamp) VALUES (?, ?, ?, ?)",
-                (level, message, module, _to_iso(datetime.utcnow())),
+                (str(level), str(message), module, _to_iso(datetime.utcnow())),
             )
             self.conn.commit()
 
@@ -313,7 +325,10 @@ class Database:
     def purge_old_logs(self, keep: int = 1000):
         with self._lock:
             c = self.conn.cursor()
-            c.execute("DELETE FROM logs WHERE id NOT IN (SELECT id FROM logs ORDER BY id DESC LIMIT ?)", (keep,))
+            c.execute(
+                "DELETE FROM logs WHERE id NOT IN (SELECT id FROM logs ORDER BY id DESC LIMIT ?)",
+                (int(keep),)
+            )
             self.conn.commit()
 
     # --------------------- Bot State / Config ---------------------
@@ -322,14 +337,17 @@ class Database:
             c = self.conn.cursor()
             c.execute("SELECT state_data FROM bot_state WHERE id = 1")
             row = c.fetchone()
-            return json.loads(row[0]) if row else {}
+            try:
+                return json.loads(row[0]) if row else {}
+            except Exception:
+                return {}
 
     def save_bot_state(self, state: Dict[str, Any]):
         with self._lock:
             c = self.conn.cursor()
             c.execute(
                 "INSERT OR REPLACE INTO bot_state (id, state_data, updated_at) VALUES (1, ?, ?)",
-                (json.dumps(_normalize_json(state)), _to_iso(datetime.utcnow()))
+                (json.dumps(_normalize_json(state), ensure_ascii=False), _to_iso(datetime.utcnow()))
             )
             self.conn.commit()
 
@@ -338,14 +356,17 @@ class Database:
             c = self.conn.cursor()
             c.execute("SELECT config_data FROM config WHERE id = 1")
             row = c.fetchone()
-            return json.loads(row[0]) if row else {}
+            try:
+                return json.loads(row[0]) if row else {}
+            except Exception:
+                return {}
 
     def save_config(self, cfg: Dict[str, Any]):
         with self._lock:
             c = self.conn.cursor()
             c.execute(
                 "INSERT OR REPLACE INTO config (id, config_data, updated_at) VALUES (1, ?, ?)",
-                (json.dumps(_normalize_json(cfg)), _to_iso(datetime.utcnow()))
+                (json.dumps(_normalize_json(cfg), ensure_ascii=False), _to_iso(datetime.utcnow()))
             )
             self.conn.commit()
 
@@ -364,11 +385,12 @@ class Database:
         for tr in dump.get("trades", []):
             self.save_trade(tr)
         for e in dump.get("equity", []):
-            # пишем синхронно, чтобы порядок сохранился
             with self._lock:
                 c = self.conn.cursor()
-                c.execute("INSERT INTO equity_history (equity, timestamp) VALUES (?, ?)",
-                          (_f(e.get("equity")), _to_iso(e.get("timestamp") or datetime.utcnow())))
+                c.execute(
+                    "INSERT INTO equity_history (equity, timestamp) VALUES (?, ?)",
+                    (_f(e.get("equity")), _to_iso(e.get("timestamp") or datetime.utcnow()))
+                )
                 self.conn.commit()
         self.save_bot_state(dump.get("state", {}))
         self.save_config(dump.get("config", {}))
@@ -390,7 +412,7 @@ class Database:
 
     # --------------------- Reset для Backtest ---------------------
     def reset_for_backtest(self):
-        """Полностью очищает БД перед новым бэктестом"""
+        """Полностью очищает БД перед новым бэктестом."""
         with self._lock:
             c = self.conn.cursor()
             c.executescript("""
