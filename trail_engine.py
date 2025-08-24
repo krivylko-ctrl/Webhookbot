@@ -1,25 +1,29 @@
 # trail_engine.py
-import math
 from typing import Dict, Optional
-from datetime import datetime
 
 from config import Config
 from state_manager import StateManager
-from analytics import TrailingLogger
 
 # тик-хелперы (точное согласование с Pine)
-from utils_round import round_price, floor_to_tick, ceil_to_tick
+from utils_round import round_to_tick, floor_to_tick, ceil_to_tick
+
+# Логгер трейлинга (делаем безопасным к отсутствию)
+try:
+    from analytics import TrailingLogger  # type: ignore
+except Exception:  # fallback no-op
+    class TrailingLogger:  # noqa: D401
+        """No-op logger if analytics.TrailingLogger is absent."""
+        def log_trail_movement(self, *args, **kwargs):  # noqa: D401
+            pass
 
 
 class TrailEngine:
     """
     Движок Smart Trailing для управления стоп-лоссами.
-    Адаптирован под Pine-логику:
-      • ARM после достижения RR (с поддержкой basis: extremum | last)
-      • Якорение по экстремуму (anchor) — максимум/минимум против цены входа
+      • ARM после достижения RR (basis: extremum | last)
+      • Anchor по экстремуму внутри бара
       • % трейлинг от entry + offset относительно anchor
       • BarTrail (lowest/highest N закрытых баров без текущего) — опционально
-
     Совместим с вызовами из KWINStrategy:
       - on_entry(entry, sl, direction)
       - process_trailing(position, current_price)
@@ -30,21 +34,16 @@ class TrailEngine:
         self.state = state_manager
         self.api = bybit_api
 
-        # Логгер трейлинга
         self.trail_logger = TrailingLogger()
 
-        # Внутреннее состояние (минимально необходимое)
+        # Внутренние якоря (последние экстремумы со стороны тренда)
         self._last_anchor_long: Optional[float] = None
         self._last_anchor_short: Optional[float] = None
 
     # ---------- События ----------
 
-    def on_entry(self, entry_price: float, stop_loss: float, direction: str):
-        """
-        Инициализация трейла при входе (как в Pine):
-        - сбрасываем/устанавливаем якорь на цене входа
-        - не трогаем armed-флаг: им управляет стратегия (или ARM-блок ниже)
-        """
+    def on_entry(self, entry_price: float, _stop_loss: float, direction: str):
+        """Инициализация якоря на цене входа."""
         try:
             if direction == "long":
                 self._last_anchor_long = float(entry_price)
@@ -56,13 +55,13 @@ class TrailEngine:
     # ---------- Публичный вход ----------
 
     def process_trailing(self, position: Dict, current_price: float):
-        """Основная логика обработки трейлинга (вызывается внешним циклом)."""
+        """Основная логика обработки трейлинга (внешний вызов)."""
         if not position or current_price is None:
             return
-        direction = position.get("direction")
-        if direction == "long":
+        side = (position.get("direction") or "").lower()
+        if side == "long":
             self._process_long_trailing(position, float(current_price))
-        elif direction == "short":
+        elif side == "short":
             self._process_short_trailing(position, float(current_price))
 
     # ---------- LONG ----------
@@ -79,12 +78,10 @@ class TrailEngine:
             if getattr(self.config, "use_arm_after_rr", True) and not armed:
                 risk = entry - current_sl
                 if risk > 0:
-                    # basis: 'extremum' -> считаем по anchor, 'last' -> по текущей цене
                     basis = (getattr(self.config, "arm_rr_basis", "extremum") or "extremum").lower()
                     anchor = float(position.get("trail_anchor") or self._last_anchor_long or entry)
-                    # поддерживаем рост anchor по текущей цене (экстремум внутри бара)
                     if current_price > anchor:
-                        anchor = current_price
+                        anchor = current_price  # экстремум внутри бара
                     rr_now = (anchor - entry) / risk if basis == "extremum" else (current_price - entry) / risk
                     need = float(getattr(self.config, "arm_rr", 0.5))
                     if rr_now >= need:
@@ -119,7 +116,6 @@ class TrailEngine:
             if trail_perc > 0.0:
                 trail_dist = entry * trail_perc
                 off_dist = entry * off_perc
-                # Pine: считаем кандидат строго от anchor
                 candidate = floor_to_tick(anchor - trail_dist - off_dist, self._tick_size())
                 new_sl = max(new_sl, candidate)
 
@@ -128,8 +124,8 @@ class TrailEngine:
                 self.trail_logger.log_trail_movement(
                     position, current_sl, new_sl, current_price,
                     "Long Trail Update",
-                    lookback_value=self.config.trail_lookback if getattr(self.config, "use_bar_trail", False) else 0,
-                    buffer_ticks=self.config.trail_buf_ticks
+                    lookback_value=getattr(self.config, "trail_lookback", 50) if getattr(self.config, "use_bar_trail", False) else 0,
+                    buffer_ticks=getattr(self.config, "trail_buf_ticks", 40)
                 )
                 self._update_stop_loss(position, new_sl)
 
@@ -196,8 +192,8 @@ class TrailEngine:
                 self.trail_logger.log_trail_movement(
                     position, current_sl, new_sl, current_price,
                     "Short Trail Update",
-                    lookback_value=self.config.trail_lookback if getattr(self.config, "use_bar_trail", False) else 0,
-                    buffer_ticks=self.config.trail_buf_ticks
+                    lookback_value=getattr(self.config, "trail_lookback", 50) if getattr(self.config, "use_bar_trail", False) else 0,
+                    buffer_ticks=getattr(self.config, "trail_buf_ticks", 40)
                 )
                 self._update_stop_loss(position, new_sl)
 
@@ -207,7 +203,7 @@ class TrailEngine:
     # ---------- BarTrail Helpers ----------
 
     def _calculate_bar_trail_long(self, current_sl: float) -> float:
-        """BarTrail для long: lowest(low, N)[1] по ЗАКРЫТЫМ барам (без текущего)."""
+        """BarTrail (long): lowest(low, N)[1] по закрытым барам базового ТФ."""
         try:
             lb = int(getattr(self.config, "trail_lookback", 50))
             if lb <= 0 or not hasattr(self.api, "get_klines"):
@@ -226,7 +222,7 @@ class TrailEngine:
             return current_sl
 
     def _calculate_bar_trail_short(self, current_sl: float) -> float:
-        """BarTrail для short: highest(high, N)[1] по ЗАКРЫТЫМ барам (без текущего)."""
+        """BarTrail (short): highest(high, N)[1] по закрытым барам базового ТФ."""
         try:
             lb = int(getattr(self.config, "trail_lookback", 50))
             if lb <= 0 or not hasattr(self.api, "get_klines"):
@@ -253,39 +249,50 @@ class TrailEngine:
         """
         try:
             tick = self._tick_size()
-            new_sl = round_price(float(new_sl), tick)
+            new_sl = round_to_tick(float(new_sl), tick)
 
             if not self.api:
-                return False
+                # локально (без API)
+                position["stop_loss"] = new_sl
+                if hasattr(self.state, "set_position"):
+                    self.state.set_position(position)
+                print(f"[TRAIL-LOCAL] SL -> {new_sl:.6f}")
+                return True
+
+            trigger_src = getattr(self.config, "trigger_price_source", "mark")
 
             # приоритет: позиционный апдейт SL
             if hasattr(self.api, "update_position_stop_loss"):
-                ok = self.api.update_position_stop_loss(self.config.symbol, new_sl)
+                ok = self.api.update_position_stop_loss(
+                    self.config.symbol,
+                    new_sl,
+                    trigger_by_source=trigger_src,
+                )
                 if ok:
                     position["stop_loss"] = new_sl
                     if hasattr(self.state, "set_position"):
                         self.state.set_position(position)
-                    print(f"[TRAIL] SL -> {new_sl:.4f}")
+                    print(f"[TRAIL] SL -> {new_sl:.6f}")
                     return True
 
-            # запасной путь: правим через trading-stop/modify_order
+            # запасной путь: правим через modify_order (fallback на trading-stop реализован в BybitAPI)
             if hasattr(self.api, "modify_order"):
                 _ = self.api.modify_order(
                     symbol=position.get("symbol", self.config.symbol),
                     stop_loss=new_sl,
-                    trigger_by_source=getattr(self.config, "trigger_price_source", "last"),
+                    trigger_by_source=trigger_src,
                 )
                 position["stop_loss"] = new_sl
                 if hasattr(self.state, "set_position"):
                     self.state.set_position(position)
-                print(f"[TRAIL] SL -> {new_sl:.4f}")
+                print(f"[TRAIL] SL -> {new_sl:.6f}")
                 return True
 
-            # локально (если API нет)
+            # крайний случай — только локально
             position["stop_loss"] = new_sl
             if hasattr(self.state, "set_position"):
                 self.state.set_position(position)
-            print(f"[TRAIL-LOCAL] SL -> {new_sl:.4f}")
+            print(f"[TRAIL-LOCAL] SL -> {new_sl:.6f}")
             return True
 
         except Exception as e:
