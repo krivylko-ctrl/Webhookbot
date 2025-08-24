@@ -303,22 +303,21 @@ def run_backtest(symbol: str,
     m15 = data15.m15.reset_index(drop=True)
 
     # ======== ОСНОВНОЙ ЦИКЛ ========
-    # ВАЖНО: для Lux-валидации 15м-свечи сначала нужно прогнать LTF внутри ЭТОГО бара (t_prev..t_curr),
-    # затем закрыть 15м-бар, затем уже идти в LTF следующего окна (t_curr..t_next) для трейла/выходов.
+    # Правильные окна:
+    #   • LTF внутри текущего бара i: [t_curr .. t_next]
+    #   • Закрываем 15m бар i
+    #   • LTF после закрытия (для трейла/выходов): [t_next .. t_next2]
     intrabar_tf = str(getattr(cfg, "intrabar_tf", "1"))
 
-    # начинаем с i = 1, чтобы иметь t_prev
-    for i in range(1, len(m15) - 1):
-        prev_bar = m15.iloc[i - 1].to_dict()
+    for i in range(0, len(m15) - 1):
         bar      = m15.iloc[i].to_dict()
         next_bar = m15.iloc[i + 1].to_dict()
 
-        t_prev = int(prev_bar["timestamp"])
-        t_curr = int(bar["timestamp"])
-        t_next = int(next_bar["timestamp"])
+        t_curr = int(bar["timestamp"])       # старт текущего 15m бара
+        t_next = int(next_bar["timestamp"])  # старт следующего 15m бара
 
         # 0) LTF внутри текущего закрывающегося 15m бара (для Lux-валидации)
-        m1_inside = iter_m1_between_by_day(broker, symbol, intrabar_tf, t_prev, t_curr)
+        m1_inside = iter_m1_between_by_day(broker, symbol, intrabar_tf, t_curr, t_next)
         for m1 in m1_inside:
             broker.set_current_price(symbol, float(m1["close"]))
             strat.on_bar_close_1m({
@@ -329,7 +328,7 @@ def run_backtest(symbol: str,
                 "close": float(m1["close"]),
             })
 
-        # 1) Закрываем 15m бар (после того как внутренняя LTF-структура уже «сведена»)
+        # 1) Закрываем текущий 15m бар
         broker.set_current_price(symbol, float(bar["close"]))
         strat.on_bar_close_15m({
             "timestamp": t_curr,
@@ -339,8 +338,14 @@ def run_backtest(symbol: str,
             "close": float(bar["close"]),
         })
 
-        # 2) LTF между текущим и следующим 15m (для трейлинга/выходов)
-        m1_after = iter_m1_between_by_day(broker, symbol, intrabar_tf, t_curr, t_next)
+        # 2) LTF после закрытия (следующий 15m бар): [t_next .. t_next2]
+        if i + 2 < len(m15):
+            t_next2 = int(m15.iloc[i + 2]["timestamp"])
+        else:
+            # если это предпоследний бар, берём ещё 15 минут «вперёд»
+            t_next2 = t_next + 15 * 60 * 1000
+
+        m1_after = iter_m1_between_by_day(broker, symbol, intrabar_tf, t_next, t_next2)
         for m1 in m1_after:
             broker.set_current_price(symbol, float(m1["close"]))
             strat.on_bar_close_1m({
