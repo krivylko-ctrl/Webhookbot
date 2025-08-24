@@ -1,3 +1,5 @@
+# bybit_api.py — совместимая обёртка для KWINStrategy (HTTP + WS v5)
+
 import requests
 import json
 import time
@@ -17,7 +19,7 @@ except Exception:
 
 class BybitAPI:
     """Лёгкая обёртка над Bybit v5 (HTTP + паблик WS).
-       По умолчанию — категория linear (USDT-M perpetual/фьючерсы)."""
+       По умолчанию — категория linear (USDT-M)."""
 
     def __init__(self, api_key: str, api_secret: str, testnet: bool = False):
         self.api_key = api_key or ""
@@ -206,8 +208,7 @@ class BybitAPI:
         limit: int = 1000
     ) -> Optional[List[Dict]]:
         """
-        Чтение свечей с окнами времени (start/end в мс). Удобно для бэктеста и LTF-валидации.
-        Возвращает по возрастанию timestamp (мс).
+        Чтение свечей с окнами времени (start/end в мс). Возвращает по возрастанию timestamp.
         """
         params = {
             "category": self.market_type,
@@ -241,7 +242,7 @@ class BybitAPI:
         print(f"[BybitAPI] get_klines_window error: {resp.get('retCode')} {resp.get('retMsg')}")
         return None
 
-    # Удобный алиас: ровно то же, что window, но с более читаемым именем
+    # Алиас
     def get_klines_between(self, symbol: str, interval: str, start_ms: int, end_ms: int, limit: int = 1000) -> List[Dict]:
         rows = self.get_klines_window(symbol, interval, start_ms=start_ms, end_ms=end_ms, limit=limit) or []
         return rows
@@ -256,8 +257,12 @@ class BybitAPI:
                 _f = self._to_float
                 return {
                     "symbol": t.get("symbol"),
+                    # camelCase — подхватится стратегией
                     "lastPrice": _f(t.get("lastPrice", 0)),
                     "markPrice": _f(t.get("markPrice", 0)),
+                    # дубли snake для совместимости со сторонним кодом (не помешают)
+                    "last_price": _f(t.get("lastPrice", 0)),
+                    "mark_price": _f(t.get("markPrice", 0)),
                     "bid1Price": _f(t.get("bid1Price", 0)),
                     "ask1Price": _f(t.get("ask1Price", 0)),
                     "volume24h": _f(t.get("volume24h", 0)),
@@ -280,6 +285,7 @@ class BybitAPI:
             lst = (resp.get("result") or {}).get("list") or []
             if not lst:
                 print(f"[BybitAPI] instruments-info empty for {params}")
+            # структура с priceFilter/lotSizeFilter — как ожидает стратегия
             return lst[0] if lst else None
         print(f"[BybitAPI] instruments-info error: {resp.get('retCode')} {resp.get('retMsg')}")
         return None
@@ -392,8 +398,7 @@ class BybitAPI:
     ) -> Optional[Dict]:
         """
         Изменение ордера. Если ID/LinkID не передан, а хотим поменять только SL/TP,
-        прозрачно фолбэкнемся на обновление SL/TP по позиции (trading-stop),
-        что соответствует тому, как стратегия пытается обновить SL.
+        прозрачно фолбэкнемся на обновление SL/TP по позиции (trading-stop).
         """
         # Фолбэк — только SL/TP без id
         if (order_id is None and order_link_id is None) and (stop_loss is not None or take_profit is not None) and price is None and qty is None:
@@ -491,14 +496,44 @@ class BybitAPI:
         )
         threading.Thread(target=self.ws.run_forever, daemon=True).start()
 
-    def subscribe_kline(self, symbol: str, interval: str, callback: Callable):
-        """Подписка на kline (возвращаются только закрытые бары через поле confirm=True)."""
+    def _convert_kline_item(self, it: Dict) -> Optional[Dict]:
+        """Конвертация WS-kline item -> candle dict (как ждёт KWINStrategy)."""
+        try:
+            ts = int(it.get("start") or it.get("startTime") or it.get("t") or 0)
+            if ts == 0:
+                return None
+            return {
+                "timestamp": ts,  # уже мс у Bybit
+                "open":  self._to_float(it.get("open")  or it.get("o")),
+                "high":  self._to_float(it.get("high")  or it.get("h")),
+                "low":   self._to_float(it.get("low")   or it.get("l")),
+                "close": self._to_float(it.get("close") or it.get("c")),
+                "volume": self._to_float(it.get("volume") or it.get("v")),
+            }
+        except Exception:
+            return None
+
+    def subscribe_kline(self, symbol: str, interval: str, callback: Callable[[Dict], None]):
+        """
+        Подписка на kline. В callback отдаём УЖЕ ГОТОВЫЙ candle-словарь
+        {'timestamp','open','high','low','close','volume'} ТОЛЬКО по закрытию бара.
+        """
         if not self.ws:
             self.start_websocket()
         topic = f"kline.{interval}.{(symbol or '').upper()}"
-        self.ws_callbacks[topic] = lambda data: (
-            callback(data) if (data.get("data", [{}])[0].get("confirm", False)) else None
-        )
+
+        def _cb(data: Dict):
+            try:
+                items = data.get("data") or []
+                for it in items:
+                    if bool(it.get("confirm", False)):
+                        candle = self._convert_kline_item(it)
+                        if candle:
+                            callback(candle)
+            except Exception as e:
+                print(f"kline callback error: {e}")
+
+        self.ws_callbacks[topic] = _cb
         msg = {"op": "subscribe", "args": [topic]}
         try:
             if self.ws:
