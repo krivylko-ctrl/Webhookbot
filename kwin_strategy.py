@@ -1,4 +1,4 @@
-# kwin_strategy.py — Lux SFP only (SFP wick + close-back, SL = extreme of SFP bar)
+# kwin_strategy.py — Lux SFP only (SFP wick + close-back, SL = swing level)
 from __future__ import annotations
 
 from typing import Any, Dict, List, Optional, Tuple
@@ -241,7 +241,7 @@ class KWINStrategy:
                         "active": True,
                         "confirmed": False,
                         "swing_prc": sw,
-                        "sfp_extreme": hi,  # SL
+                        "sfp_extreme": hi,  # записываем, но SL считаем от swing_prc
                         "oppos_prc": sw,
                         "created_bars_ago": 0,
                         "created_ts": int(curr.get("timestamp") or 0),
@@ -265,7 +265,7 @@ class KWINStrategy:
                         "active": True,
                         "confirmed": False,
                         "swing_prc": sw,
-                        "sfp_extreme": lo,  # SL
+                        "sfp_extreme": lo,  # записываем, но SL считаем от swing_prc
                         "oppos_prc": sw,
                         "created_bars_ago": 0,
                         "created_ts": int(curr.get("timestamp") or 0),
@@ -288,7 +288,8 @@ class KWINStrategy:
             if cl < oppos:
                 tick = float(self.tick_size or 0.01)
                 buf_ticks = int(getattr(self.config, "sl_buf_ticks", 0) or 0)
-                sl = ceil_to_tick(float(self._active_bear["sfp_extreme"]) + buf_ticks * tick, tick)
+                # ⬇️ SL от swing, а не от экстремума SFP-свечи
+                sl = ceil_to_tick(float(self._active_bear["swing_prc"]) + buf_ticks * tick, tick)
                 if self.can_enter_short:
                     self._log("info", f"Confirm SFP-bear @close={cl:.6f} → ENTRY short SL={sl:.6f}")
                     self._process_short_entry(entry_override=cl, sl_override=sl)
@@ -311,7 +312,8 @@ class KWINStrategy:
             if cl > oppos:
                 tick = float(self.tick_size or 0.01)
                 buf_ticks = int(getattr(self.config, "sl_buf_ticks", 0) or 0)
-                sl = floor_to_tick(float(self._active_bull["sfp_extreme"]) - buf_ticks * tick, tick)
+                # ⬇️ SL от swing, а не от экстремума SFP-свечи
+                sl = floor_to_tick(float(self._active_bull["swing_prc"]) - buf_ticks * tick, tick)
                 if self.can_enter_long:
                     self._log("info", f"Confirm SFP-bull @close={cl:.6f} → ENTRY long SL={sl:.6f}")
                     self._process_long_entry(entry_override=cl, sl_override=sl)
