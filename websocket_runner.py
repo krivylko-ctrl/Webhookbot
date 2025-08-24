@@ -32,14 +32,23 @@ log = logging.getLogger("BybitWS")
 
 # -------------------- НАСТРОЙКИ --------------------
 BYBIT_TESTNET = os.getenv("BYBIT_TESTNET", "false").lower() not in ("0", "false", "no")
+WS_CATEGORY   = os.getenv("WS_CATEGORY", "linear").strip().lower()  # linear|inverse|spot|option
+
 # Список символов/ТФ из ENV, по умолчанию ETH/BTC на 15м + трейды
 SYMBOLS = [s.strip().upper() for s in os.getenv("WS_SYMBOLS", "ETHUSDT,BTCUSDT").split(",") if s.strip()]
-KL_TFS  = [tf.strip() for tf in os.getenv("WS_TFS", "15").split(",") if tf.strip()]  # в минутах, напр. "1,15"
+KL_TFS  = [tf.strip() for tf in os.getenv("WS_TFS", "15").split(",") if tf.strip()]  # "1,15" и т.п.
+
 SAVE_CSV = os.getenv("WS_SAVE_CSV", "true").lower() not in ("0", "false", "no")
 DATA_DIR = os.getenv("WS_DATA_DIR", "data")
 
-URL = "wss://stream-testnet.bybit.com/v5/public/linear" if BYBIT_TESTNET \
-      else "wss://stream.bybit.com/v5/public/linear"
+if WS_CATEGORY not in ("linear", "inverse", "spot", "option"):
+    WS_CATEGORY = "linear"
+
+URL = (
+    f"wss://stream-testnet.bybit.com/v5/public/{WS_CATEGORY}"
+    if BYBIT_TESTNET
+    else f"wss://stream.bybit.com/v5/public/{WS_CATEGORY}"
+)
 
 PING_INTERVAL_S = 20
 READ_TIMEOUT_S  = 60
@@ -61,9 +70,12 @@ class KlineBar:
     confirm: bool
 
 
+# общий лок на запись CSV (чтобы несколько задач не писали одновременно)
+_csv_lock = asyncio.Lock()
+
+
 def _to_float(x, default=0.0) -> float:
     try:
-        # bybit шлёт числа строками
         return float(x)
     except Exception:
         return float(default)
@@ -99,17 +111,13 @@ async def _append_bar_to_csv(bar: KlineBar):
         return
     path = _csv_path(bar.symbol, bar.interval)
     line = f"{bar.start_ms},{bar.open},{bar.high},{bar.low},{bar.close},{bar.volume}\n"
-    loop = asyncio.get_running_loop()
-    # неблокирующая запись
-    await loop.run_in_executor(None, _append_line_sync, path, line)
-
-
-def _append_line_sync(path: str, line: str):
-    first = not os.path.exists(path)
-    with open(path, "a", encoding="utf-8") as f:
-        if first:
-            f.write("timestamp,open,high,low,close,volume\n")
-        f.write(line)
+    async with _csv_lock:
+        first = not os.path.exists(path)
+        # запись синхронная, но под асинхронным локом (пишем быстро, проблем не будет)
+        with open(path, "a", encoding="utf-8") as f:
+            if first:
+                f.write("timestamp,open,high,low,close,volume\n")
+            f.write(line)
 
 
 class BybitWebSocket:
@@ -167,7 +175,7 @@ class BybitWebSocket:
         for s in self.symbols:
             for tf in self.tfs:
                 args.append(f"kline.{tf}.{s}")
-            # трейды необязательны — полезны для отладки
+            # трейды — полезно для отладки, оставляем
             args.append(f"publicTrade.{s}")
         self._subscribed_args = args
         await self._send_json({"op": "subscribe", "args": args})
@@ -187,7 +195,7 @@ class BybitWebSocket:
             try:
                 await self._send_json({"op": "ping"})
             except Exception:
-                # пусть упадёт в listen и реконнектнется
+                # упадём в listen и реконнектнёмся
                 return
             await asyncio.sleep(PING_INTERVAL_S)
 
@@ -203,8 +211,7 @@ class BybitWebSocket:
             try:
                 msg = await asyncio.wait_for(self.ws.recv(), timeout=READ_TIMEOUT_S)
             except asyncio.TimeoutError:
-                log.warning("Таймаут чтения — пингуем заново")
-                # дёрнем пинг сразу, пусть heartbeat продолжит
+                log.warning("Таймаут чтения — отправляем ping")
                 try:
                     await self._send_json({"op": "ping"})
                 except Exception:
@@ -223,7 +230,7 @@ class BybitWebSocket:
             await self._dispatch(data)
 
     async def _dispatch(self, data: Dict):
-        # ответы на ping/pong/subscribe
+        # сервисные ответы
         if data.get("op") in ("pong",) or "success" in data:
             log.debug(f"Svc msg: {data}")
             return
@@ -243,38 +250,49 @@ class BybitWebSocket:
             log.debug(f"Неизвестный topic: {topic}")
 
     async def _on_kline(self, tf: Optional[str], symbol: Optional[str], data: Dict):
+        """
+        Обработка kline:
+        - Bybit может прислать массив из нескольких элементов; проходимся по всем
+        - confirm=True → закрытый бар → лог/CSV
+        - интервал/символ берём из topic; если их нет, используем payload-поля
+        """
         try:
             arr = data.get("data") or []
             if not arr:
                 return
-            k = arr[0]  # bybit шлёт по одному объекту
 
-            # confirm=True → бар ЗАКРЫТ
-            confirm = bool(k.get("confirm", False))
-            # поля по спецификации v5 (строки → float)
-            bar = KlineBar(
-                symbol=symbol or str(k.get("symbol") or ""),
-                interval=str(tf or k.get("interval") or "15"),
-                start_ms=int(k.get("start", 0)),
-                end_ms=int(k["end"]) if k.get("end") not in (None, "") else None,
-                open=_to_float(k.get("open")),
-                high=_to_float(k.get("high")),
-                low=_to_float(k.get("low")),
-                close=_to_float(k.get("close")),
-                volume=_to_float(k.get("volume")),
-                turnover=_to_float(k.get("turnover")),
-                confirm=confirm,
-            )
+            for k in arr:
+                confirm = bool(k.get("confirm", False))
+                # предпочитаем значения из topic
+                tf_eff = str(tf or k.get("interval") or "15")
+                sym_eff = symbol or str(k.get("symbol") or "")
+                start_ms = int(k.get("start") or k.get("t") or 0)
+                end_ms = int(k["end"]) if k.get("end") not in (None, "") else None
 
-            # Только закрытые бары пишем/логируем — это важно для бэктеста
-            if bar.confirm:
-                ts = _dt_utc_from_ms(bar.start_ms).isoformat()
-                log.info(
-                    f"[{bar.symbol} {bar.interval}m] close @ {ts}  O={bar.open} H={bar.high} L={bar.low} C={bar.close} V={bar.volume}"
+                bar = KlineBar(
+                    symbol=sym_eff,
+                    interval=tf_eff,
+                    start_ms=start_ms,
+                    end_ms=end_ms,
+                    open=_to_float(k.get("open") or k.get("o")),
+                    high=_to_float(k.get("high") or k.get("h")),
+                    low=_to_float(k.get("low") or k.get("l")),
+                    close=_to_float(k.get("close") or k.get("c")),
+                    volume=_to_float(k.get("volume") or k.get("v")),
+                    turnover=_to_float(k.get("turnover") or k.get("tv")),
+                    confirm=confirm,
                 )
-                await _append_bar_to_csv(bar)
-            else:
-                log.debug(f"[{bar.symbol} {bar.interval}m] промежуточный бар (confirm=False)")
+
+                # Только закрытые бары — строгое соответствие Pine/TV
+                if bar.confirm and bar.start_ms:
+                    ts = _dt_utc_from_ms(bar.start_ms).isoformat()
+                    log.info(
+                        f"[{bar.symbol} {bar.interval}m] close @ {ts}  "
+                        f"O={bar.open} H={bar.high} L={bar.low} C={bar.close} V={bar.volume}"
+                    )
+                    await _append_bar_to_csv(bar)
+                else:
+                    log.debug(f"[{bar.symbol or 'UNKNOWN'} {bar.interval}m] промежуточный (confirm={bar.confirm})")
 
         except Exception as e:
             log.error(f"Ошибка kline: {e}")
@@ -294,7 +312,7 @@ class BybitWebSocket:
 
 # -------------------- MAIN --------------------
 async def main():
-    # Список подписок
+    # Список подписок (для логов)
     subs = []
     for s in SYMBOLS:
         for tf in KL_TFS:
