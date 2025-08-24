@@ -560,6 +560,7 @@ if submitted:
         if not eq:
             st.info("Нет истории equity."); return
         df = pd.DataFrame(eq)
+        # в историю мы пишем ISO (UTC-naive). Для коррекции на всякий — parse с utc и убираем tz.
         df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce", utc=True).dt.tz_convert(None)
         fig = go.Figure()
         fig.add_trace(go.Scatter(x=df["timestamp"], y=df["equity"], mode="lines", name="Equity"))
