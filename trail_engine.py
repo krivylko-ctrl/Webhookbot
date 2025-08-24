@@ -1,5 +1,7 @@
 # trail_engine.py
-from typing import Dict, Optional
+from __future__ import annotations
+
+from typing import Dict, Optional, Any
 
 from config import Config
 from state_manager import StateManager
@@ -13,8 +15,8 @@ try:
 except Exception:  # fallback no-op
     class TrailingLogger:  # noqa: D401
         """No-op logger if analytics.TrailingLogger is absent."""
-        def log_trail_movement(self, *args, **kwargs):  # noqa: D401
-            pass
+        def __init__(self, *args, **kwargs) -> None: ...
+        def log_trail_movement(self, *args, **kwargs) -> None: ...
 
 
 class TrailEngine:
@@ -29,7 +31,7 @@ class TrailEngine:
       - process_trailing(position, current_price)
     """
 
-    def __init__(self, config: Config, state_manager: StateManager, bybit_api):
+    def __init__(self, config: Config, state_manager: StateManager, bybit_api: Any = None):
         self.config = config
         self.state = state_manager
         self.api = bybit_api
@@ -80,8 +82,9 @@ class TrailEngine:
                 if risk > 0:
                     basis = (getattr(self.config, "arm_rr_basis", "extremum") or "extremum").lower()
                     anchor = float(position.get("trail_anchor") or self._last_anchor_long or entry)
+                    # экстремум внутри текущего бара
                     if current_price > anchor:
-                        anchor = current_price  # экстремум внутри бара
+                        anchor = current_price
                     rr_now = (anchor - entry) / risk if basis == "extremum" else (current_price - entry) / risk
                     need = float(getattr(self.config, "arm_rr", 0.5))
                     if rr_now >= need:
