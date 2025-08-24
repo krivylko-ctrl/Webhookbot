@@ -96,11 +96,11 @@ class KWINStrategy:
                 self.db.save_log(level, msg, module="KWINStrategy")
         except Exception:
             pass
-        # на всякий случай в консоль
         print(f"[{level.upper()}] {msg}")
 
     # ============ ВСПОМОГАТЕЛЬНОЕ ============
     def _align_15m_ms(self, ts_ms: int) -> int:
+        """Возвращает НАЧАЛО 15-минутного бара (timestamp округлён вниз)."""
         return (int(ts_ms) // 900_000) * 900_000
 
     def _ensure_desc(self, arr: List[Dict], key: str = "timestamp"):
@@ -133,8 +133,12 @@ class KWINStrategy:
 
     # ---------- Lux helpers ----------
     def _bar_window_ms(self, bar_ts_ms: int) -> Tuple[int, int]:
-        end_ms = self._align_15m_ms(bar_ts_ms)  # close aligned
-        start_ms = end_ms - 900_000 + 1
+        """
+        Окно текущего 15m бара (start..end), если ts — его start.
+        Если твой источник даёт ts=close — формула всё равно корректна.
+        """
+        start_ms = self._align_15m_ms(bar_ts_ms)
+        end_ms = start_ms + 900_000 - 1
         return start_ms, end_ms
 
     def _ltf_slices_for_bar(self, bar_ts_ms: int) -> List[Dict]:
@@ -182,22 +186,31 @@ class KWINStrategy:
             self._log("debug", f"LTF-volume reject [{direction}] pct={pct:.2f}% thr={thr:.2f}%")
         return ok
 
-    # ---------- Пивоты ----------
-    def _pivot_low_value(self, left: int, right: int = 1) -> Optional[float]:
-        n = int(left) + int(right) + 1
-        if len(self.candles_15m) < n:
+    # ---------- Пивоты (FIXED) ----------
+    def _pivot_low_value(self, left: int, _right_ignored: int = 1) -> Optional[float]:
+        """
+        Пивот-LOW на баре [1]: low[1] должен быть минимумом среди { low[1], low[2..(1+left)] }.
+        Не требуем «будущих» баров, чтобы не задерживать сигнал.
+        """
+        L = int(left)
+        need = 1 + L  # центр + L более старых
+        if len(self.candles_15m) < (need + 1):  # +1, т.к. массив начинается с [0]
             return None
-        lows = [float(self.candles_15m[i]["low"]) for i in range(0, n)]
-        center = lows[int(right)]
-        return center if center == min(lows) else None
+        center = float(self.candles_15m[1]["low"])
+        older = [float(self.candles_15m[i]["low"]) for i in range(2, 2 + L)]
+        return center if center <= min([center] + older) else None
 
-    def _pivot_high_value(self, left: int, right: int = 1) -> Optional[float]:
-        n = int(left) + int(right) + 1
-        if len(self.candles_15m) < n:
+    def _pivot_high_value(self, left: int, _right_ignored: int = 1) -> Optional[float]:
+        """
+        Пивот-HIGH на баре [1]: high[1] должен быть максимумом среди { high[1], high[2..(1+left)] }.
+        """
+        L = int(left)
+        need = 1 + L
+        if len(self.candles_15m) < (need + 1):
             return None
-        highs = [float(self.candles_15m[i]["high"]) for i in range(0, n)]
-        center = highs[int(right)]
-        return center if center == max(highs) else None
+        center = float(self.candles_15m[1]["high"])
+        older = [float(self.candles_15m[i]["high"]) for i in range(2, 2 + L)]
+        return center if center >= max([center] + older) else None
 
     # ---------- Lux SFP flow ----------
     def _lux_find_new_sfp(self) -> None:
@@ -207,7 +220,7 @@ class KWINStrategy:
             return
 
         curr = self.candles_15m[0]
-        prev1 = self.candles_15m[1]  # центр пивота (right=1) — это [1]!
+        prev1 = self.candles_15m[1]  # центр пивота — это [1]
         tick = float(self.tick_size or 0.01)
 
         # Bearish SFP (pivot-high = high[1])
@@ -215,9 +228,8 @@ class KWINStrategy:
             sw = float(prev1["high"])
             hi = float(curr["high"])
             cl = float(curr["close"])
-            # Lux-условие: hi > swing и close < swing (open НЕ требуем)
+            # Lux: hi > swing и close < swing
             if hi > sw and cl < sw:
-                # Доп. фильтр wick глубины, если включён
                 if bool(getattr(self.config, "use_sfp_quality", False)):
                     min_ticks = int(getattr(self.config, "wick_min_ticks", 0) or 0)
                     wick_ticks = max(0.0, (hi - sw) / tick)
@@ -230,7 +242,7 @@ class KWINStrategy:
                         "confirmed": False,
                         "swing_prc": sw,
                         "sfp_extreme": hi,  # SL
-                        "oppos_prc": sw,    # right=1 => oppos = swing
+                        "oppos_prc": sw,
                         "created_bars_ago": 0,
                         "created_ts": int(curr.get("timestamp") or 0),
                     }
@@ -325,14 +337,14 @@ class KWINStrategy:
             bar_ts = int(candle.get("timestamp") or candle.get("open_time") or 0)
             if bar_ts and bar_ts < 1_000_000_000_000:
                 bar_ts *= 1000
-            aligned = self._align_15m_ms(bar_ts)
-            if aligned == self.last_processed_bar_ts:
+            aligned_start = self._align_15m_ms(bar_ts)
+            if aligned_start == self.last_processed_bar_ts:
                 return
 
-            self.last_processed_bar_ts = aligned
+            self.last_processed_bar_ts = aligned_start
             self.can_enter_long = True
             self.can_enter_short = True
-            self._log("debug", f"15m close @ts={aligned}")
+            self._log("debug", f"15m close @ts(start)={aligned_start}")
             self.run_cycle()
         except Exception as e:
             self._log("error", f"on_bar_close_15m: {e}")
