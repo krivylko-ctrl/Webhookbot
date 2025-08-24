@@ -155,7 +155,8 @@ def init_components():
         except Exception:
             pass
 
-    strategy = KWINStrategy(cfg, bybit_api, state, db)
+    # именованные аргументы — строго совместимо с сигнатурой KWINStrategy
+    strategy = KWINStrategy(cfg, api=bybit_api, state_manager=state, db=db)
 
     # Лёгкий старт: подтянуть свечи один раз (если API есть)
     try:
@@ -309,7 +310,8 @@ def main():
     if equity_data:
         df_eq = pd.DataFrame(equity_data)
         if "timestamp" in df_eq.columns:
-            df_eq["timestamp"] = pd.to_datetime(df_eq["timestamp"], errors="coerce")
+            # приводим к naive UTC для единообразия отображения
+            df_eq["timestamp"] = pd.to_datetime(df_eq["timestamp"], errors="coerce", utc=True).dt.tz_convert(None)
         fig = go.Figure()
         fig.add_trace(go.Scatter(x=df_eq.get("timestamp"), y=df_eq.get("equity"), mode="lines", name="Equity"))
         fig.update_layout(height=380, xaxis_title="Дата", yaxis_title="Equity ($)")
