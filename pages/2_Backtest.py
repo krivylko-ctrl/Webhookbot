@@ -302,15 +302,35 @@ def run_backtest(symbol: str,
 
     m15 = data15.m15.reset_index(drop=True)
 
-    # основной цикл по закрытым 15m барам
+    # ======== ОСНОВНОЙ ЦИКЛ ========
+    # ВАЖНО: для Lux-валидации 15м-свечи сначала нужно прогнать LTF внутри ЭТОГО бара (t_prev..t_curr),
+    # затем закрыть 15м-бар, затем уже идти в LTF следующего окна (t_curr..t_next) для трейла/выходов.
     intrabar_tf = str(getattr(cfg, "intrabar_tf", "1"))
-    for i in range(0, len(m15) - 1):
-        bar = m15.iloc[i].to_dict()
+
+    # начинаем с i = 1, чтобы иметь t_prev
+    for i in range(1, len(m15) - 1):
+        prev_bar = m15.iloc[i - 1].to_dict()
+        bar      = m15.iloc[i].to_dict()
+        next_bar = m15.iloc[i + 1].to_dict()
+
+        t_prev = int(prev_bar["timestamp"])
         t_curr = int(bar["timestamp"])
-        t_next = int(m15.iloc[i + 1]["timestamp"])
+        t_next = int(next_bar["timestamp"])
 
+        # 0) LTF внутри текущего закрывающегося 15m бара (для Lux-валидации)
+        m1_inside = iter_m1_between_by_day(broker, symbol, intrabar_tf, t_prev, t_curr)
+        for m1 in m1_inside:
+            broker.set_current_price(symbol, float(m1["close"]))
+            strat.on_bar_close_1m({
+                "timestamp": int(m1["timestamp"]),
+                "open":  float(m1["open"]),
+                "high":  float(m1["high"]),
+                "low":   float(m1["low"]),
+                "close": float(m1["close"]),
+            })
+
+        # 1) Закрываем 15m бар (после того как внутренняя LTF-структура уже «сведена»)
         broker.set_current_price(symbol, float(bar["close"]))
-
         strat.on_bar_close_15m({
             "timestamp": t_curr,
             "open":  float(bar["open"]),
@@ -319,8 +339,9 @@ def run_backtest(symbol: str,
             "close": float(bar["close"]),
         })
 
-        m1_set = iter_m1_between_by_day(broker, symbol, intrabar_tf, t_curr, t_next)
-        for m1 in m1_set:
+        # 2) LTF между текущим и следующим 15m (для трейлинга/выходов)
+        m1_after = iter_m1_between_by_day(broker, symbol, intrabar_tf, t_curr, t_next)
+        for m1 in m1_after:
             broker.set_current_price(symbol, float(m1["close"]))
             strat.on_bar_close_1m({
                 "timestamp": int(m1["timestamp"]),
@@ -331,6 +352,7 @@ def run_backtest(symbol: str,
             })
             simulate_exits_on_m1(state, db, cfg, m1)
 
+    # Закрытие последней открытой позиции по последнему close
     pos = state.get_current_position()
     if pos and pos.get("status") == "open":
         last_close = float(m15.iloc[-1]["close"])
@@ -560,7 +582,7 @@ if submitted:
         if not eq:
             st.info("Нет истории equity."); return
         df = pd.DataFrame(eq)
-        # в историю мы пишем ISO (UTC-naive). Для коррекции на всякий — parse с utc и убираем tz.
+        # приводим к naive UTC для единообразия отображения
         df["timestamp"] = pd.to_datetime(df["timestamp"], errors="coerce", utc=True).dt.tz_convert(None)
         fig = go.Figure()
         fig.add_trace(go.Scatter(x=df["timestamp"], y=df["equity"], mode="lines", name="Equity"))
