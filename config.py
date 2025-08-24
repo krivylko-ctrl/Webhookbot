@@ -80,7 +80,8 @@ class Config:
         self.lux_mode                   = env("LUX_MODE", "true").lower() not in ("0","false","no")
         self.lux_swings                 = int(env("LUX_SWINGS", "2"))
         # "outside_gt" | "outside_lt" | "none"
-        self.lux_volume_validation      = env("LUX_VOLUME_VALIDATION", "none").lower()
+        # дефолт приведён к 'outside_gt' для консистентности с бэктестом/WS
+        self.lux_volume_validation      = env("LUX_VOLUME_VALIDATION", "outside_gt").lower()
         self.lux_volume_threshold_pct   = float(env("LUX_VOLUME_THRESHOLD_PCT", "10.0"))
         self.lux_auto                   = env("LUX_AUTO", "false").lower() not in ("0","false","no")
         self.lux_mlt                    = int(env("LUX_MLT", "10"))
@@ -255,9 +256,9 @@ class Config:
             self.intrabar_tf = "1"
 
         # ---- Lux поля ----
-        self.lux_volume_validation = (self.lux_volume_validation or "none").lower()
+        self.lux_volume_validation = (self.lux_volume_validation or "outside_gt").lower()
         if self.lux_volume_validation not in ("outside_gt", "outside_lt", "none"):
-            self.lux_volume_validation = "none"
+            self.lux_volume_validation = "outside_gt"
 
         try:
             self.lux_volume_threshold_pct = max(0.0, min(100.0, float(self.lux_volume_threshold_pct)))
