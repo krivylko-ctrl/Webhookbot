@@ -950,6 +950,42 @@ class KWINStrategy:
             pass
         return float(current_price), float(current_price)
 
+    # >>> ДОБАВЛЕНО: корректное обновление SL (используется Smart/Bar-трейлингом)
+    def _update_stop_loss(self, position: Dict, new_sl: float):
+        try:
+            direction = str(position.get("direction"))
+            old_sl = float(position.get("stop_loss") or 0.0)
+
+            # Квантование в сторону "ужесточения"
+            if direction == "long":
+                candidate = floor_to_tick(float(new_sl), self.tick_size)
+                if candidate <= old_sl:
+                    return
+            else:
+                candidate = ceil_to_tick(float(new_sl), self.tick_size)
+                if candidate >= old_sl:
+                    return
+
+            api_updated = False
+            if self.api:
+                try:
+                    # популярные методы обновления стопа в API-обёртках
+                    if hasattr(self.api, "update_stop_loss"):
+                        self.api.update_stop_loss(self.symbol, stop_loss=candidate)
+                        api_updated = True
+                    elif hasattr(self.api, "set_trading_stop"):
+                        self.api.set_trading_stop(self.symbol, stop_loss=candidate)
+                        api_updated = True
+                except Exception as e:
+                    self._log("warn", f"API SL update failed: {e}")
+
+            position["stop_loss"] = float(candidate)
+            if self.state:
+                self.state.set_position(position)
+            self._log("info", f"[TRAIL MOVE] SL {old_sl:.6f} -> {candidate:.6f}{' (api)' if api_updated else ''}")
+        except Exception as e:
+            self._log("error", f"_update_stop_loss: {e}")
+
     def _bar_trail_update(self, position: Dict):
         """Баровый трейл включается ПОСЛЕ ARM. Всегда стремимся к более “тугому” стопу."""
         if not self.use_bar_trail or self.trail_lookback <= 0:
@@ -1150,6 +1186,73 @@ class KWINStrategy:
                         self._update_smart_trailing(pos)
         except Exception as e:
             self._log("error", f"update_candles: {e}")
+
+    # >>> ДОБАВЛЕНО: служебные визуал-хелперы Lux SFP (лог/совместимость с Pine), вызываются в run_cycle()
+    def _lux_find_new_sfp(self):
+        try:
+            L = int(self.lux_swings)
+            if len(self.candles_15m) < L + 2:
+                return
+            cur15 = self.candles_15m[0]
+            prev1 = self.candles_15m[1]
+            op15, cl15, hi15, lo15 = map(float, (cur15["open"], cur15["close"], cur15["high"], cur15["low"]))
+
+            ph15 = self._pivot_high_value(L, 1)
+            pl15 = self._pivot_low_value (L, 1)
+
+            sid_prev_ts = int(prev1.get("timestamp") or 0)
+
+            new_bear = None
+            new_bull = None
+
+            if ph15 is not None and len(self.candles_15m) > L:
+                swH_val = float(self.candles_15m[L]["high"])
+                if hi15 > swH_val and op15 < swH_val and cl15 < swH_val:
+                    new_bear = {
+                        "sid_15m": sid_prev_ts,
+                        "swing": swH_val,
+                        "ts_bar": int(cur15.get("timestamp") or 0),
+                        "created_index": int(self._bar_index_15m),
+                        "expire_after": int(self.lux_expire_bars),
+                        "source": "15m",
+                    }
+
+            if pl15 is not None and len(self.candles_15m) > L:
+                swL_val = float(self.candles_15m[L]["low"])
+                if lo15 < swL_val and op15 > swL_val and cl15 > swL_val:
+                    new_bull = {
+                        "sid_15m": sid_prev_ts,
+                        "swing": swL_val,
+                        "ts_bar": int(cur15.get("timestamp") or 0),
+                        "created_index": int(self._bar_index_15m),
+                        "expire_after": int(self.lux_expire_bars),
+                        "source": "15m",
+                    }
+
+            if new_bear:
+                self._active_bear = new_bear
+            if new_bull:
+                self._active_bull = new_bull
+        except Exception as e:
+            self._log("error", f"_lux_find_new_sfp: {e}")
+
+    def _lux_update_active(self):
+        try:
+            idx = int(self._bar_index_15m)
+
+            def alive(ctx: Optional[Dict]) -> bool:
+                if not ctx:
+                    return False
+                created = int(ctx.get("created_index", idx))
+                exp = int(ctx.get("expire_after", self.lux_expire_bars))
+                return (idx - created) <= exp
+
+            if not alive(self._active_bear):
+                self._active_bear = None
+            if not alive(self._active_bull):
+                self._active_bull = None
+        except Exception as e:
+            self._log("error", f"_lux_update_active: {e}")
 
     def run_cycle(self):
         """15m логика входа (немедленно на закрытии окна) + подтяжка трейла."""
