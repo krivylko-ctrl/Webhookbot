@@ -5,7 +5,11 @@ from typing import Dict, Optional, Any
 from datetime import datetime, timezone
 from threading import RLock
 
-from database import Database
+try:
+    # тип только для аннотаций; сам модуль может отсутствовать при раннем импорте
+    from database import Database  # type: ignore
+except Exception:
+    Database = None  # type: ignore
 
 
 class StateManager:
@@ -13,37 +17,68 @@ class StateManager:
     Потокобезопасный стор состояния бота.
     Хранит:
       • equity
-      • текущую позицию (direction, quantity/size, entry_price, stop_loss, take_profit,
+      • текущую позицию (direction, size/quantity, entry_price, stop_loss, take_profit,
         armed, trail_anchor, entry_time_ts, status)
       • статус бота
-      • last_close_time_ms — метка времени (UTC, мс) последнего закрытия позиции (для кулдауна)
-    Состояние периодически/при изменениях сохраняется в БД через Database.save_bot_state().
+      • last_close_time_ms — UTC (мс) последнего закрытия
+    Состояние по возможности сохраняется в БД (merge с существующим bot_state).
     """
 
-    def __init__(self, db: Database, taker_fee_rate: float = 0.00055):
-        self.db = db
+    def __init__(
+        self,
+        db: Optional["Database"] = None,
+        taker_fee_rate: float = 0.00055,
+        initial_equity: float = 300.0,
+    ):
+        self.db: Optional["Database"] = db
         self._lock = RLock()
 
-        self._equity: float = 100.0
+        self._equity: float = float(initial_equity)
         self._bot_status: str = "stopped"
         self._current_position: Optional[Dict[str, Any]] = None
         self._last_close_time_ms: Optional[int] = None  # для кулдауна входов
 
-        # комиссия биржи (используем такую же, как и database.update_trade_exit)
+        # комиссия биржи (должна совпадать с database.update_trade_exit / стратегией)
         self._fee_rate: float = float(taker_fee_rate)
 
         self._load_state()
 
+    # ----------------- DB attach/detach -----------------
+
+    def attach_db(self, db: "Database") -> None:
+        """Поздняя привязка БД (совместимо с текущим вебсокет-раннером)."""
+        self.db = db
+        # после привязки попробуем дозагрузить прошлое состояние
+        self._load_state()
+
     # ----------------- Persist -----------------
 
+    def _merge_and_save_state(self, payload: Dict[str, Any]) -> None:
+        """Сливаем с текущим bot_state и сохраняем (не перетираем поля раннера)."""
+        if not self.db:
+            return
+        try:
+            existing = self.db.get_bot_state() or {}
+        except Exception:
+            existing = {}
+        merged = dict(existing)
+        merged.update(payload)
+        try:
+            self.db.save_bot_state(merged)
+        except Exception as e:
+            print(f"[StateManager] Error saving state: {e}")
+
     def _load_state(self) -> None:
-        """Загрузка сохранённого состояния из БД."""
+        """Загрузка сохранённого состояния из БД (если доступна)."""
+        if not self.db:
+            return
         try:
             state = self.db.get_bot_state() or {}
             with self._lock:
-                self._current_position = state.get("position") or None
-                self._equity = float(state.get("equity", 100.0))
-                self._bot_status = str(state.get("status", "stopped"))
+                pos = state.get("position") or None
+                self._current_position = dict(pos) if isinstance(pos, dict) else None
+                self._equity = float(state.get("equity", self._equity))
+                self._bot_status = str(state.get("status", self._bot_status))
                 lct = state.get("last_close_time_ms") or state.get("last_close_time")
                 if lct is not None:
                     try:
@@ -54,19 +89,15 @@ class StateManager:
             print(f"[StateManager] Error loading state: {e}")
 
     def _save_state(self) -> None:
-        """Сохранение текущего состояния в БД."""
-        try:
-            with self._lock:
-                payload = {
-                    "position": self._current_position,
-                    "equity": float(self._equity),
-                    "status": self._bot_status,
-                    "last_close_time_ms": int(self._last_close_time_ms) if self._last_close_time_ms else None,
-                    "updated_at": datetime.utcnow().replace(microsecond=0).isoformat(),
-                }
-            self.db.save_bot_state(payload)
-        except Exception as e:
-            print(f"[StateManager] Error saving state: {e}")
+        """Сохранение текущего состояния (merge)."""
+        payload = {
+            "position": self.get_current_position(),
+            "equity": float(self.get_equity()),
+            "status": self.get_bot_status(),
+            "last_close_time_ms": self.get_last_close_time(),
+            "updated_at": datetime.utcnow().replace(microsecond=0).isoformat(),
+        }
+        self._merge_and_save_state(payload)
 
     # ----------------- Equity -----------------
 
@@ -107,7 +138,18 @@ class StateManager:
                 # Дефолты/нормализация
                 pos.setdefault("status", "open")
                 pos.setdefault("armed", False)
-                pos.setdefault("entry_time_ts", int(datetime.utcnow().timestamp() * 1000))
+                # таймстемп — всегда в мс
+                ets = pos.get("entry_time_ts")
+                if ets is None:
+                    ets = int(datetime.utcnow().timestamp() * 1000)
+                try:
+                    ets = int(ets)
+                except Exception:
+                    ets = int(datetime.utcnow().timestamp() * 1000)
+                if ets < 1_000_000_000_000:  # сек → мс
+                    ets *= 1000
+                pos["entry_time_ts"] = ets
+
                 if pos.get("trail_anchor") is None:
                     pos["trail_anchor"] = pos.get("entry_price")
 
@@ -123,8 +165,8 @@ class StateManager:
                     except Exception:
                         pos["size"] = pos["quantity"]
 
-                # Числовые поля (на всякий)
-                for k in ("entry_price", "stop_loss", "take_profit"):
+                # Числовые поля
+                for k in ("entry_price", "stop_loss", "take_profit", "trail_anchor"):
                     if k in pos and pos[k] is not None:
                         try:
                             pos[k] = float(pos[k])
@@ -139,7 +181,7 @@ class StateManager:
             self._current_position = None
         self._save_state()
 
-    # Удобные апдейтеры — используются TrailEngine/стратегией
+    # Удобные апдейтеры — используются трейлом/стратегией/GUI
     def update_position_stop_loss(self, new_sl: float) -> None:
         with self._lock:
             if self._current_position:
@@ -169,15 +211,14 @@ class StateManager:
     def close_position(self, exit_price: float, exit_reason: str = "manual") -> None:
         """
         Закрыть текущую позицию и синхронизировать это с БД.
-        Net PnL считаем локально (как в Database.update_trade_exit) и прибавляем к equity.
-        Затем обновляем запись сделки в БД (она посчитает то же самое).
-        После закрытия — проставляем last_close_time_ms (UTC now, мс) и чистим локальную позицию.
+        Считаем локальный net PnL (как database.update_trade_exit), прибавляем к equity,
+        шлём апдейт в БД (если подключена), проставляем last_close_time_ms и чистим локальную позицию.
         """
         pos = self.get_current_position()
         if not pos:
             return
 
-        # --- 1) Локальный net PnL (без ожидания чтения из БД)
+        # --- 1) Локальный net PnL
         try:
             entry = float(pos.get("entry_price") or 0.0)
             qty   = float(pos.get("size") or pos.get("quantity") or 0.0)
@@ -194,21 +235,22 @@ class StateManager:
         except Exception as e:
             print(f"[StateManager] Error computing local PnL: {e}")
 
-        # --- 2) Обновляем сделку в БД (БД тоже посчитает net PnL, что ок)
-        try:
-            self.db.update_trade_exit(
-                {
-                    "exit_price": float(exit_price),
-                    "exit_time": datetime.utcnow(),
-                    "exit_reason": exit_reason,
-                    "status": "closed",
-                },
-                fee_rate=self._fee_rate,
-            )
-        except Exception as e:
-            print(f"[StateManager] Error closing trade in DB: {e}")
+        # --- 2) Обновляем сделку в БД
+        if self.db:
+            try:
+                self.db.update_trade_exit(
+                    {
+                        "exit_price": float(exit_price),
+                        "exit_time": datetime.utcnow(),
+                        "exit_reason": exit_reason,
+                        "status": "closed",
+                    },
+                    fee_rate=self._fee_rate,
+                )
+            except Exception as e:
+                print(f"[StateManager] Error closing trade in DB: {e}")
 
-        # --- 3) Обновляем last_close_time_ms (UTC now → ms)
+        # --- 3) last_close_time_ms (UTC now → ms)
         try:
             now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
         except Exception:
