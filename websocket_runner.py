@@ -8,6 +8,7 @@ Bybit v5 WebSocket Runner для KWIN Trading Bot
 — Автоподдержка соединения (heartbeat + авто-реконнект, экспоненциальный бэкофф)
 — Нормализация типов, безопасные фолы
 — (Опционально) сохранение закрытых свечей в CSV
+— (НОВОЕ) Полная интеграция с database.py: фиксация сделок, equity-слепки уже делает стратегия, конфиг+состояние сохраняются
 """
 
 import asyncio
@@ -26,7 +27,13 @@ try:
 except Exception:
     requests = None
 
-# ---------- ЛОГИ ---------
+# >>> DB-HOOK: импорт БД
+try:
+    from database import Database
+except Exception:
+    Database = None
+
+# -------------------- ЛОГИ --------------------
 logging.basicConfig(
     level=getattr(logging, os.getenv("WS_LOG_LEVEL", "INFO").upper()),
     format="%(asctime)s | %(levelname)s | %(message)s",
@@ -76,11 +83,14 @@ KWIN = None
 KWIN_SYMBOL = None
 KWIN_INTRABAR_TF = None  # "1", "3", "5"...
 
+# >>> DB-HOOK: глобальная ссылка на БД для хуков
+DB_REF: Optional[Database] = None
+
 def _try_init_kwin():
     """Создаёт экземпляр KWINStrategy из локального проекта.
        Безопасно: если модулей нет — просто не включаем мост.
     """
-    global KWIN_ENABLED, KWIN, KWIN_SYMBOL, KWIN_INTRABAR_TF
+    global KWIN_ENABLED, KWIN, KWIN_SYMBOL, KWIN_INTRABAR_TF, DB_REF
     if not BRIDGE_TO_KWIN:
         log.info("KWIN bridge disabled by env (BRIDGE_TO_KWIN=false)")
         return
@@ -117,8 +127,20 @@ def _try_init_kwin():
             )
 
         from state_manager import StateManager
-        from database import Database
+        from database import Database as DBClass
         from kwin_strategy import KWINStrategy
+
+        # >>> DB-HOOK: инициализируем БД один раз
+        try:
+            DB_REF = DBClass(os.getenv("DB_DSN", "kwin_bot.db"))
+            # Сразу сохраним конфиг в таблицу config
+            try:
+                DB_REF.save_config(getattr(cfg, "__dict__", dict(cfg.__dict__)))
+            except Exception as e:
+                log.warning(f"Не удалось сохранить config в БД: {e!r}")
+        except Exception as e:
+            log.warning(f"Database init failed: {e!r}")
+            DB_REF = None
 
         api = None
         if EXECUTE_ORDERS:
@@ -135,16 +157,108 @@ def _try_init_kwin():
                 api = None
 
         st = StateManager()
-        db = Database(os.getenv("DB_DSN", ":memory:"))
-
-        KWIN = KWINStrategy(cfg, api=api, state_manager=st, db=db)
+        # >>> DB-HOOK: передаём БД в стратегию
+        KWIN = KWINStrategy(cfg, api=api, state_manager=st, db=DB_REF)
         KWIN_SYMBOL = str(getattr(cfg, "symbol", "ETHUSDT")).upper()
         KWIN_INTRABAR_TF = str(getattr(cfg, "intrabar_tf", "1")).strip()
         KWIN_ENABLED = True
         log.info(f"KWIN bridge enabled → symbol={KWIN_SYMBOL}, intrabar_tf={KWIN_INTRABAR_TF}")
+
+        # >>> DB-HOOK: навешиваем обёртки для записи сделок в БД
+        _install_db_hooks_for_trades()
+
     except Exception as e:
         log.warning(f"KWIN bridge init failed: {e!r}. Работаем без стратегии.")
         KWIN_ENABLED = False
+
+def _install_db_hooks_for_trades():
+    """Монки-патч стратегийных методов, чтобы автоматически писать сделки в БД.
+       — на Entry: создаём запись в trades
+       — на Exit/Stop: закрываем запись с расчётом net PnL (это делает database.py)
+    """
+    if not (KWIN_ENABLED and KWIN is not None and DB_REF is not None):
+        return
+
+    # Сохраняем оригиналы
+    orig_long = getattr(KWIN, "_process_long_entry", None)
+    orig_short = getattr(KWIN, "_process_short_entry", None)
+    orig_apply = getattr(KWIN, "_apply_realized_pnl", None)
+
+    if orig_long:
+        def _wrap_long(*args, **kwargs):
+            # состояние до
+            before = KWIN.state.get_current_position() if KWIN.state else None
+            res = orig_long(*args, **kwargs)
+            # состояние после — позиция открыта?
+            try:
+                after = KWIN.state.get_current_position() if KWIN.state else None
+                if (after and str(after.get("status")) == "open" and
+                        (not before or str(before.get("status")) != "open")):
+                    ts_ms = int(after.get("entry_time_ts") or 0)
+                    DB_REF.save_trade({
+                        "symbol": KWIN.symbol,
+                        "direction": "long",
+                        "entry_price": float(after.get("entry_price")),
+                        "stop_loss": float(after.get("stop_loss") or after.get("sl_calc")),
+                        "take_profit": float(after.get("take_profit") or 0.0),
+                        "quantity": float(after.get("size") or 0.0),
+                        "entry_time": ts_ms if ts_ms else datetime.utcnow(),
+                        "status": "open",
+                    })
+            except Exception as e:
+                try:
+                    DB_REF.save_log("error", f"DB save_trade failed (long): {e}", "WS")
+                except Exception:
+                    pass
+            return res
+        setattr(KWIN, "_process_long_entry", _wrap_long)
+
+    if orig_short:
+        def _wrap_short(*args, **kwargs):
+            before = KWIN.state.get_current_position() if KWIN.state else None
+            res = orig_short(*args, **kwargs)
+            try:
+                after = KWIN.state.get_current_position() if KWIN.state else None
+                if (after and str(after.get("status")) == "open" and
+                        (not before or str(before.get("status")) != "open")):
+                    ts_ms = int(after.get("entry_time_ts") or 0)
+                    DB_REF.save_trade({
+                        "symbol": KWIN.symbol,
+                        "direction": "short",
+                        "entry_price": float(after.get("entry_price")),
+                        "stop_loss": float(after.get("stop_loss") or after.get("sl_calc")),
+                        "take_profit": float(after.get("take_profit") or 0.0),
+                        "quantity": float(after.get("size") or 0.0),
+                        "entry_time": ts_ms if ts_ms else datetime.utcnow(),
+                        "status": "open",
+                    })
+            except Exception as e:
+                try:
+                    DB_REF.save_log("error", f"DB save_trade failed (short): {e}", "WS")
+                except Exception:
+                    pass
+            return res
+        setattr(KWIN, "_process_short_entry", _wrap_short)
+
+    if orig_apply:
+        def _wrap_apply(exit_price: float, reason: str = "close"):
+            # сначала стратегия пересчитает equity и закроет позицию в своём state
+            res = orig_apply(exit_price, reason=reason)
+            # затем в БД закрываем последнюю открытую
+            try:
+                DB_REF.update_trade_exit({
+                    "exit_price": float(exit_price),
+                    "exit_reason": str(reason),
+                    "status": "closed",
+                    "exit_time": datetime.utcnow(),
+                }, fee_rate=float(getattr(KWIN, "taker_fee_rate", 0.00055)))
+            except Exception as e:
+                try:
+                    DB_REF.save_log("error", f"DB update_trade_exit failed: {e}", "WS")
+                except Exception:
+                    pass
+            return res
+        setattr(KWIN, "_apply_realized_pnl", _wrap_apply)
 
 _try_init_kwin()
 
@@ -172,10 +286,6 @@ def _to_float(x, default=0.0) -> float:
         return float(default)
 
 def _topic_parts(topic: str) -> Tuple[str, Optional[str], Optional[str]]:
-    """
-    kline.15.ETHUSDT -> ("kline", "15", "ETHUSDT")
-    publicTrade.ETHUSDT -> ("publicTrade", None, "ETHUSDT")
-    """
     parts = (topic or "").split(".")
     if not parts:
         return "", None, None
@@ -205,6 +315,7 @@ async def _append_bar_to_csv(bar: KlineBar):
             f.write(line)
 
 # ---------- REST утилиты для сида ----------
+
 _INTERVAL_NORMALIZE = {
     "1m": "1",
     "3m": "3",
@@ -220,7 +331,7 @@ def _norm_tf(tf: str) -> str:
     t = tf.strip().lower()
     if t.endswith("m") or t.endswith("h"):
         return _INTERVAL_NORMALIZE.get(t, t.rstrip("mh"))
-    return t  # "1","3","5","15","60",...
+    return t
 
 def _tf_limit(tf: str) -> int:
     t = _norm_tf(tf)
@@ -248,9 +359,7 @@ def _rest_fetch_klines(category: str, symbol: str, tf: str) -> List[Dict]:
         j = r.json()
         rows = (j.get("result") or {}).get("list") or []
         out: List[Dict] = []
-        # Bybit v5 возвращает list с newest first → переведём в oldest→newest
         for it in reversed(rows):
-            # Форматы могут различаться: иногда list, иногда dict; нормализуем
             if isinstance(it, dict):
                 start_ms = int(it.get("start") or it.get("t") or it.get("open_time") or 0)
                 o = it.get("open") or it.get("o")
@@ -260,7 +369,6 @@ def _rest_fetch_klines(category: str, symbol: str, tf: str) -> List[Dict]:
                 v = it.get("volume") or it.get("v")
                 tv = it.get("turnover") or it.get("tv")
             else:
-                # спецификация v5/list обычно: [start, open, high, low, close, volume, turnover]
                 start_ms = int(it[0])
                 o, h, l, c, v, tv = it[1], it[2], it[3], it[4], it[5], (it[6] if len(it) > 6 else 0)
 
@@ -275,7 +383,7 @@ def _rest_fetch_klines(category: str, symbol: str, tf: str) -> List[Dict]:
                 "close": _to_float(c),
                 "volume": _to_float(v),
                 "turnover": _to_float(tv),
-                "confirm": True,   # сидаем только закрытые бары
+                "confirm": True,
                 "interval": interval,
                 "symbol": symbol,
             })
@@ -285,7 +393,6 @@ def _rest_fetch_klines(category: str, symbol: str, tf: str) -> List[Dict]:
         return []
 
 # ---------- Анти-дубликаты закрытых баров ----------
-# Ключ: (symbol, interval) → последний start_ms закрытого бара, уже отфиденный в KWIN/CSV
 _last_closed_start_ms: Dict[Tuple[str, str], int] = {}
 
 def _is_new_closed_bar(bar: KlineBar) -> bool:
@@ -297,10 +404,6 @@ def _is_new_closed_bar(bar: KlineBar) -> bool:
     return False
 
 async def _seed_history(symbols: List[str], tfs: List[str]):
-    """Исторический сид закрытых баров (строго confirm=true) в стратегию.
-       Порядок: для каждого 15m окна предварительно прокидываем M1 окна (если есть такой tf),
-       затем закрытие 15m, и т.д. Это даёт идентичное поведение Pine-реплею.
-    """
     if not (WS_SEED_HISTORY and KWIN_ENABLED and KWIN is not None):
         return
     category = WS_CATEGORY
@@ -309,7 +412,6 @@ async def _seed_history(symbols: List[str], tfs: List[str]):
             log.info(f"Seed skip {s}: KWIN ожидает {KWIN_SYMBOL}")
             continue
 
-        # Раздельно тянем TF
         tf_set = {_norm_tf(tf) for tf in tfs}
         have_1m = ("1" in tf_set) or (KWIN_INTRABAR_TF and _norm_tf(KWIN_INTRABAR_TF) == "1")
         have_15 = "15" in tf_set
@@ -319,26 +421,12 @@ async def _seed_history(symbols: List[str], tfs: List[str]):
         bars_15: List[Dict] = _rest_fetch_klines(category, s, "15") if have_15 else []
         bars_60: List[Dict] = _rest_fetch_klines(category, s, "60") if have_60 else []
 
-        # Индексы по времени для быстрых срезов
         def _bars_in_window(bars: List[Dict], start_ms: int, end_ms: int) -> List[Dict]:
             return [b for b in bars if start_ms <= int(b["timestamp"]) <= end_ms]
 
-        # Вспомогательное: длительность TF
         def _tf_to_ms(interval: str) -> int:
             i = str(interval)
-            if i == "1":
-                return 60_000
-            if i == "3":
-                return 180_000
-            if i == "5":
-                return 300_000
-            if i == "15":
-                return 900_000
-            if i == "30":
-                return 1_800_000
-            if i == "60":
-                return 3_600_000
-            return 60_000
+            return {"1": 60_000, "3": 180_000, "5": 300_000, "15": 900_000, "30": 1_800_000, "60": 3_600_000}.get(i, 60_000)
 
         async def _feed_bar(b: Dict):
             bar = KlineBar(
@@ -358,11 +446,9 @@ async def _seed_history(symbols: List[str], tfs: List[str]):
                 await _append_bar_to_csv(bar)
                 await _feed_kwin(bar)
 
-        # 1) H1 — просто по порядку
         for b60 in bars_60:
             await _feed_bar(b60)
 
-        # 2) Для каждого 15m окна: сначала M1 внутри, затем 15m
         if bars_15:
             for b15 in bars_15:
                 start_15 = int(b15["timestamp"])
@@ -371,7 +457,6 @@ async def _seed_history(symbols: List[str], tfs: List[str]):
                     for m1 in _bars_in_window(bars_1m, start_15, end_15):
                         await _feed_bar(m1)
                 await _feed_bar(b15)
-        # 3) Если 15m нет, но есть 1m — просто прогрев
         elif bars_1m:
             for m1 in bars_1m:
                 await _feed_bar(m1)
@@ -429,12 +514,18 @@ class BybitWebSocket:
         for s in self.symbols:
             for tf in self.tfs:
                 args.append(f"kline.{_norm_tf(tf)}.{s}")
-            args.append(f"publicTrade.{s}")  # полезно для диагностики
+            args.append(f"publicTrade.{s}")
         if not args:
             return
         self._subscribed_args = args
         await self._send_json({"op": "subscribe", "args": args})
         log.info(f"Подписка: {args}")
+        # >>> DB-HOOK: сохраним bot_state (подписки)
+        try:
+            if DB_REF is not None:
+                DB_REF.save_bot_state({"subs": args, "url": self.url, "category": WS_CATEGORY})
+        except Exception:
+            pass
 
     def _start_heartbeat(self):
         if self._ping_task is None or self._ping_task.done():
@@ -483,7 +574,6 @@ class BybitWebSocket:
             await self._dispatch(data)
 
     async def _dispatch(self, data: Dict):
-        # сервисные
         if data.get("op") in ("pong",) or "success" in data:
             log.debug(f"Svc msg: {data}")
             return
@@ -511,7 +601,6 @@ class BybitWebSocket:
             for k in arr:
                 confirm = bool(k.get("confirm", False))
                 if not confirm:
-                    # Стратегию кормим только закрытыми барами
                     continue
 
                 tf_eff  = str(_norm_tf(tf or k.get("interval") or "15"))
@@ -542,12 +631,19 @@ class BybitWebSocket:
                     confirm=True,
                 )
 
-                # Только закрытые бары → Pine-паритет, плюс анти-дубликат
                 if bar.start_ms and _is_new_closed_bar(bar):
                     ts = _dt_utc_from_ms(bar.start_ms).isoformat()
                     log.info(f"[{bar.symbol} {bar.interval}m] close @{ts} O={bar.open} H={bar.high} L={bar.low} C={bar.close} V={bar.volume}")
                     await _append_bar_to_csv(bar)
                     await _feed_kwin(bar)
+                    # >>> DB-HOOK: обновим bot_state последним закрытым баром
+                    try:
+                        if DB_REF is not None and bar.interval in ("1", "15", "60"):
+                            st = DB_REF.get_bot_state() or {}
+                            st.setdefault("last_closed", {})[f"{bar.symbol}.{bar.interval}m"] = int(bar.start_ms)
+                            DB_REF.save_bot_state(st)
+                    except Exception:
+                        pass
         except Exception as e:
             log.error(f"Ошибка kline: {e}")
             log.debug(f"payload: {data}")
@@ -569,12 +665,11 @@ async def _feed_kwin(bar: KlineBar):
     if not KWIN_ENABLED or KWIN is None:
         return
     if KWIN_SYMBOL and bar.symbol != KWIN_SYMBOL:
-        # Не смешиваем разные символы в одном экземпляре стратегии
         log.debug(f"KWIN ignore {bar.symbol}, ожидался {KWIN_SYMBOL}")
         return
 
     candle = {
-        "timestamp": bar.start_ms,  # стратегия ждёт 'timestamp' в ms начала бара
+        "timestamp": bar.start_ms,
         "open":  bar.open,
         "high":  bar.high,
         "low":   bar.low,
@@ -590,9 +685,6 @@ async def _feed_kwin(bar: KlineBar):
             KWIN.on_bar_close_15m(candle)
         elif bar.interval in ("60", "60m", "1h"):
             KWIN.on_bar_close_60m(candle)
-        else:
-            # Добавь при необходимости: "3","5","30","120" и их хэндлеры
-            pass
     except Exception as e:
         log.error(f"KWIN feed error ({bar.interval}m): {e!r}")
 
@@ -616,6 +708,19 @@ async def main():
     if WS_SEED_HISTORY:
         await _seed_history(SYMBOLS, SEED_TFS)
 
+    # >>> DB-HOOK: сохраним стартовые параметры в bot_state
+    try:
+        if DB_REF is not None:
+            DB_REF.save_bot_state({
+                "symbols": SYMBOLS,
+                "ws_tfs": KL_TFS,
+                "seed_tfs": SEED_TFS,
+                "category": WS_CATEGORY,
+                "testnet": bool(BYBIT_TESTNET),
+            })
+    except Exception:
+        pass
+
     ws = BybitWebSocket(URL, SYMBOLS, KL_TFS)
     try:
         await ws.run_forever()
@@ -625,7 +730,6 @@ async def main():
         await ws.close()
 
 if __name__ == "__main__":
-    # Лёгкая проверка REST (гео-блоки)
     try:
         if requests is None:
             raise RuntimeError("requests not available")
