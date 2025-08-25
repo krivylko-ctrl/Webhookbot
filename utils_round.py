@@ -4,19 +4,24 @@ from __future__ import annotations
 from decimal import Decimal, ROUND_DOWN, ROUND_UP, ROUND_HALF_UP, localcontext, getcontext
 from typing import Optional, Literal, Union
 
+__all__ = [
+    "round_price", "round_qty",
+    "floor_to_tick", "ceil_to_tick", "round_to_tick",
+    "is_on_tick", "snap_to_tick_if_close", "ensure_min_qty",
+    "price_round", "qty_round",
+]
+
 # Высокая точность для внутренних расчётов, чтобы исключить артефакты (0.30000000000004 и т.п.)
 getcontext().prec = 40
 
 # Микро-эпсилон для «прилипания» к ближайшему тику
 _EPS = Decimal("1e-18")
 
-
 NumberLike = Union[float, int, str, Decimal]
 
 
 def _D(x: NumberLike) -> Decimal:
     """Безопасная конвертация в Decimal через str(x) — гасит двоичную погрешность."""
-    # Decimal принимает Decimal как есть; иначе — через str
     return x if isinstance(x, Decimal) else Decimal(str(x))
 
 
@@ -121,8 +126,9 @@ def is_on_tick(price: NumberLike, tick: NumberLike) -> bool:
         ctx.prec = 40
         q = _q_step(tick)
         p = _D(price)
-        r = p / q
-        return (r - r.to_integral_value(rounding=ROUND_HALF_UP)).copy_abs() <= _EPS
+        # остаток от деления по модулю шага
+        rem = (p % q).copy_abs()
+        return rem <= q * _EPS or (q - rem) <= q * _EPS
 
 
 def snap_to_tick_if_close(price: NumberLike, tick: NumberLike) -> float:
@@ -136,10 +142,12 @@ def snap_to_tick_if_close(price: NumberLike, tick: NumberLike) -> float:
         ctx.prec = 40
         q = _q_step(tick)
         p = _D(price)
-        r = p / q
-        nearest = r.to_integral_value(rounding=ROUND_HALF_UP)
-        if (r - nearest).copy_abs() <= _EPS:
-            return float(nearest * q)
+        rem = p % q
+        # если остаток очень мал — липнем вниз; если почти полный шаг — липнем вверх
+        if rem.copy_abs() <= q * _EPS:
+            return float((p - rem))
+        if (q - rem).copy_abs() <= q * _EPS:
+            return float((p + (q - rem)))
     return float(price)
 
 
@@ -151,7 +159,7 @@ def ensure_min_qty(qty: NumberLike, min_qty: NumberLike, step: NumberLike) -> fl
     if float(step) <= 0:
         return max(float(qty), float(min_qty))
     qd = round_qty(qty, step, mode="down")
-    if qd + 0.0 < float(min_qty):  # "+ 0.0" — явная конверсия в float
+    if qd + 0.0 < float(min_qty):  # явная конверсия в float
         return round_qty(min_qty, step, mode="up")
     return qd
 
@@ -159,8 +167,5 @@ def ensure_min_qty(qty: NumberLike, min_qty: NumberLike, step: NumberLike) -> fl
 # -----------------------------
 # АЛИАСЫ ДЛЯ СОВМЕСТИМОСТИ
 # -----------------------------
-# Старые вызовы в проекте:
-#   from utils_round import round_price, round_qty
-#   from utils_round import price_round, qty_round
 price_round = round_to_tick   # ближе всего к PineScript `round()`
 qty_round = round_qty
