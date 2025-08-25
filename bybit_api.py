@@ -1,55 +1,90 @@
-# bybit_api.py — совместимая обёртка для KWINStrategy (HTTP + WS v5)
-
+# bybit_api.py — REST-обёртка для KWINStrategy (HTTP v5, БЕЗ WebSocket)
 import requests
 import json
 import time
 import hashlib
 import hmac
+import random
 from urllib.parse import urlencode
-import threading
 from typing import Dict, List, Optional, Callable, Any
 
-# Необязательные хелперы округления по тик-сайзу/шагу
+# Необязательные хелперы округления по тик-сайзу/шагу (стратегия сама округляет, но дублируем защитно)
 try:
-    from utils_round import round_price, round_qty  # noqa: F401
+    from utils_round import round_price, round_qty, floor_to_tick, ceil_to_tick  # noqa: F401
 except Exception:
     def round_price(x, *_args, **_kw): return x
     def round_qty(x, *_args, **_kw): return x
+    def floor_to_tick(x, *_): return x
+    def ceil_to_tick(x, *_): return x
 
 
 class BybitAPI:
-    """Лёгкая обёртка над Bybit v5 (HTTP + паблик WS).
-       По умолчанию — категория linear (USDT-M)."""
+    """Лёгкая REST-обёртка над Bybit v5 (без WS).
+       По умолчанию — категория linear (USDT-M).
+       Совместимо с KWINStrategy.
+    """
 
-    def __init__(self, api_key: str, api_secret: str, testnet: bool = False):
+    def __init__(
+        self,
+        api_key: str,
+        api_secret: str,
+        testnet: bool = False,
+        *,
+        market_type: str = "linear",
+        account_type: str = "UNIFIED",
+        timeout: int = 15,
+        retries: int = 2,
+        backoff: float = 0.5,
+        recv_window: int = 5000,
+        proxies: Optional[Dict[str, str]] = None,
+        hedge_mode: bool = True,
+        default_position_idx: Optional[int] = None,
+        **_kwargs
+    ):
         self.api_key = api_key or ""
         self.api_secret = api_secret or ""
         self.testnet = bool(testnet)
 
-        # По умолчанию — деривативы ("linear")
-        self.market_type = "linear"
+        # Категория рынка для v5: "linear"|"inverse"|"spot"|"option"
+        self.market_type = (market_type or "linear").lower()
+        if self.market_type not in ("linear", "inverse", "spot", "option"):
+            self.market_type = "linear"
+
+        # Тип аккаунта для /wallet-balance
+        self.account_type = (account_type or "UNIFIED").upper()
+        self.hedge_mode = bool(hedge_mode)
+        self.default_position_idx = default_position_idx  # 1=One-Way / 3=Hedge-Short / 5=Hedge-Long (зависит от категории)
 
         if self.testnet:
             self.base_url = "https://api-testnet.bybit.com"
-            self.ws_url = "wss://stream-testnet.bybit.com/v5/public/linear"
         else:
             self.base_url = "https://api.bybit.com"
-            self.ws_url = "wss://stream.bybit.com/v5/public/linear"
+
+        # HTTP с повторными попытками
+        self.timeout = int(timeout)
+        self.retries = int(retries)
+        self.backoff = float(backoff)
+        self.recv_window = int(recv_window)
 
         self.session = requests.Session()
         self.session.headers.update({
-            "User-Agent": "KWINBot/1.0 (+https://example.local)",
+            "User-Agent": "KWINBot/1.0",
             "Accept": "application/json",
         })
+        if proxies:
+            try:
+                self.session.proxies.update(proxies)
+            except Exception:
+                pass
 
-        # WS
-        self.ws = None
-        self._ws_lock = threading.RLock()
-        self.ws_callbacks: Dict[str, Callable] = {}
-        self._ws_subscriptions: set[str] = set()
-        self._ws_should_run = False
+        # ----- MUST-HAVE: кэш инструментов и внешний провайдер цены -----
+        self._instr_cache: Dict[str, Dict] = {}
+        self._instr_cache_ts: Dict[str, float] = {}
+        self._instr_ttl_sec: int = 300
 
-    # ==================== внутренняя утилита подписи ====================
+        self._price_provider: Optional[Callable[[str, str], Optional[float]]] = None
+
+    # ==================== утилиты подписи/сетевые ====================
 
     @staticmethod
     def _sorted_qs(params: Dict[str, Any]) -> str:
@@ -65,12 +100,25 @@ class BybitAPI:
 
     def _generate_signature(self, payload: str, timestamp_ms: str) -> str:
         # формула подписи v5: ts + api_key + recv_window + payload
-        prehash = timestamp_ms + self.api_key + "5000" + payload
+        prehash = timestamp_ms + self.api_key + str(self.recv_window) + payload
         return hmac.new(
             self.api_secret.encode("utf-8"),
             prehash.encode("utf-8"),
             hashlib.sha256
         ).hexdigest()
+
+    def _http_call(self, method: str, url: str, **kw) -> requests.Response:
+        # Простые ретраи на сетевые ошибки/5xx с экспон.бэк-оффом + джиттер
+        last_exc = None
+        for i in range(self.retries + 1):
+            try:
+                return self.session.request(method, url, timeout=self.timeout, **kw)
+            except requests.RequestException as e:
+                last_exc = e
+                delay = self.backoff * (2 ** i)
+                delay *= (0.8 + 0.4 * random.random())
+                time.sleep(delay)
+        raise last_exc
 
     def _send_request(
         self,
@@ -79,44 +127,64 @@ class BybitAPI:
         params: Optional[Dict] = None,
         *,
         requires_auth: bool = False,
-        timeout: int = 30
+        timeout: Optional[int] = None
     ) -> Dict:
         params = params or {}
         url = f"{self.base_url}{endpoint}"
         headers: Dict[str, str] = {"Content-Type": "application/json"}
 
+        # Коды, при которых имеет смысл повторить (rate-limit/сервис)
+        RETRYABLE_CODES = {10006, 10007, 30005, 30033}  # too many requests / timeout / system busy (примерный набор)
+
         try:
-            if requires_auth:
-                timestamp = str(int(time.time() * 1000))
+            # внутренний цикл ретраев по retCode (помимо сетевых)
+            for attempt in range(self.retries + 1):
+                if requires_auth:
+                    timestamp = str(int(time.time() * 1000))
+                    if method.upper() == "GET":
+                        payload_str = self._sorted_qs(params)
+                    else:
+                        payload_str = json.dumps(params, separators=(',', ':'), ensure_ascii=False)
+                    signature = self._generate_signature(payload_str, timestamp)
+                    headers.update({
+                        "X-BAPI-API-KEY": self.api_key,
+                        "X-BAPI-SIGN": signature,
+                        "X-BAPI-SIGN-TYPE": "2",
+                        "X-BAPI-TIMESTAMP": timestamp,
+                        "X-BAPI-RECV-WINDOW": str(self.recv_window),
+                    })
+
                 if method.upper() == "GET":
-                    payload_str = self._sorted_qs(params)
+                    r = self._http_call("GET", url, params=params, headers=headers)
+                elif method.upper() == "POST":
+                    data = json.dumps(params, separators=(',', ':'), ensure_ascii=False) if params else None
+                    r = self._http_call("POST", url, data=data, headers=headers)
                 else:
-                    payload_str = json.dumps(params, separators=(',', ':'), ensure_ascii=False)
-                signature = self._generate_signature(payload_str, timestamp)
-                headers.update({
-                    "X-BAPI-API-KEY": self.api_key,
-                    "X-BAPI-SIGN": signature,
-                    "X-BAPI-SIGN-TYPE": "2",
-                    "X-BAPI-TIMESTAMP": timestamp,
-                    "X-BAPI-RECV-WINDOW": "5000",
-                })
+                    raise ValueError(f"Unsupported HTTP method: {method}")
 
-            if method.upper() == "GET":
-                r = self.session.get(url, params=params, headers=headers, timeout=timeout)
-            elif method.upper() == "POST":
-                data = json.dumps(params, separators=(',', ':'), ensure_ascii=False) if params else None
-                r = self.session.post(url, data=data, headers=headers, timeout=timeout)
-            else:
-                raise ValueError(f"Unsupported HTTP method: {method}")
+                r.raise_for_status()
+                resp = r.json()
 
-            r.raise_for_status()
-            resp = r.json()
-            if isinstance(resp, dict) and resp.get("retCode") not in (0, "0", None):
+                # успех = retCode 0 или отсутствие retCode
+                ret_code = resp.get("retCode")
+                if ret_code in (0, "0", None):
+                    return resp
+
+                # неуспех — возможно повторим
+                if isinstance(ret_code, int) and ret_code in RETRYABLE_CODES and attempt < self.retries:
+                    delay = self.backoff * (2 ** attempt)
+                    delay *= (0.8 + 0.4 * random.random())
+                    time.sleep(delay)
+                    continue
+
                 try:
-                    print(f"[BybitAPI] {method} {endpoint} retCode={resp.get('retCode')} retMsg={resp.get('retMsg')}")
+                    print(f"[BybitAPI] {method} {endpoint} retCode={ret_code} retMsg={resp.get('retMsg')}")
                 except Exception:
                     pass
-            return resp
+                return resp  # вернём как есть
+
+            # если вылетели по ретраям
+            return {"retCode": -1, "retMsg": "retry_exceeded"}
         except requests.exceptions.RequestException as e:
             print(f"API Request Error [{method} {endpoint}]: {e}")
             return {"retCode": -1, "retMsg": str(e)}
@@ -143,16 +211,48 @@ class BybitAPI:
     # ==================== конфиг ====================
 
     def set_market_type(self, market_type: str):
-        """Жёстко фиксируем категорию (linear/inverse/spot/option). По умолчанию — linear."""
+        """Фиксируем категорию (linear/inverse/spot/option). По умолчанию — linear."""
         m = (market_type or "linear").lower()
+        if m not in ("linear", "inverse", "spot", "option"):
+            m = "linear"
         self.market_type = m
-        base = "stream-testnet" if self.testnet else "stream"
-        # Эндпоинт WS зависит от категории
-        self.ws_url = f"wss://{base}.bybit.com/v5/public/{m}"
 
     def force_linear(self):
-        """Удобный хелпер: насильно фиксирует работу только с фьючерсами (linear)."""
+        """Насильно фиксирует работу только с фьючерсами (linear)."""
         self.set_market_type("linear")
+
+    # ==================== кэш инструментов / квантование ====================
+
+    def _get_instr_cached(self, symbol: str) -> Optional[Dict]:
+        key = (symbol or "").upper()
+        now = time.time()
+        if key in self._instr_cache and (now - self._instr_cache_ts.get(key, 0)) < self._instr_ttl_sec:
+            return self._instr_cache[key]
+        info = self._get_instruments_info_uncached(key)
+        if info:
+            self._instr_cache[key] = info
+            self._instr_cache_ts[key] = now
+        return info
+
+    def quantize_price(self, symbol: str, price: float) -> float:
+        info = self._get_instr_cached(symbol) or {}
+        tick = float(((info.get("priceFilter") or {}).get("tickSize") or 0.0) or 0.0)
+        if tick <= 0:
+            return float(price)
+        # округление к ближайшему тика (как в стратегии для pine-like)
+        return round(float(price) / tick) * tick
+
+    def quantize_qty(self, symbol: str, qty: float) -> float:
+        info = self._get_instr_cached(symbol) or {}
+        step = float(((info.get("lotSizeFilter") or {}).get("qtyStep") or 0.0) or 0.0)
+        if step <= 0:
+            return float(qty)
+        return round(float(qty) / step) * step
+
+    def enforce_min_qty(self, symbol: str, qty: float) -> float:
+        info = self._get_instr_cached(symbol) or {}
+        m = float(((info.get("lotSizeFilter") or {}).get("minOrderQty") or 0.0) or 0.0)
+        return float(qty) if (m <= 0 or float(qty) >= m) else 0.0
 
     # ==================== публичные ====================
 
@@ -189,7 +289,7 @@ class BybitAPI:
         """
         Последние N свечей по категории self.market_type.
         interval: строка минут ("1","3","5","15","60",...).
-        Возвращает список по возрастанию timestamp (мс).
+        Возвращает список по **убыванию** timestamp (newest-first).
         """
         params = {
             "category": self.market_type,
@@ -203,8 +303,11 @@ class BybitAPI:
             out: List[Dict] = []
             for it in lst:
                 try:
+                    ts = int(it[0])
+                    if ts < 1_000_000_000_000:
+                        ts *= 1000
                     out.append({
-                        "timestamp": int(it[0]),
+                        "timestamp": ts,
                         "open":  self._to_float(it[1]),
                         "high":  self._to_float(it[2]),
                         "low":   self._to_float(it[3]),
@@ -213,7 +316,8 @@ class BybitAPI:
                     })
                 except Exception:
                     continue
-            return self._dedup_and_sort_kl(out)
+            out.sort(key=lambda x: x["timestamp"], reverse=True)
+            return out
         print(f"[BybitAPI] get_klines error: {resp.get('retCode')} {resp.get('retMsg')}")
         return []
 
@@ -234,7 +338,7 @@ class BybitAPI:
             "category": self.market_type,
             "symbol": (symbol or "").upper(),
             "interval": str(interval),
-            "limit": int(min(max(1, limit), 1000)),  # по докам макс 1000
+            "limit": int(min(max(1, limit), 1000)),
         }
         if start_ms is not None:
             params["start"] = int(start_ms)
@@ -257,8 +361,11 @@ class BybitAPI:
             lst = result.get("list") or []
             for it in lst:
                 try:
+                    ts = int(it[0])
+                    if ts < 1_000_000_000_000:
+                        ts *= 1000
                     out.append({
-                        "timestamp": int(it[0]),
+                        "timestamp": ts,
                         "open":  self._to_float(it[1]),
                         "high":  self._to_float(it[2]),
                         "low":   self._to_float(it[3]),
@@ -270,7 +377,6 @@ class BybitAPI:
 
             cursor = result.get("nextPageCursor")
             safety_pages += 1
-            # Условия выхода: нет курсора или превысили разумный лимит страниц
             if not cursor or safety_pages > 200:
                 break
 
@@ -289,12 +395,11 @@ class BybitAPI:
             if lst:
                 t = lst[0]
                 _f = self._to_float
+                # Вернём поля и в camel, и в snake — стратегия умеет оба варианта.
                 return {
                     "symbol": t.get("symbol"),
-                    # camelCase — подхватится стратегией
                     "lastPrice": _f(t.get("lastPrice", 0)),
                     "markPrice": _f(t.get("markPrice", 0)),
-                    # дубли snake для совместимости со сторонним кодом (не помешают)
                     "last_price": _f(t.get("lastPrice", 0)),
                     "mark_price": _f(t.get("markPrice", 0)),
                     "bid1Price": _f(t.get("bid1Price", 0)),
@@ -306,33 +411,132 @@ class BybitAPI:
             print(f"[BybitAPI] get_ticker error: {resp.get('retCode')} {resp.get('retMsg')}")
         return None
 
+    # ----- внешний провайдер цены -----
+    def set_price_provider(self, fn: Callable[[str, str], Optional[float]]) -> None:
+        """fn(symbol, source['last'|'mark']) -> price|None"""
+        self._price_provider = fn
+
     def get_price(self, symbol: str, source: str = "last") -> float:
+        # сперва — внешний провайдер (WS), затем REST
+        if self._price_provider:
+            try:
+                p = self._price_provider(symbol, source)
+                if isinstance(p, (int, float)) and p > 0:
+                    return float(p)
+            except Exception:
+                pass
         t = self.get_ticker(symbol) or {}
         last = self._to_float(t.get("lastPrice", 0))
         mark = self._to_float(t.get("markPrice", 0))
         return mark if (str(source).lower() == "mark" and mark > 0) else last
 
-    def get_instruments_info(self, symbol: str) -> Optional[Dict]:
+    # ----- instruments-info + кэш -----
+    def _get_instruments_info_uncached(self, symbol: str) -> Optional[Dict]:
         params = {"category": self.market_type, "symbol": (symbol or "").upper()}
         resp = self._send_request("GET", "/v5/market/instruments-info", params, requires_auth=False)
         if resp.get("retCode") == 0:
             lst = (resp.get("result") or {}).get("list") or []
             if not lst:
                 print(f"[BybitAPI] instruments-info empty for {params}")
-            # структура с priceFilter/lotSizeFilter — как ожидает стратегия
-            return lst[0] if lst else None
+                return None
+            info = dict(lst[0])
+            # Нормализация: приводим к float-типам, если они строковые
+            try:
+                pf = info.get("priceFilter") or {}
+                ls = info.get("lotSizeFilter") or {}
+                for k in ("tickSize",):
+                    if k in pf:
+                        pf[k] = float(pf[k])
+                for k in ("qtyStep", "minOrderQty"):
+                    if k in ls:
+                        ls[k] = float(ls[k])
+                info["priceFilter"] = pf
+                info["lotSizeFilter"] = ls
+            except Exception:
+                pass
+            return info
         print(f"[BybitAPI] instruments-info error: {resp.get('retCode')} {resp.get('retMsg')}")
         return None
 
+    def get_instruments_info(self, symbol: str) -> Optional[Dict]:
+        """Публичный метод: отдаём из кэша с TTL."""
+        return self._get_instr_cached(symbol)
+
     # ==================== приватные (trade/account) ====================
 
-    def get_wallet_balance(self, account_type: str = "UNIFIED") -> Optional[Dict]:
-        params = {"accountType": account_type}
+    def get_wallet_balance(self, account_type: Optional[str] = None) -> Optional[Dict]:
+        """
+        Стратегия может вызывать это, когда equity_source='wallet'.
+        По умолчанию берём self.account_type (обычно 'UNIFIED').
+        """
+        params = {"accountType": (account_type or self.account_type)}
         resp = self._send_request("GET", "/v5/account/wallet-balance", params, requires_auth=True)
         if resp.get("retCode") == 0:
             return resp.get("result")
         print(f"[BybitAPI] wallet-balance error: {resp.get('retCode')} {resp.get('retMsg')}")
         return None
+
+    def _fetch_position_size(self, symbol: str) -> Dict[str, Any]:
+        """
+        Возвращает агрегированную позицию по символу:
+        { 'size': float, 'side': 'long'|'short'|None }
+        """
+        params = {"category": self.market_type, "symbol": (symbol or "").upper()}
+        resp = self._send_request("GET", "/v5/position/list", params, requires_auth=True)
+        size = 0.0
+        side = None
+        if resp.get("retCode") == 0:
+            lst = (resp.get("result") or {}).get("list") or []
+            for p in lst:
+                sz = self._to_float(p.get("size", 0))
+                sd = (p.get("side") or "").lower()
+                if sz <= 0:
+                    continue
+                if side is None:
+                    side = "long" if sd == "buy" else "short"
+                size += sz if sd == "buy" else -sz
+            if size > 0:
+                side = "long"
+            elif size < 0:
+                side = "short"
+                size = abs(size)
+            else:
+                side = None
+        else:
+            print(f"[BybitAPI] position/list error: {resp.get('retCode')} {resp.get('retMsg')}")
+        return {"size": float(size), "side": side}
+
+    def close_position(self, symbol: str) -> bool:
+        """
+        Закрыть текущую позицию рыночным ордером (reduceOnly).
+        Именно это дергает KWINStrategy при flip/close.
+        """
+        pos = self._fetch_position_size(symbol)
+        size = float(pos.get("size") or 0.0)
+        side = pos.get("side")
+        if size <= 0 or side not in ("long", "short"):
+            return True  # уже нет позиции — считаем успехом
+
+        close_side = "Sell" if side == "long" else "Buy"
+        params: Dict[str, str] = {
+            "category": self.market_type,
+            "symbol": (symbol or "").upper(),
+            "side": close_side,
+            "orderType": "Market",
+            "qty": str(size),
+            "reduceOnly": "true",
+            # идемпотентность
+            "orderLinkId": f"kwin-cls-{(symbol or '').upper()}-{int(time.time()*1000)}",
+        }
+        # в hedge-режиме укажем positionIdx, если задан по умолчанию
+        if self.default_position_idx is not None:
+            params["positionIdx"] = str(self.default_position_idx)
+
+        resp = self._send_request("POST", "/v5/order/create", params, requires_auth=True)
+        if resp.get("retCode") == 0:
+            return True
+        print(f"[BybitAPI] close_position error: {resp.get('retCode')} {resp.get('retMsg')}")
+        return False
 
     def place_order(
         self,
@@ -350,36 +554,57 @@ class BybitAPI:
         position_idx: Optional[int] = None,
         tpsl_mode: Optional[str] = None,
     ) -> Optional[Dict]:
+        """
+        KWINStrategy отправляет Market + stop_loss, trigger_by_source = 'last'|'mark'.
+        Здесь же делаем корректную мапу для v5 + квантование и minQty.
+        """
+        # квантование / minQty
+        q = self.quantize_qty(symbol, float(qty))
+        q = self.enforce_min_qty(symbol, q)
+        if q <= 0:
+            print("[BybitAPI] place_order: qty < minOrderQty")
+            return None
+        p = None
+        if price is not None:
+            p = self.quantize_price(symbol, float(price))
+
         params: Dict[str, str] = {
             "category": self.market_type,
             "symbol": (symbol or "").upper(),
-            "side": str(side).title(),
-            "orderType": str(orderType).title(),
-            "qty": str(qty),
+            "side": str(side).title(),            # Buy/Sell
+            "orderType": str(orderType).title(),  # Market/Limit/...
+            "qty": str(q),
         }
-        if price is not None:
-            params["price"] = str(price)
+        if p is not None:
+            params["price"] = str(p)
         if reduce_only:
             params["reduceOnly"] = "true"
         if order_link_id:
             params["orderLinkId"] = order_link_id
+        else:
+            params["orderLinkId"] = f"kwin-{(symbol or '').upper()}-{int(time.time()*1000)}"
         if time_in_force:
             params["timeInForce"] = time_in_force
-        if position_idx is not None:
-            params["positionIdx"] = str(position_idx)
+
+        # positionIdx: если явно передали — используем, иначе дефолт, если задан
+        eff_pos_idx = position_idx if position_idx is not None else self.default_position_idx
+        if eff_pos_idx is not None:
+            params["positionIdx"] = str(eff_pos_idx)
         if tpsl_mode:
             params["tpslMode"] = str(tpsl_mode)
 
         # SL/TP + источник триггера (MarkPrice/LastPrice)
         if stop_loss is not None:
-            params["stopLoss"] = str(stop_loss)
+            sl_q = self.quantize_price(symbol, float(stop_loss))
+            params["stopLoss"] = str(sl_q)
             params["slTriggerBy"] = self._map_trigger_by(trigger_by_source)
         if take_profit is not None:
-            params["takeProfit"] = str(take_profit)
+            tp_q = self.quantize_price(symbol, float(take_profit))
+            params["takeProfit"] = str(tp_q)
             params["tpTriggerBy"] = self._map_trigger_by(trigger_by_source)
 
-        # для stop/conditional-ордеров указываем общий triggerBy
-        if orderType.lower() in {"stop", "conditional"}:
+        # Если это stop/conditional — общий triggerBy
+        if str(orderType).lower() in {"stop", "conditional"}:
             params["triggerBy"] = self._map_trigger_by(trigger_by_source)
 
         resp = self._send_request("POST", "/v5/order/create", params, requires_auth=True)
@@ -398,16 +623,18 @@ class BybitAPI:
     ) -> bool:
         """
         Обновляет SL по открытой позиции (используется стратегией/трейлом).
-        По v5 это /v5/position/trading-stop (категория linear/inverse).
+        По v5 это /v5/position/trading-stop.
         """
+        sl_q = self.quantize_price(symbol, float(new_sl))
         params: Dict[str, str] = {
             "category": self.market_type,
             "symbol": (symbol or "").upper(),
-            "stopLoss": str(new_sl),
+            "stopLoss": str(sl_q),
             "slTriggerBy": self._map_trigger_by(trigger_by_source),
         }
-        if position_idx is not None:
-            params["positionIdx"] = str(position_idx)
+        eff_pos_idx = position_idx if position_idx is not None else self.default_position_idx
+        if eff_pos_idx is not None:
+            params["positionIdx"] = str(eff_pos_idx)
 
         resp = self._send_request("POST", "/v5/position/trading-stop", params, requires_auth=True)
         if resp.get("retCode") == 0:
@@ -441,10 +668,11 @@ class BybitAPI:
             if stop_loss is not None:
                 ok_sl = self.update_position_stop_loss(symbol, float(stop_loss), trigger_by_source=trigger_by_source)
             if take_profit is not None:
+                tp_q = self.quantize_price(symbol, float(take_profit))
                 params_tp = {
                     "category": self.market_type,
                     "symbol": (symbol or "").upper(),
-                    "takeProfit": str(take_profit),
+                    "takeProfit": str(tp_q),
                     "tpTriggerBy": self._map_trigger_by(trigger_by_source),
                 }
                 resp_tp = self._send_request("POST", "/v5/position/trading-stop", params_tp, requires_auth=True)
@@ -466,25 +694,32 @@ class BybitAPI:
         if order_link_id:
             params["orderLinkId"] = order_link_id
         if price is not None:
-            params["price"] = str(price)
+            p = self.quantize_price(symbol, float(price))
+            params["price"] = str(p)
         if qty is not None:
-            params["qty"] = str(qty)
+            q = self.quantize_qty(symbol, float(qty))
+            q = self.enforce_min_qty(symbol, q)
+            if q <= 0:
+                print("[BybitAPI] modify_order: qty < minOrderQty")
+                return None
+            params["qty"] = str(q)
 
         resp = self._send_request("POST", "/v5/order/amend", params, requires_auth=True)
         if resp.get("retCode") != 0:
             print(f"[BybitAPI] order/amend error: {resp.get('retCode')} {resp.get('retMsg')}")
             return None
 
-        # Доп. шаг: SL/TP
+        # Доп. шаг: SL/TP через trading-stop
         if stop_loss is not None or take_profit is not None:
             ok = True
             if stop_loss is not None:
                 ok = ok and self.update_position_stop_loss(symbol, float(stop_loss), trigger_by_source=trigger_by_source)
             if take_profit is not None:
+                tp_q = self.quantize_price(symbol, float(take_profit))
                 params_tp = {
                     "category": self.market_type,
                     "symbol": (symbol or "").upper(),
-                    "takeProfit": str(take_profit),
+                    "takeProfit": str(tp_q),
                     "tpTriggerBy": self._map_trigger_by(trigger_by_source),
                 }
                 resp_tp = self._send_request("POST", "/v5/position/trading-stop", params_tp, requires_auth=True)
@@ -492,116 +727,3 @@ class BybitAPI:
             return {"ok": ok, "result": resp.get("result")}
 
         return resp.get("result")
-
-    # ==================== WebSocket ====================
-
-    def start_websocket(self, on_message: Optional[Callable] = None):
-        """Запуск WS с авто-переподключением (публичный стрим категории market_type).
-           На реконнекте выполняем ре-сабскрайб и держим пинг."""
-        from websocket import WebSocketApp
-
-        def _resubscribe(ws):
-            # безопасно переотправляем все темы
-            with self._ws_lock:
-                topics = list(self._ws_subscriptions)
-            if not topics:
-                return
-            try:
-                ws.send(json.dumps({"op": "subscribe", "args": topics}))
-                print(f"[WS] Resubscribed: {topics}")
-            except Exception as e:
-                print(f"[WS] resubscribe error: {e}")
-
-        def on_ws_message(ws, message):
-            try:
-                data = json.loads(message)
-                if on_message:
-                    on_message(data)
-                topic = data.get("topic")
-                if topic and topic in self.ws_callbacks:
-                    self.ws_callbacks[topic](data)
-            except Exception as e:
-                print(f"WS message error: {e}")
-
-        def on_ws_error(ws, error):
-            print(f"WS error: {error}")
-
-        def on_ws_close(ws, *_):
-            print("WS closed — reconnecting...")
-            self._ws_should_run = False
-            time.sleep(2)
-            # автоперезапуск
-            self.start_websocket(on_message)
-
-        def on_ws_open(ws):
-            print("WS connection opened")
-            _resubscribe(ws)
-            # пинг-поток
-            def _pinger():
-                while self._ws_should_run:
-                    try:
-                        ws.send(json.dumps({"op": "ping"}))
-                    except Exception:
-                        break
-                    time.sleep(15)
-            self._ws_should_run = True
-            threading.Thread(target=_pinger, daemon=True).start()
-
-        self.ws = WebSocketApp(
-            self.ws_url,
-            on_open=on_ws_open,
-            on_message=on_ws_message,
-            on_error=on_ws_error,
-            on_close=on_ws_close,
-        )
-        threading.Thread(target=self.ws.run_forever, daemon=True).start()
-
-    def _convert_kline_item(self, it: Dict) -> Optional[Dict]:
-        """Конвертация WS-kline item -> candle dict (как ждёт KWINStrategy)."""
-        try:
-            ts = int(it.get("start") or it.get("startTime") or it.get("t") or 0)
-            if ts == 0:
-                return None
-            return {
-                "timestamp": ts,  # уже мс у Bybit
-                "open":  self._to_float(it.get("open")  or it.get("o")),
-                "high":  self._to_float(it.get("high")  or it.get("h")),
-                "low":   self._to_float(it.get("low")   or it.get("l")),
-                "close": self._to_float(it.get("close") or it.get("c")),
-                "volume": self._to_float(it.get("volume") or it.get("v")),
-            }
-        except Exception:
-            return None
-
-    def _subscribe_topics(self, topics: List[str]):
-        with self._ws_lock:
-            for t in topics:
-                self._ws_subscriptions.add(t)
-        try:
-            if self.ws:
-                self.ws.send(json.dumps({"op": "subscribe", "args": topics}))
-        except Exception as e:
-            print(f"WS send error: {e}")
-
-    def subscribe_kline(self, symbol: str, interval: str, callback: Callable[[Dict], None]):
-        """
-        Подписка на kline. В callback отдаём УЖЕ ГОТОВЫЙ candle-словарь
-        {'timestamp','open','high','low','close','volume'} ТОЛЬКО по закрытию бара.
-        """
-        if not self.ws:
-            self.start_websocket()
-        topic = f"kline.{interval}.{(symbol or '').upper()}"
-
-        def _cb(data: Dict):
-            try:
-                items = data.get("data") or []
-                for it in items:
-                    if bool(it.get("confirm", False)):
-                        candle = self._convert_kline_item(it)
-                        if candle:
-                            callback(candle)
-            except Exception as e:
-                print(f"kline callback error: {e}")
-
-        self.ws_callbacks[topic] = _cb
-        self._subscribe_topics([topic])
