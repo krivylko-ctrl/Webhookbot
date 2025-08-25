@@ -62,11 +62,11 @@ class Config:
         # ARM (вооружение трейла после достижения RR)
         self.use_arm_after_rr = env("USE_ARM_AFTER_RR", "true").lower() not in ("0", "false", "no")
         self.arm_rr           = max(0.1, float(env("ARM_RR", "0.5")))          # в R, минимально 0.1
-        self.arm_rr_basis     = env("ARM_RR_BASIS", "extremum").lower()        # "extremum"|"last"
+        self.arm_rr_basis     = env("ARM_RR_BASIS", "extremum").lower()        # "extremum"|"last" (в стратегии база всё равно = close)
 
-        # Источники цены (по умолчанию триггеры по mark)
-        self.price_for_logic      = env("PRICE_FOR_LOGIC", "last").lower()     # "last"|"mark"
-        self.trigger_price_source = env("TRIGGER_PRICE_SOURCE", "mark").lower()# "last"|"mark"
+        # Источники цены — ДЕФОЛТ "close" для Pine-паритета!
+        self.price_for_logic      = env("PRICE_FOR_LOGIC", "close").lower()     # "close"|"last"|"mark"
+        self.trigger_price_source = env("TRIGGER_PRICE_SOURCE", "mark").lower() # "last"|"mark"
 
         # === ЗОНАЛЬНЫЙ СТОП ===
         self.use_swing_sl        = env("USE_SWING_SL", "false").lower() not in ("0","false","no")
@@ -79,9 +79,8 @@ class Config:
         # === LUX SFP ===
         self.lux_mode                   = env("LUX_MODE", "true").lower() not in ("0","false","no")
         self.lux_swings                 = int(env("LUX_SWINGS", "2"))
-        # "outside_gt" | "outside_lt" | "none"
-        # дефолт приведён к 'outside_gt' для консистентности с бэктестом/WS
-        self.lux_volume_validation      = env("LUX_VOLUME_VALIDATION", "outside_gt").lower()
+        # В стратегии сейчас принудительно "none". Ставим такой же дефолт, чтобы не вводить в заблуждение.
+        self.lux_volume_validation      = env("LUX_VOLUME_VALIDATION", "none").lower()  # "outside_gt" | "outside_lt" | "none"
         self.lux_volume_threshold_pct   = float(env("LUX_VOLUME_THRESHOLD_PCT", "10.0"))
         self.lux_auto                   = env("LUX_AUTO", "false").lower() not in ("0","false","no")
         self.lux_mlt                    = int(env("LUX_MLT", "10"))
@@ -90,8 +89,8 @@ class Config:
         self.lux_expire_bars            = int(env("LUX_EXPIRE_BARS", "500"))
 
         # === ИНТРАБАР ===
-        self.use_intrabar         = env("USE_INTRABAR", "true").lower() not in ("0","false","no")   # 1m только для трейлинга
-        self.use_intrabar_entries = env("USE_INTRABAR_ENTRIES", "false").lower() not in ("0","false","no")  # ⛔ входы по M1
+        self.use_intrabar         = env("USE_INTRABAR", "true").lower() not in ("0","false","no")   # 1m для сигналов/трейлинга
+        self.use_intrabar_entries = env("USE_INTRABAR_ENTRIES", "false").lower() not in ("0","false","no")  # сейчас стратегия смотрит только use_intrabar
         self.intrabar_tf          = env("INTRABAR_TF", "1")
         self.intrabar_pull_limit  = int(env("INTRABAR_PULL_LIMIT", "1500"))
         self.smooth_intrabar      = env("SMOOTH_INTRABAR", "true").lower() not in ("0","false","no")
@@ -101,7 +100,7 @@ class Config:
         self.limit_qty_enabled = env("LIMIT_QTY_ENABLED", "true").lower() not in ("0","false","no")
         self.max_qty_manual    = float(env("MAX_QTY_MANUAL", "50.0"))
 
-        # === ФИЛЬТРЫ SFP (на будущее; Lux-версии могут их игнорировать) ===
+        # === ФИЛЬТРЫ SFP (для «классики», Lux может игнорить) ===
         self.use_sfp_quality = env("USE_SFP_QUALITY", "true").lower() not in ("0","false","no")
         self.wick_min_ticks  = int(env("WICK_MIN_TICKS", "7"))
         self.close_back_pct  = float(env("CLOSE_BACK_PCT", "1.0"))  # [0..1]
@@ -137,6 +136,14 @@ class Config:
         self.use_bar_trail   = env("USE_BAR_TRAIL", "true").lower() not in ("0","false","no")
         self.trail_lookback  = int(env("TRAIL_LOOKBACK", "50"))
         self.trail_buf_ticks = int(env("TRAIL_BUF_TICKS", "40"))
+
+        # === ДОП. ФЛАГИ ДЛЯ 1:1 С KWINStrategy ===
+        self.initial_capital      = float(env("INITIAL_CAPITAL", "300.0"))      # используется если equity_source='local'
+        self.equity_source        = env("EQUITY_SOURCE", "local").lower()       # 'local' | 'wallet'
+        self.equity_mode          = env("EQUITY_MODE", "wallet_plus_upnl").lower()  # 'wallet' | 'wallet_plus_upnl'
+        self.wallet_includes_upnl = env("WALLET_INCLUDES_UPNL", "false").lower() not in ("0","false","no")
+        self.quantize_initial_sl  = env("QUANTIZE_INITIAL_SL", "false").lower() not in ("0","false","no")
+        self.force_pine_min_qty   = env("FORCE_PINE_MIN_QTY", "false").lower() not in ("0","false","no")
 
         # Нормализация и загрузка config.json (если есть)
         self._update_days_back()
@@ -217,9 +224,9 @@ class Config:
             self.tick_size = max(self.tick_size, 0.01)
 
         # строковые поля + вайтлисты
-        self.price_for_logic = (self.price_for_logic or "last").lower()
-        if self.price_for_logic not in ("last", "mark"):
-            self.price_for_logic = "last"
+        self.price_for_logic = (self.price_for_logic or "close").lower()
+        if self.price_for_logic not in ("close", "last", "mark"):
+            self.price_for_logic = "close"
 
         self.trigger_price_source = (self.trigger_price_source or "mark").lower()
         if self.trigger_price_source not in ("last", "mark"):
@@ -229,13 +236,12 @@ class Config:
         if self.arm_rr_basis not in ("extremum", "last"):
             self.arm_rr_basis = "extremum"
 
-        # новые числовые — приводим к корректным диапазонам
+        # числа
         try:
             self.sl_buf_ticks = max(0, int(self.sl_buf_ticks))
         except Exception:
             self.sl_buf_ticks = 0
 
-        # числа
         try:
             self.trailing_perc = max(0.0, float(self.trailing_perc))
         except Exception:
@@ -256,9 +262,9 @@ class Config:
             self.intrabar_tf = "1"
 
         # ---- Lux поля ----
-        self.lux_volume_validation = (self.lux_volume_validation or "outside_gt").lower()
+        self.lux_volume_validation = (self.lux_volume_validation or "none").lower()
         if self.lux_volume_validation not in ("outside_gt", "outside_lt", "none"):
-            self.lux_volume_validation = "outside_gt"
+            self.lux_volume_validation = "none"
 
         try:
             self.lux_volume_threshold_pct = max(0.0, min(100.0, float(self.lux_volume_threshold_pct)))
@@ -282,6 +288,14 @@ class Config:
 
         # ---- Dual-SFP поля ----
         self.bar_priority = self._normalize_bar_priority(self.bar_priority)
+
+        # ---- Equity / исполнение ----
+        self.equity_source = (self.equity_source or "local").lower()
+        if self.equity_source not in ("local", "wallet"):
+            self.equity_source = "local"
+        self.equity_mode = (self.equity_mode or "wallet_plus_upnl").lower()
+        if self.equity_mode not in ("wallet", "wallet_plus_upnl"):
+            self.equity_mode = "wallet_plus_upnl"
 
     # ---------- load/save ----------
 
@@ -399,6 +413,14 @@ class Config:
             "use_bar_trail": self.use_bar_trail,
             "trail_lookback": self.trail_lookback,
             "trail_buf_ticks": self.trail_buf_ticks,
+
+            # --- KWIN parity / wallet ---
+            "initial_capital": self.initial_capital,
+            "equity_source": self.equity_source,
+            "equity_mode": self.equity_mode,
+            "wallet_includes_upnl": self.wallet_includes_upnl,
+            "quantize_initial_sl": self.quantize_initial_sl,
+            "force_pine_min_qty": self.force_pine_min_qty,
         }
 
     def validate(self) -> bool:
@@ -415,7 +437,7 @@ class Config:
                 raise ValueError("close_back_pct must be in [0..1]")
             if self.arm_rr_basis not in ("extremum", "last"):
                 raise ValueError("arm_rr_basis invalid")
-            if self.price_for_logic not in ("last", "mark"):
+            if self.price_for_logic not in ("close", "last", "mark"):
                 raise ValueError("price_for_logic invalid")
             if self.trigger_price_source not in ("last", "mark"):
                 raise ValueError("trigger_price_source invalid")
@@ -443,6 +465,14 @@ class Config:
                 raise ValueError("bar_priority must be one of: Prefer Bear | Prefer Bull | Skip")
             if self.start_time_ms is not None and int(self.start_time_ms) < 0:
                 raise ValueError("start_time_ms must be >= 0 (unix ms)")
+
+            # Equity settings
+            if self.equity_source not in ("local", "wallet"):
+                raise ValueError("equity_source invalid")
+            if self.equity_mode not in ("wallet", "wallet_plus_upnl"):
+                raise ValueError("equity_mode invalid")
+            if self.initial_capital <= 0:
+                raise ValueError("initial_capital must be > 0")
 
             return True
         except Exception as e:
