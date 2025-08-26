@@ -9,6 +9,7 @@ import backtrader as bt
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+import matplotlib.dates as mdates  # ← для правильной привязки к оси времени
 
 # ---- боевые модули ----
 from kwin_strategy import KWINStrategy
@@ -144,7 +145,6 @@ class BTApiAdapter:
         return {"lastPrice": px, "markPrice": px, "last_price": px, "mark_price": px}
 
     def get_price(self, symbol: str, source: str = "last") -> float:
-        # Источник в backtest одинаковый (данные одни и те же); KWIN смотрит на config.price_for_logic
         return float(self.ctx.data1.close[0]) if self.ctx.data1_present else float(self.ctx.data0.close[0])
 
     def place_order(self, symbol: str, side: str, orderType: str, qty: float,
@@ -205,18 +205,16 @@ class BT_KwinAdapter(bt.Strategy):
         risk_reward=1.3,
         sl_buf_ticks=0,
         lux_swings=2,
-        lux_volume_validation="none",  # по ТЗ — байпас по умолчанию
-        use_intrabar=True,             # включаем интрабарную обработку
+        lux_volume_validation="none",
+        use_intrabar=True,
         intrabar_tf="1",
         intrabar_pull_limit=2000,
         price_for_logic="last",
     )
 
     def __init__(self):
-        # наличие второй ленты (1m)
         self.data1_present = (len(self.datas) > 1)
 
-        # конфиг для KWIN
         cfg = Config()
         cfg.symbol = self.p.symbol
         cfg.tick_size = float(self.p.tick_size)
@@ -266,10 +264,8 @@ class BT_KwinAdapter(bt.Strategy):
         }
 
     def next(self):
-        # синхронно обновляем equity
         self.state.set_equity(float(self.broker.getvalue()))
 
-        # 1) Интрабар 1m (если есть новый бар на data1)
         if self.data1_present:
             dt1 = self.data1.datetime.datetime(0)
             if self._last_dt1 != dt1:
@@ -277,14 +273,12 @@ class BT_KwinAdapter(bt.Strategy):
                 candle_1m = self._bar_to_candle(self.data1)
                 self.kwin.on_bar_close_1m(candle_1m)
 
-        # 2) Основной бар 15m (если новый)
         dt0 = self.data0.datetime.datetime(0)
         if self._last_dt0 != dt0:
             self._last_dt0 = dt0
             candle_15m = self._bar_to_candle(self.data0)
             self.kwin.on_bar_close_15m(candle_15m)
 
-        # 3) Смарт-трейл (возьмёт цену через bt_api)
         self.kwin.process_trailing()
 
 # =========================== UI: источники ===========================
@@ -311,7 +305,7 @@ with st.expander("Источник данных", expanded=True):
         period = st.selectbox("Период", ["7d", "14d", "30d", "60d", "1y"], index=2)
         if st.button("Скачать с Yahoo"):
             df15 = load_yahoo(ticker, tf, period)
-            df1 = None  # Yahoo 1m ограничен — пропускаем
+            df1 = None
         if df15 is not None:
             st.success(f"{tf}: {len(df15)} строк | {df15['datetime'].iloc[0]} → {df15['datetime'].iloc[-1]}")
             st.dataframe(df15.head(5), use_container_width=True)
@@ -370,12 +364,70 @@ run = st.button("🚀 Запустить")
 class PandasData15(PandasData): pass
 class PandasData1(PandasData): pass
 
+# ---------- Рисовалка стрелок поверх графика ----------
+def _plot_trade_markers(ax, df15: pd.DataFrame, trades: List[Dict]) -> None:
+    """Рисует стрелочки входов/выходов по данным из KWIN Database."""
+    if not trades or df15 is None or df15.empty:
+        return
+
+    # ось времени backtrader — matplotlib dates
+    # подготовим быстрый доступ к средним ценам бара (для fallback)
+    mid_price_by_dt = {pd.to_datetime(d).to_pydatetime(): float(c)
+                       for d, c in zip(df15["datetime"], (df15["high"]+df15["low"])/2)}
+
+    xs_in, ys_in, colors_in, markers_in = [], [], [], []
+    xs_out, ys_out, colors_out, markers_out = [], [], [], []
+
+    for tr in trades:
+        try:
+            # вход
+            ets = tr.get("entry_time")
+            epx = tr.get("entry_price")
+            side = (tr.get("direction") or "").lower()
+            if ets:
+                edt = pd.to_datetime(ets, utc=True, errors="coerce").tz_convert(None).to_pydatetime()
+                x = mdates.date2num(edt)
+                y = float(epx) if epx else float(mid_price_by_dt.get(edt))
+                if side == "long":
+                    xs_in.append(x); ys_in.append(y); colors_in.append("#10B981"); markers_in.append("^")
+                elif side == "short":
+                    xs_in.append(x); ys_in.append(y); colors_in.append("#EF4444"); markers_in.append("v")
+
+            # выход (если есть)
+            xts = tr.get("exit_time")
+            xpx = tr.get("exit_price")
+            if xts and xpx is not None:
+                xdt = pd.to_datetime(xts, utc=True, errors="coerce").tz_convert(None).to_pydatetime()
+                xnum = mdates.date2num(xdt)
+                yv = float(xpx)
+                if side == "long":
+                    xs_out.append(xnum); ys_out.append(yv); colors_out.append("#10B981"); markers_out.append("v")
+                elif side == "short":
+                    xs_out.append(xnum); ys_out.append(yv); colors_out.append("#EF4444"); markers_out.append("^")
+        except Exception:
+            continue
+
+    # входы — сплошные маркеры
+    for x, y, c, m in zip(xs_in, ys_in, colors_in, markers_in):
+        ax.scatter(x, y, marker=m, s=70, c=c, edgecolors="black", linewidths=0.6, zorder=5)
+
+    # выходы — полые маркеры
+    for x, y, c, m in zip(xs_out, ys_out, colors_out, markers_out):
+        ax.scatter(x, y, marker=m, s=90, facecolors="white", edgecolors=c, linewidths=1.2, zorder=5)
+
+    # легенда
+    import matplotlib.lines as mlines
+    lg_long_in  = mlines.Line2D([], [], color="#10B981", marker="^", linestyle="None", markersize=8, label="Long entry")
+    lg_long_out = mlines.Line2D([], [], color="#10B981", marker="v", markerfacecolor="white", linestyle="None", markersize=8, label="Long exit")
+    lg_sh_in    = mlines.Line2D([], [], color="#EF4444", marker="v", linestyle="None", markersize=8, label="Short entry")
+    lg_sh_out   = mlines.Line2D([], [], color="#EF4444", marker="^", markerfacecolor="white", linestyle="None", markersize=8, label="Short exit")
+    ax.legend(handles=[lg_long_in, lg_long_out, lg_sh_in, lg_sh_out], loc="upper left")
+
 if run:
     if df15 is None or df15.empty:
         st.error("Нет данных 15m.")
     else:
         cerebro = bt.Cerebro()
-        # ВАЖНО: исполнять по close текущего бара — как у тебя в лайве
         cerebro.broker.set_coc(bool(cheat_on_close))
 
         data0 = PandasData15(dataname=df15.set_index("datetime"))
@@ -400,7 +452,7 @@ if run:
             risk_reward=rr,
             sl_buf_ticks=sl_buf_ticks,
             lux_swings=swings,
-            lux_volume_validation="none",           # по умолчанию — байпас
+            lux_volume_validation="none",
             use_intrabar=(data1 is not None),
             intrabar_tf="1",
             price_for_logic=price_for_logic,
@@ -435,8 +487,18 @@ if run:
             sr = sharpe.get("sharperatio", None)
             st.metric("Sharpe", f"{sr:.2f}" if sr is not None else "—")
 
-        # график
+        # график Backtrader
         fig = cerebro.plot(style='candlestick', iplot=False, volume=False)[0][0]
+
+        # ---- стрелочки входов/выходов из твоей БД ----
+        try:
+            trades = strat.kwin.db.get_all_trades() if hasattr(strat, "kwin") else []
+            ax_price = fig.axes[0] if fig.axes else None
+            if trades and ax_price is not None:
+                _plot_trade_markers(ax_price, df15, trades)
+        except Exception as e:
+            st.warning(f"Не удалось наложить метки сделок: {e}")
+
         st.pyplot(fig, clear_figure=True, use_container_width=True)
 
         # ===================== Экспорт сделок / логов из твоей БД =====================
