@@ -5,11 +5,12 @@ import io
 
 import streamlit as st
 import pandas as pd
+import numpy as np
 import backtrader as bt
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-import matplotlib.dates as mdates  # ← для правильной привязки к оси времени
+import matplotlib.dates as mdates  # для привязки к оси времени
 
 # ---- боевые модули ----
 from kwin_strategy import KWINStrategy
@@ -359,20 +360,36 @@ with e3:
 with e4:
     price_for_logic = st.selectbox("Источник цены для логики", ["last", "mark"], index=0)
 
+# Оверлеи на графике
+st.subheader("Оверлеи")
+ov1, ov2, ov3 = st.columns(3)
+with ov1:
+    show_trade_markers = st.checkbox("Показывать стрелочки вход/выход", True)
+with ov2:
+    show_sl_tp = st.checkbox("Показывать линии SL/TP", True)
+with ov3:
+    show_labels = st.checkbox("Подписи (R, PnL)", True)
+
 run = st.button("🚀 Запустить")
 
 class PandasData15(PandasData): pass
 class PandasData1(PandasData): pass
 
-# ---------- Рисовалка стрелок поверх графика ----------
-def _plot_trade_markers(ax, df15: pd.DataFrame, trades: List[Dict]) -> None:
-    """Рисует стрелочки входов/выходов по данным из KWIN Database."""
+# ---------- Рисовалка стрелок + SL/TP + подписи ----------
+def _plot_trade_markers(ax, df15: pd.DataFrame, trades: List[Dict],
+                        *, show_sl_tp: bool = True, show_labels: bool = True) -> None:
+    """Рисует стрелочки входов/выходов, SL/TP линии и подписи (R, PnL) из KWIN Database."""
     if not trades or df15 is None or df15.empty:
         return
 
-    # ось времени backtrader — matplotlib dates
-    # подготовим быстрый доступ к средним ценам бара (для fallback)
-    mid_price_by_dt = {pd.to_datetime(d).to_pydatetime(): float(c)
+    # баровая ширина в днях для линий SL/TP
+    dn = mdates.date2num(pd.to_datetime(df15["datetime"]).dt.tz_convert(None).to_pydatetime())
+    if len(dn) >= 2:
+        bar_w = float(np.median(np.diff(dn)))
+    else:
+        bar_w = 1/96.0  # ~15m
+
+    mid_price_by_dt = {pd.to_datetime(d).tz_convert(None).to_pydatetime(): float(c)
                        for d, c in zip(df15["datetime"], (df15["high"]+df15["low"])/2)}
 
     xs_in, ys_in, colors_in, markers_in = [], [], [], []
@@ -380,30 +397,76 @@ def _plot_trade_markers(ax, df15: pd.DataFrame, trades: List[Dict]) -> None:
 
     for tr in trades:
         try:
-            # вход
-            ets = tr.get("entry_time")
-            epx = tr.get("entry_price")
             side = (tr.get("direction") or "").lower()
-            if ets:
-                edt = pd.to_datetime(ets, utc=True, errors="coerce").tz_convert(None).to_pydatetime()
-                x = mdates.date2num(edt)
-                y = float(epx) if epx else float(mid_price_by_dt.get(edt))
-                if side == "long":
-                    xs_in.append(x); ys_in.append(y); colors_in.append("#10B981"); markers_in.append("^")
-                elif side == "short":
-                    xs_in.append(x); ys_in.append(y); colors_in.append("#EF4444"); markers_in.append("v")
+            e_ts = tr.get("entry_time")
+            x_ts = tr.get("exit_time")
+            e_px = tr.get("entry_price")
+            x_px = tr.get("exit_price")
+            sl   = tr.get("stop_loss")
+            tp   = tr.get("take_profit")
+            pnl  = tr.get("pnl")
+            rr   = tr.get("rr")
 
-            # выход (если есть)
-            xts = tr.get("exit_time")
-            xpx = tr.get("exit_price")
-            if xts and xpx is not None:
-                xdt = pd.to_datetime(xts, utc=True, errors="coerce").tz_convert(None).to_pydatetime()
-                xnum = mdates.date2num(xdt)
-                yv = float(xpx)
+            if not e_ts:
+                continue
+
+            # точки входа/выхода
+            edt = pd.to_datetime(e_ts, utc=True, errors="coerce").tz_convert(None).to_pydatetime()
+            xedt = mdates.date2num(edt)
+            y_entry = float(e_px) if e_px is not None else float(mid_price_by_dt.get(edt))
+
+            if side == "long":
+                xs_in.append(xedt); ys_in.append(y_entry); colors_in.append("#10B981"); markers_in.append("^")
+            elif side == "short":
+                xs_in.append(xedt); ys_in.append(y_entry); colors_in.append("#EF4444"); markers_in.append("v")
+
+            exit_xnum = None
+            if x_ts and x_px is not None:
+                xdt = pd.to_datetime(x_ts, utc=True, errors="coerce").tz_convert(None).to_pydatetime()
+                exit_xnum = mdates.date2num(xdt)
                 if side == "long":
-                    xs_out.append(xnum); ys_out.append(yv); colors_out.append("#10B981"); markers_out.append("v")
+                    xs_out.append(exit_xnum); ys_out.append(float(x_px)); colors_out.append("#10B981"); markers_out.append("v")
                 elif side == "short":
-                    xs_out.append(xnum); ys_out.append(yv); colors_out.append("#EF4444"); markers_out.append("^")
+                    xs_out.append(exit_xnum); ys_out.append(float(x_px)); colors_out.append("#EF4444"); markers_out.append("^")
+
+            # SL/TP линии (горизонтальные) от входа до выхода (или на 2 бара вперёд)
+            if show_sl_tp and (sl is not None or tp is not None):
+                x_start = xedt - 0.15*bar_w  # чуть левее входа
+                x_end   = exit_xnum if exit_xnum is not None else (xedt + 2*bar_w)
+
+                if sl is not None:
+                    ax.hlines(y=float(sl), xmin=x_start, xmax=x_end,
+                              colors="#EF4444", linestyles="dashed", linewidth=1.2, zorder=3)
+                if tp is not None:
+                    ax.hlines(y=float(tp), xmin=x_start, xmax=x_end,
+                              colors="#10B981", linestyles="dashed", linewidth=1.2, zorder=3)
+
+            # подписи возле входа
+            if show_labels:
+                label_parts = []
+                if rr is not None:
+                    try:
+                        label_parts.append(f"R={float(rr):.2f}")
+                    except Exception:
+                        pass
+                if pnl is not None:
+                    try:
+                        label_parts.append(f"PnL={float(pnl):.2f}")
+                    except Exception:
+                        pass
+                if label_parts:
+                    text = " • ".join(label_parts)
+                    # смещение подписи: над long, под short
+                    dy = (0.004 if side == "long" else -0.004) * y_entry
+                    ax.annotate(text, (xedt, y_entry),
+                                xytext=(0, 12 if side == "long" else -14),
+                                textcoords="offset points",
+                                ha="center", va="bottom" if side == "long" else "top",
+                                fontsize=8, color="#111827",
+                                bbox=dict(boxstyle="round,pad=0.2",
+                                          fc="#D1FAE5" if side == "long" else "#FEE2E2",
+                                          ec="#10B981" if side == "long" else "#EF4444",
+                                          lw=0.8, alpha=0.9))
         except Exception:
             continue
 
@@ -490,12 +553,13 @@ if run:
         # график Backtrader
         fig = cerebro.plot(style='candlestick', iplot=False, volume=False)[0][0]
 
-        # ---- стрелочки входов/выходов из твоей БД ----
+        # ---- стрелочки/SL-TP/подписи из твоей БД ----
         try:
             trades = strat.kwin.db.get_all_trades() if hasattr(strat, "kwin") else []
             ax_price = fig.axes[0] if fig.axes else None
-            if trades and ax_price is not None:
-                _plot_trade_markers(ax_price, df15, trades)
+            if trades and ax_price is not None and show_trade_markers:
+                _plot_trade_markers(ax_price, df15, trades,
+                                    show_sl_tp=show_sl_tp, show_labels=show_labels)
         except Exception as e:
             st.warning(f"Не удалось наложить метки сделок: {e}")
 
