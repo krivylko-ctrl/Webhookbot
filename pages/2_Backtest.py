@@ -1,6 +1,8 @@
 # pages/3_Backtrader.py — Бэктест твоей KWINStrategy с dual-TF (15m + 1m)
 import os
 from typing import List, Dict, Optional, Tuple
+import io
+
 import streamlit as st
 import pandas as pd
 import backtrader as bt
@@ -8,7 +10,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-# ---- твои боевые модули ----
+# ---- боевые модули ----
 from kwin_strategy import KWINStrategy
 from config import Config
 from state_manager import StateManager
@@ -39,7 +41,6 @@ def _norm_df(df: pd.DataFrame) -> pd.DataFrame:
         raise ValueError("В источнике нет колонки 'datetime'")
     df["datetime"] = pd.to_datetime(df["datetime"], utc=True, errors="coerce")
     df.dropna(subset=["datetime"], inplace=True)
-    # если volume нет — создадим нули
     if "volume" not in df.columns:
         df["volume"] = 0.0
     df = df[REQ_COLS]
@@ -139,11 +140,11 @@ class BTApiAdapter:
         }
 
     def get_ticker(self, symbol: str) -> Dict:
-        # берем последнюю доступную цену (если есть 1m — используем её, иначе 15m)
         px = float(self.ctx.data1.close[0]) if self.ctx.data1_present else float(self.ctx.data0.close[0])
         return {"lastPrice": px, "markPrice": px, "last_price": px, "mark_price": px}
 
     def get_price(self, symbol: str, source: str = "last") -> float:
+        # Источник в backtest одинаковый (данные одни и те же); KWIN смотрит на config.price_for_logic
         return float(self.ctx.data1.close[0]) if self.ctx.data1_present else float(self.ctx.data0.close[0])
 
     def place_order(self, symbol: str, side: str, orderType: str, qty: float,
@@ -208,6 +209,7 @@ class BT_KwinAdapter(bt.Strategy):
         use_intrabar=True,             # включаем интрабарную обработку
         intrabar_tf="1",
         intrabar_pull_limit=2000,
+        price_for_logic="last",
     )
 
     def __init__(self):
@@ -232,6 +234,8 @@ class BT_KwinAdapter(bt.Strategy):
         cfg.use_intrabar = bool(self.p.use_intrabar)
         cfg.intrabar_tf = str(self.p.intrabar_tf)
         cfg.intrabar_pull_limit = int(self.p.intrabar_pull_limit)
+
+        cfg.price_for_logic = str(self.p.price_for_logic).lower()
 
         self.db = Database(memory=True)
         self.state = StateManager(self.db)
@@ -258,7 +262,7 @@ class BT_KwinAdapter(bt.Strategy):
             "high":  float(data.high[0]),
             "low":   float(data.low[0]),
             "close": float(data.close[0]),
-            "volume": float(data.volume[0]) if hasattr(data, "volume") else 0.0,
+            "volume": float(getattr(data, "volume", [0])[0] or 0.0),
         }
 
     def next(self):
@@ -328,7 +332,7 @@ with st.expander("Источник данных", expanded=True):
 st.markdown("---")
 st.header("Запуск бэктеста (KWINStrategy) — dual-TF")
 
-c0, c1, c2, c3 = st.columns(4)
+c0, c1, c2, c3, c4 = st.columns(5)
 with c0:
     symbol = st.text_input("Символ", "ETHUSDT")
 with c1:
@@ -337,6 +341,8 @@ with c2:
     commission = st.number_input("Комиссия (taker, dec.)", 0.0, 0.01, 0.00055, 0.00005)
 with c3:
     slippage = st.number_input("Слиппедж (dec.)", 0.0, 0.01, 0.0, 0.0001)
+with c4:
+    cheat_on_close = st.checkbox("Исполнять по close текущего бара (Cheat-On-Close)", True)
 
 st.subheader("Параметры стратегии")
 d1, d2, d3, d4 = st.columns(4)
@@ -349,13 +355,15 @@ with d3:
 with d4:
     sl_buf_ticks = st.number_input("SL buf (ticks)", 0, 200, 0, 1)
 
-e1, e2, e3 = st.columns(3)
+e1, e2, e3, e4 = st.columns(4)
 with e1:
     tick_size = st.number_input("tick_size", 0.0001, 1.0, 0.01, 0.0001, format="%.4f")
 with e2:
     qty_step = st.number_input("qty_step", 0.0001, 1.0, 0.01, 0.0001, format="%.4f")
 with e3:
     min_order_qty = st.number_input("min_order_qty", 0.0001, 10.0, 0.01, 0.0001, format="%.4f")
+with e4:
+    price_for_logic = st.selectbox("Источник цены для логики", ["last", "mark"], index=0)
 
 run = st.button("🚀 Запустить")
 
@@ -367,6 +375,9 @@ if run:
         st.error("Нет данных 15m.")
     else:
         cerebro = bt.Cerebro()
+        # ВАЖНО: исполнять по close текущего бара — как у тебя в лайве
+        cerebro.broker.set_coc(bool(cheat_on_close))
+
         data0 = PandasData15(dataname=df15.set_index("datetime"))
         cerebro.adddata(data0)  # data0 = 15m
 
@@ -389,9 +400,10 @@ if run:
             risk_reward=rr,
             sl_buf_ticks=sl_buf_ticks,
             lux_swings=swings,
-            lux_volume_validation="none",
+            lux_volume_validation="none",           # по умолчанию — байпас
             use_intrabar=(data1 is not None),
             intrabar_tf="1",
+            price_for_logic=price_for_logic,
         )
 
         # Аналайзеры
@@ -401,7 +413,7 @@ if run:
         cerebro.addanalyzer(bt.analyzers.Returns, _name='rets', timeframe=bt.TimeFrame.Days)
 
         result = cerebro.run(maxcpus=1)
-        strat = result[0]
+        strat: BT_KwinAdapter = result[0]
         final_val = cerebro.broker.getvalue()
         st.success(f"Финальный капитал: {final_val:.2f}")
 
@@ -426,3 +438,32 @@ if run:
         # график
         fig = cerebro.plot(style='candlestick', iplot=False, volume=False)[0][0]
         st.pyplot(fig, clear_figure=True, use_container_width=True)
+
+        # ===================== Экспорт сделок / логов из твоей БД =====================
+        st.markdown("### 📋 Сделки (из KWIN Database)")
+        try:
+            trades = strat.kwin.db.get_all_trades() if hasattr(strat, "kwin") else []
+            if trades:
+                df_tr = pd.DataFrame(trades)
+                st.dataframe(df_tr, use_container_width=True)
+                csv_buf = io.StringIO()
+                df_tr.to_csv(csv_buf, index=False)
+                st.download_button("⬇️ Экспорт сделок CSV", data=csv_buf.getvalue(), file_name="trades_kwin.csv", mime="text/csv")
+            else:
+                st.info("Сделок нет.")
+        except Exception as e:
+            st.warning(f"Не удалось получить сделки: {e}")
+
+        st.markdown("### 🧾 Логи стратегии")
+        try:
+            logs = strat.kwin.db.get_logs(500) if hasattr(strat, "kwin") else []
+            if logs:
+                df_lg = pd.DataFrame(logs)
+                st.dataframe(df_lg, use_container_width=True)
+                csv_buf2 = io.StringIO()
+                df_lg.to_csv(csv_buf2, index=False)
+                st.download_button("⬇️ Экспорт логов CSV", data=csv_buf2.getvalue(), file_name="logs_kwin.csv", mime="text/csv")
+            else:
+                st.caption("Логи пусты.")
+        except Exception as e:
+            st.warning(f"Не удалось получить логи: {e}")
