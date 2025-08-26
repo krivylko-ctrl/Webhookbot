@@ -208,6 +208,42 @@ class BybitAPI:
         except Exception:
             return float(default)
 
+    # ---------- нормализация интервалов ----------
+    @staticmethod
+    def _norm_interval(interval: str) -> str:
+        """
+        Принимает "1","15","60","D"... а также "1m","15m","1h","4h","1d" и приводит к v5-формату.
+        """
+        s = str(interval).strip()
+        lower = s.lower()
+        # уже допустимые v5 варианты
+        if lower in {"1","3","5","15","30","60","120","240","360","720"}:
+            return lower
+        if lower in {"d", "w", "m"}:
+            return lower.upper()
+
+        # суффиксы
+        if lower.endswith("m"):
+            try:
+                return str(int(lower[:-1]))
+            except Exception:
+                return "1"
+        if lower.endswith("h"):
+            try:
+                mins = int(lower[:-1]) * 60
+                return str(mins)
+            except Exception:
+                return "60"
+        if lower.endswith("d"):
+            return "D"
+        if lower.endswith("w"):
+            return "W"
+        if lower.endswith("mo") or lower.endswith("mon"):
+            return "M"
+
+        # дефолт
+        return lower
+
     # ==================== конфиг ====================
 
     def set_market_type(self, market_type: str):
@@ -239,7 +275,7 @@ class BybitAPI:
         tick = float(((info.get("priceFilter") or {}).get("tickSize") or 0.0) or 0.0)
         if tick <= 0:
             return float(price)
-        # округление к ближайшему тика (как в стратегии для pine-like)
+        # округление к ближайшему тика
         return round(float(price) / tick) * tick
 
     def quantize_qty(self, symbol: str, qty: float) -> float:
@@ -288,14 +324,15 @@ class BybitAPI:
     def get_klines(self, symbol: str, interval: str, limit: int = 200) -> List[Dict]:
         """
         Последние N свечей по категории self.market_type.
-        interval: строка минут ("1","3","5","15","60",...).
+        interval: строка минут ("1","3","5","15","60",... или "1m","15m","1h","1d").
         Возвращает список по **убыванию** timestamp (newest-first).
         """
+        iv = self._norm_interval(interval)
         params = {
             "category": self.market_type,
             "symbol": (symbol or "").upper(),
-            "interval": str(interval),
-            "limit": int(limit),
+            "interval": iv,
+            "limit": int(min(max(1, limit), 1000)),
         }
         resp = self._send_request("GET", "/v5/market/kline", params, requires_auth=False)
         if resp.get("retCode") == 0:
@@ -334,10 +371,11 @@ class BybitAPI:
         Чтение свечей с окнами времени (start/end в мс). Возвращает по возрастанию timestamp.
         Реализована пагинация по cursor до полного покрытия окна.
         """
+        iv = self._norm_interval(interval)
         params = {
             "category": self.market_type,
             "symbol": (symbol or "").upper(),
-            "interval": str(interval),
+            "interval": iv,
             "limit": int(min(max(1, limit), 1000)),
         }
         if start_ms is not None:
