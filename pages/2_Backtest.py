@@ -1,5 +1,4 @@
 # pages/3_Backtrader.py — Бэктест KWINStrategy (15m + 1m, Bybit-only) + стрелочки вход/выход
-
 import os
 from typing import List, Dict, Optional, Tuple
 import io
@@ -56,7 +55,7 @@ def _norm_df(df: pd.DataFrame) -> pd.DataFrame:
     df.reset_index(drop=True, inplace=True)
     return df
 
-# ---------- чанковая загрузка с Bybit ----------
+# ---------- НОВОЕ: чанковая загрузка с Bybit ----------
 _MINUTES = {"1":1,"3":3,"5":5,"15":15,"30":30,"60":60}
 def _tf_ms(interval: str) -> int:
     return int(_MINUTES.get(str(interval), 1)) * 60_000
@@ -88,7 +87,7 @@ def _rows_to_df(rows: List[Dict]) -> pd.DataFrame:
     return df
 
 def _fetch_bybit_range(symbol: str, interval: str, start_ms: int, end_ms: int, max_per_call: int = 1000) -> pd.DataFrame:
-    """Качаем все бары в [start_ms, end_ms] кусками, объединяем (без обрезки по 1000 баров)."""
+    """Качаем все бары в [start_ms, end_ms] кусками, объединяем."""
     if LiveBybitAPI is None:
         st.error("bybit_api не найден")
         return pd.DataFrame(columns=REQ_COLS)
@@ -103,15 +102,10 @@ def _fetch_bybit_range(symbol: str, interval: str, start_ms: int, end_ms: int, m
         approx_window = tfms * max_per_call
         chunk_end = min(end_ms, cursor + approx_window - 1)
 
-        # предпочтительно window-метод
-        rows = []
-        try:
-            if hasattr(api, "get_klines_window"):
-                rows = api.get_klines_window(symbol, interval, start_ms=cursor, end_ms=chunk_end, limit=max_per_call) or []
-            else:
-                rows = api.get_klines(symbol, interval, max_per_call) or []
-        except Exception:
-            rows = []
+        if hasattr(api, "get_klines_window"):
+            rows = api.get_klines_window(symbol, interval, start_ms=cursor, end_ms=chunk_end, limit=max_per_call) or []
+        else:
+            rows = api.get_klines(symbol, interval, max_per_call) or []
 
         if not rows:
             cursor += tfms
@@ -133,7 +127,7 @@ def _fetch_bybit_range(symbol: str, interval: str, start_ms: int, end_ms: int, m
     return _rows_to_df(all_rows)
 
 def _utc_now():
-    """UTC-aware pandas.Timestamp."""
+    """UTC-aware timestamp (pandas.Timestamp)."""
     now = pd.Timestamp.utcnow()
     if now.tzinfo is None:
         return now.tz_localize("UTC")
@@ -146,7 +140,7 @@ def load_bybit(symbol: str, interval: str, days: int) -> Optional[pd.DataFrame]:
     return df if not df.empty else None
 
 def load_bybit_dual(symbol: str, main_interval: str, ltf_interval: str, days: int) -> Tuple[Optional[pd.DataFrame], Optional[pd.DataFrame]]:
-    """Грузим оба ТФ с Bybit за один и тот же период (полное покрытие)."""
+    """Грузим оба ТФ с Bybit за один и тот же период (полное покрытие, без обрезки 1000 баров)."""
     end = _utc_now()
     start = end - pd.Timedelta(days=int(days))
     s_ms, e_ms = int(start.timestamp()*1000), int(end.timestamp()*1000)
@@ -192,7 +186,7 @@ class BTApiAdapter:
     def get_price(self, symbol: str, source: str = "last") -> float:
         return float(self.ctx.data1.close[0]) if self.ctx.data1_present else float(self.ctx.data0.close[0])
 
-    # никакие реальные ордера в BT не отправляем — KWIN сама ведёт учёт
+    # Никаких реальных ордеров в BT — KWIN сама ведёт PnL у себя
     def place_order(self, *args, **kwargs) -> Dict:
         return {"ok": True, "order": None}
 
@@ -419,49 +413,133 @@ def _plot_trade_markers(ax, df15: pd.DataFrame, trades: List[Dict]) -> None:
     lg_sh_out   = mlines.Line2D([], [], color="#EF4444", marker="^", markerfacecolor="white", linestyle="None", markersize=8, label="Short exit")
     ax.legend(handles=[lg_long_in, lg_long_out, lg_sh_in, lg_sh_out], loc="upper left")
 
-# ---------- Хелперы метрик KWIN ----------
-def _compute_kwin_metrics(trades: List[Dict], initial_cash: float) -> Dict[str, float]:
-    """Считаем PnL, PnL%, WinRate, MaxDD, Кол-во сделок по данным KWIN DB."""
-    if not trades:
-        return {"pnl": 0.0, "pnl_pct": 0.0, "wr": 0.0, "count": 0, "maxdd_pct": 0.0}
+# ---------- Подсчёт метрик по сделкам KWIN ----------
+def _trade_qty(tr: Dict) -> float:
+    # гибкая поддержка ключей
+    for k in ("qty", "size", "quantity"):
+        if k in tr and tr[k] is not None:
+            try:
+                return float(tr[k])
+            except Exception:
+                pass
+    return 0.0
 
-    # берём ТОЛЬКО закрытые сделки
-    rows = []
-    for t in trades:
+def _trade_side(tr: Dict) -> str:
+    s = (tr.get("direction") or tr.get("side") or "").strip().lower()
+    return "long" if s.startswith("l") else ("short" if s.startswith("s") else "")
+
+def _trade_time(tr: Dict]) -> Optional[pd.Timestamp]:
+    t = tr.get("exit_time") or tr.get("close_time") or tr.get("entry_time")
+    if not t:
+        return None
+    # поддержим и ms, и iso
+    try:
+        if isinstance(t, (int, float)) and t > 1_000_000_000_000:
+            return pd.to_datetime(int(t), unit="ms", utc=True)
+        return pd.to_datetime(t, utc=True, errors="coerce")
+    except Exception:
+        return None
+
+def _compute_kwin_metrics(trades: List[Dict], start_equity: float, fee_rate: float) -> Tuple[pd.DataFrame, Dict]:
+    """
+    Возвращает:
+      - df_eq: кривая equity по закрытым сделкам
+      - stats: словарь метрик (pnl_pct, max_dd_pct, winrate, trades)
+    Логика:
+      1) Если в трейде есть 'pnl' — используем его.
+      2) Иначе считаем валовую PnL от цен и qty и вычитаем комиссии 2 * fee_rate.
+    """
+    if not trades:
+        return pd.DataFrame(columns=["time", "equity", "pnl"]), {"trades": 0, "winrate": 0.0, "pnl_pct": 0.0, "max_dd_pct": 0.0}
+
+    # берём только закрытые
+    closed = []
+    for tr in trades:
+        ex = tr.get("exit_price")
+        xt = tr.get("exit_time") or tr.get("close_time")
+        if ex is not None and xt is not None:
+            closed.append(tr)
+
+    if not closed:
+        return pd.DataFrame(columns=["time", "equity", "pnl"]), {"trades": 0, "winrate": 0.0, "pnl_pct": 0.0, "max_dd_pct": 0.0}
+
+    # сортируем по времени закрытия
+    def _time_key(tr):
+        ts = _trade_time(tr)
+        return ts.value if ts is not None else 0
+    closed.sort(key=_time_key)
+
+    equity = float(start_equity)
+    eq_points = []
+    wins = 0
+
+    for tr in closed:
+        pnl = tr.get("pnl")
+        if pnl is None:
+            # считаем сами
+            side = _trade_side(tr)
+            qty = _trade_qty(tr)
+            ent = tr.get("entry_price")
+            ex  = tr.get("exit_price")
+            if None in (ent, ex) or qty <= 0 or side == "":
+                # скипаем неполные записи
+                continue
+            ent = float(ent); ex = float(ex)
+            gross = (ex - ent) * qty if side == "long" else (ent - ex) * qty
+            fees = (ent * qty * fee_rate) + (ex * qty * fee_rate)
+            pnl = gross - fees
         try:
-            if t.get("exit_price") is None:
-                continue
-            direction = (t.get("direction") or "").lower()
-            size = float(t.get("size") or t.get("qty") or 0.0)
-            entry = float(t.get("entry_price") or 0.0)
-            exitp = float(t.get("exit_price") or 0.0)
-            if size <= 0 or entry <= 0 or exitp <= 0:
-                continue
-            etime = pd.to_datetime(t.get("exit_time"), utc=True, errors="coerce")
-            pnl = (exitp - entry) * size if direction == "long" else (entry - exitp) * size
-            rows.append({"exit_time": etime, "pnl": float(pnl)})
+            pnl = float(pnl)
         except Exception:
             continue
 
-    if not rows:
-        return {"pnl": 0.0, "pnl_pct": 0.0, "wr": 0.0, "count": 0, "maxdd_pct": 0.0}
+        equity += pnl
+        ts = _trade_time(tr) or pd.Timestamp.utcnow().tz_localize("UTC")
+        eq_points.append({"time": ts, "equity": equity, "pnl": pnl})
+        if pnl > 0:
+            wins += 1
 
-    df = pd.DataFrame(rows).sort_values("exit_time").reset_index(drop=True)
-    total_pnl = float(df["pnl"].sum())
-    count = int(len(df))
-    wins = int((df["pnl"] > 0).sum())
-    wr = (wins / count * 100.0) if count else 0.0
+    if not eq_points:
+        return pd.DataFrame(columns=["time", "equity", "pnl"]), {"trades": 0, "winrate": 0.0, "pnl_pct": 0.0, "max_dd_pct": 0.0}
 
-    # equity curve
-    eq = float(initial_cash) + df["pnl"].cumsum()
-    roll_max = eq.cummax()
-    dd = (eq - roll_max).min()  # отрицательное число
-    maxdd_abs = float(dd) if pd.notnull(dd) else 0.0
-    maxdd_pct = (abs(maxdd_abs) / float(roll_max.max()) * 100.0) if float(roll_max.max()) > 0 else 0.0
+    df_eq = pd.DataFrame(eq_points)
+    df_eq.sort_values("time", inplace=True)
+    df_eq.reset_index(drop=True, inplace=True)
 
-    pnl_pct = (total_pnl / float(initial_cash) * 100.0) if float(initial_cash) > 0 else 0.0
-    return {"pnl": total_pnl, "pnl_pct": pnl_pct, "wr": wr, "count": count, "maxdd_pct": maxdd_pct}
+    # метрики
+    trades_n = len(df_eq)
+    winrate = 100.0 * wins / trades_n if trades_n else 0.0
+    final_eq = float(df_eq["equity"].iloc[-1])
+    pnl_pct = 100.0 * (final_eq - start_equity) / start_equity if start_equity > 0 else 0.0
 
+    # max DD (по equity)
+    peak = df_eq["equity"].cummax()
+    dd = (df_eq["equity"] - peak) / peak
+    max_dd_pct = -dd.min() * 100.0 if not dd.empty else 0.0
+
+    stats = {
+        "trades": trades_n,
+        "winrate": winrate,
+        "pnl_pct": pnl_pct,
+        "max_dd_pct": max_dd_pct,
+        "final_equity": final_eq,
+    }
+    return df_eq, stats
+
+# ---------- Рисуем equity ----------
+def _plot_equity_curve(df_eq: pd.DataFrame):
+    if df_eq is None or df_eq.empty:
+        return None
+    fig = plt.figure()
+    ax = fig.add_subplot(111)
+    x = mdates.date2num(pd.to_datetime(df_eq["time"]).dt.tz_convert(None))
+    ax.plot(x, df_eq["equity"])
+    ax.set_title("KWIN Backtest — Equity")
+    ax.xaxis_date()
+    fig.autofmt_xdate()
+    return fig
+
+# =========================== Запуск ===========================
 if run:
     # забираем данные из session_state (устойчиво между перезапусками)
     df15 = st.session_state.get("data_15m")
@@ -498,11 +576,11 @@ if run:
             lux_swings=swings,
             lux_volume_validation="none",
             use_intrabar=(data1 is not None),
-            intrabar_tf=str(1 if data1 is not None else main_tf),  # если нет LTF — не критично
+            intrabar_tf="1",
             price_for_logic=price_for_logic,
         )
 
-        # Аналайзеры BT (справочные; реальные метрики ниже считаем из KWIN DB)
+        # Аналайзеры брокера (скорее справочные — сделки KWIN ведёт сама)
         cerebro.addanalyzer(bt.analyzers.TradeAnalyzer, _name='ta')
         cerebro.addanalyzer(bt.analyzers.DrawDown, _name='dd')
         cerebro.addanalyzer(bt.analyzers.SharpeRatio, _name='sharpe', timeframe=bt.TimeFrame.Days)
@@ -511,44 +589,97 @@ if run:
         result = cerebro.run(maxcpus=1)
         strat: BT_KwinAdapter = result[0]
 
-        # ---------- МЕТРИКИ по KWIN DB ----------
+        # ======= МЕТРИКИ KWIN (вариант №2 — СЧИТАЕМ САМИ) =======
+        st.markdown("## ✅ KWIN Backtest — Метрики (из БД KWIN)")
         try:
-            trades_kwin = strat.kwin.db.get_all_trades() if hasattr(strat, "kwin") else []
+            trades = strat.kwin.db.get_all_trades() if hasattr(strat, "kwin") else []
         except Exception:
-            trades_kwin = []
+            trades = []
 
-        metr = _compute_kwin_metrics(trades_kwin, float(cash))
-        m1, m2, m3, m4, m5 = st.columns(5)
-        m1.metric("PnL (USDT)", f"{metr['pnl']:.2f}")
-        m2.metric("PnL %", f"{metr['pnl_pct']:.2f}%")
-        m3.metric("WinRate", f"{metr['wr']:.1f}%")
-        m4.metric("Max DD", f"{metr['maxdd_pct']:.2f}%")
-        m5.metric("Сделок", f"{int(metr['count'])}")
+        if trades:
+            df_eq, stats = _compute_kwin_metrics(trades, start_equity=float(cash), fee_rate=float(commission))
+            c1, c2, c3, c4, c5 = st.columns(5)
+            with c1:
+                st.metric("Сделок (закрытых)", stats["trades"])
+            with c2:
+                st.metric("WinRate", f"{stats['winrate']:.1f}%")
+            with c3:
+                st.metric("PnL", f"{stats['pnl_pct']:.1f}%")
+            with c4:
+                st.metric("Max DD", f"{stats['max_dd_pct']:.1f}%")
+            with c5:
+                st.metric("Final Equity", f"{stats['final_equity']:.2f}")
 
-        # ---------- график Backtrader ----------
-        fig = cerebro.plot(style='candlestick', iplot=False, volume=False)[0][0]
+            # график equity
+            fig_eq = _plot_equity_curve(df_eq)
+            if fig_eq is not None:
+                st.pyplot(fig_eq, clear_figure=True, use_container_width=True)
 
-        # стрелочки входов/выходов из БД KWIN
-        if show_markers:
-            try:
-                ax_price = fig.axes[0] if fig.axes else None
-                if trades_kwin and ax_price is not None:
-                    _plot_trade_markers(ax_price, df15, trades_kwin)
-            except Exception as e:
-                st.warning(f"Не удалось наложить метки сделок: {e}")
+            # экспорт equity и сделок
+            st.markdown("### 📊 Equity кривая (по закрытиям)")
+            st.dataframe(df_eq, use_container_width=True)
+            csv_eq = io.StringIO()
+            df_eq.to_csv(csv_eq, index=False)
+            st.download_button("⬇️ Экспорт Equity CSV", data=csv_eq.getvalue(), file_name="kwin_equity.csv", mime="text/csv")
+        else:
+            st.info("Сделок из KWIN не найдено. Проверь, что стратегия действительно закрывает сделки и пишет в БД.")
 
-        st.pyplot(fig, clear_figure=True, use_container_width=True)
+        # ======= ПАРАМЕТРЫ БРОКЕРА (для справки) =======
+        st.markdown("---")
+        st.markdown("## ℹ️ Статистика Backtrader (справочно)")
+        broker_val = cerebro.broker.getvalue()
+        kwin_eq = strat.state.get_equity() if hasattr(strat, "state") else None
+        st.caption(f"Equity (KWIN): {kwin_eq:.2f}" if kwin_eq is not None else "Equity (KWIN): —")
+        st.caption(f"Broker Value (BT): {broker_val:.2f}")
 
-        # ---------- таблицы ----------
+        try:
+            ta = strat.analyzers.ta.get_analysis()
+            dd = strat.analyzers.dd.get_analysis()
+            sharpe = strat.analyzers.sharpe.get_analysis()
+        except Exception:
+            ta, dd, sharpe = {}, {}, {}
+
+        cA,cB,cC,cD = st.columns(4)
+        with cA:
+            total = ta.total.closed if 'total' in ta and 'closed' in ta.total else 0
+            st.metric("BT Closed Trades", total or 0)
+        with cB:
+            won = ta.won.total if 'won' in ta and 'total' in ta.won else 0
+            wr = (won/total*100) if total else 0
+            st.metric("BT WinRate", f"{wr:.1f}%")
+        with cC:
+            st.metric("BT Max DD", f"{getattr(dd.max, 'drawdown', 0):.2f}%")
+        with cD:
+            sr = sharpe.get("sharperatio", None)
+            st.metric("BT Sharpe", f"{sr:.2f}" if sr is not None else "—")
+
+        # ======= ГРАФИК ЦЕНЫ + МЕТКИ СДЕЛОК =======
+        st.markdown("---")
+        st.markdown("## График цены (Backtrader) + стрелочки KWIN")
+        try:
+            fig = cerebro.plot(style='candlestick', iplot=False, volume=False)[0][0]
+        except Exception as e:
+            fig = None
+            st.warning(f"Не удалось отрисовать график BT: {e}")
+
+        if fig is not None:
+            if show_markers:
+                try:
+                    trades_for_plot = trades
+                    ax_price = fig.axes[0] if fig.axes else None
+                    if trades_for_plot and ax_price is not None:
+                        _plot_trade_markers(ax_price, df15, trades_for_plot)
+                except Exception as e:
+                    st.warning(f"Не удалось наложить метки сделок: {e}")
+
+            st.pyplot(fig, clear_figure=True, use_container_width=True)
+
+        # ======= Таблицы сырых данных =======
+        st.markdown("---")
         st.markdown("### 📋 Сделки (из KWIN Database)")
         try:
-            if trades_kwin:
-                df_tr = pd.DataFrame(trades_kwin)
-                # удобный PnL по сделке (gross)
-                if {"entry_price","exit_price","size","direction"}.issubset(df_tr.columns):
-                    pnl = (df_tr["exit_price"] - df_tr["entry_price"]) * df_tr["size"]
-                    pnl[df_tr["direction"].str.lower()=="short"] *= -1
-                    df_tr["pnl"] = pnl
+            if trades:
+                df_tr = pd.DataFrame(trades)
                 st.dataframe(df_tr, use_container_width=True)
                 csv_buf = io.StringIO()
                 df_tr.to_csv(csv_buf, index=False)
@@ -560,7 +691,7 @@ if run:
 
         st.markdown("### 🧾 Логи стратегии")
         try:
-            logs = strat.kwin.db.get_logs(1000) if hasattr(strat, "kwin") else []
+            logs = strat.kwin.db.get_logs(500) if hasattr(strat, "kwin") else []
             if logs:
                 df_lg = pd.DataFrame(logs)
                 st.dataframe(df_lg, use_container_width=True)
