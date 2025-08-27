@@ -428,7 +428,7 @@ def _trade_side(tr: Dict) -> str:
     s = (tr.get("direction") or tr.get("side") or "").strip().lower()
     return "long" if s.startswith("l") else ("short" if s.startswith("s") else "")
 
-def _trade_time(tr: Dict]) -> Optional[pd.Timestamp]:
+def _trade_time(tr: Dict) -> Optional[pd.Timestamp]:
     t = tr.get("exit_time") or tr.get("close_time") or tr.get("entry_time")
     if not t:
         return None
