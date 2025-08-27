@@ -180,7 +180,7 @@ class BTApiAdapter:
         self._step = float(qty_step)
         self._minq = float(min_order_qty)
         self._sl_order = None
-               self._tp_order = None
+        self._tp_order = None
 
     def get_instruments_info(self, symbol: str) -> Dict:
         return {
