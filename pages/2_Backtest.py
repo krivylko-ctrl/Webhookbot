@@ -10,7 +10,6 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
-from datetime import timezone
 
 # ---- боевые модули ----
 from kwin_strategy import KWINStrategy
@@ -47,13 +46,7 @@ def _norm_df(df: pd.DataFrame) -> pd.DataFrame:
         df.rename(columns=rename, inplace=True)
     if "datetime" not in df.columns:
         raise ValueError("В источнике нет колонки 'datetime'")
-    # делаем tz-aware UTC, не «локализуем» уже-aware метки
-    dt = pd.to_datetime(df["datetime"], errors="coerce", utc=False)
-    if getattr(dt.dt, "tz", None) is None:
-        dt = dt.dt.tz_localize("UTC")
-    else:
-        dt = dt.dt.tz_convert("UTC")
-    df["datetime"] = dt
+    df["datetime"] = pd.to_datetime(df["datetime"], utc=True, errors="coerce")
     df.dropna(subset=["datetime"], inplace=True)
     if "volume" not in df.columns:
         df["volume"] = 0.0
@@ -64,7 +57,6 @@ def _norm_df(df: pd.DataFrame) -> pd.DataFrame:
 
 # ---------- НОВОЕ: чанковая загрузка с Bybit ----------
 _MINUTES = {"1":1,"3":3,"5":5,"15":15,"30":30,"60":60}
-
 def _tf_ms(interval: str) -> int:
     return int(_MINUTES.get(str(interval), 1)) * 60_000
 
@@ -106,7 +98,7 @@ def _fetch_bybit_range(symbol: str, interval: str, start_ms: int, end_ms: int, m
     all_rows: List[Dict] = []
     last_seen_ms = None
 
-    while cursor <= end_ms:
+    while cursor < end_ms:
         approx_window = tfms * max_per_call
         chunk_end = min(end_ms, cursor + approx_window - 1)
 
@@ -136,14 +128,14 @@ def _fetch_bybit_range(symbol: str, interval: str, start_ms: int, end_ms: int, m
     return _rows_to_df(all_rows)
 
 def load_bybit(symbol: str, interval: str, days: int) -> Optional[pd.DataFrame]:
-    end = pd.Timestamp.now(tz="UTC")
+    end = pd.Timestamp.utcnow().tz_localize("UTC")
     start = end - pd.Timedelta(days=int(days))
     df = _fetch_bybit_range(symbol, str(interval), int(start.timestamp()*1000), int(end.timestamp()*1000))
     return df if not df.empty else None
 
 def load_bybit_dual(symbol: str, main_interval: str, ltf_interval: str, days: int) -> Tuple[Optional[pd.DataFrame], Optional[pd.DataFrame]]:
     """Грузим оба ТФ с Bybit за один и тот же период (полное покрытие, без обрезки 1000 баров)."""
-    end = pd.Timestamp.now(tz="UTC")
+    end = pd.Timestamp.utcnow().tz_localize("UTC")
     start = end - pd.Timedelta(days=int(days))
     s_ms, e_ms = int(start.timestamp()*1000), int(end.timestamp()*1000)
     df_main = _fetch_bybit_range(symbol, str(main_interval), s_ms, e_ms)
@@ -172,6 +164,7 @@ class BTApiAdapter:
         self._tick = float(tick_size)
         self._step = float(qty_step)
         self._minq = float(min_order_qty)
+        # no-op: не создаём ордера Backtrader
         self._sl_order = None
         self._tp_order = None
 
@@ -188,50 +181,21 @@ class BTApiAdapter:
     def get_price(self, symbol: str, source: str = "last") -> float:
         return float(self.ctx.data1.close[0]) if self.ctx.data1_present else float(self.ctx.data0.close[0])
 
+    # --- ВАЖНО: больше НЕ торгуем внутри Backtrader. Только эмуляция ответа API. ---
     def place_order(self, symbol: str, side: str, orderType: str, qty: float,
                     price: Optional[float] = None, stop_loss: Optional[float] = None,
                     take_profit: Optional[float] = None, order_link_id: Optional[str] = None,
                     reduce_only: bool = False, trigger_by_source: str = "mark",
                     time_in_force: Optional[str] = None, position_idx: Optional[int] = None,
                     tpsl_mode: Optional[str] = None) -> Dict:
-
-        size = float(max(qty, 0.0))
-        if side.lower().startswith("b"):   # Buy = long
-            main_order = self.ctx.buy(size=size)
-            if stop_loss is not None:
-                self._sl_order = self.ctx.sell(exectype=bt.Order.Stop,  price=float(stop_loss), size=size)
-            if take_profit is not None:
-                self._tp_order = self.ctx.sell(exectype=bt.Order.Limit, price=float(take_profit), size=size)
-        else:                               # Sell = short
-            main_order = self.ctx.sell(size=size)
-            if stop_loss is not None:
-                self._sl_order = self.ctx.buy(exectype=bt.Order.Stop,  price=float(stop_loss), size=size)
-            if take_profit is not None:
-                self._tp_order = self.ctx.buy(exectype=bt.Order.Limit, price=float(take_profit), size=size)
-        return {"ok": True, "order": getattr(main_order, "ref", None)}
+        return {"ok": True, "order": None}
 
     def update_position_stop_loss(self, symbol: str, new_sl: float, trigger_by_source: str = "mark",
                                   position_idx: Optional[int] = None) -> bool:
-        try:
-            if self._sl_order is not None:
-                try:
-                    self.ctx.broker.cancel(self._sl_order)
-                except Exception:
-                    pass
-                self._sl_order = None
-            sz = abs(float(self.ctx.position.size))
-            if sz <= 0:
-                return True
-            if self.ctx.position.size > 0:
-                self._sl_order = self.ctx.sell(exectype=bt.Order.Stop, price=float(new_sl), size=sz)
-            else:
-                self._sl_order = self.ctx.buy(exectype=bt.Order.Stop, price=float(new_sl), size=sz)
-            return True
-        except Exception:
-            return False
+        return True
 
 class BT_KwinAdapter(bt.Strategy):
-    """Backtrader-обёртка, которая кормит твою KWINStrategy 15m и 1m данными и собирает сделки для оверлея."""
+    """Backtrader-обёртка, которая кормит твою KWINStrategy 15m и 1m данными."""
     params = dict(
         symbol="ETHUSDT",
         tick_size=0.01,
@@ -288,11 +252,8 @@ class BT_KwinAdapter(bt.Strategy):
         self._last_dt0 = None
         self._last_dt1 = None
 
-        # собираем сделки backtrader (fallback для стрелок)
-        self._bt_trades: List[Dict] = []
-
     def _bar_to_candle(self, data) -> Dict:
-        dt = data.datetime.datetime(0)  # naive UTC (Backtrader отдаёт naive)
+        dt = data.datetime.datetime(0)  # naive UTC
         ts_ms = int(pd.Timestamp(dt, tz="UTC").timestamp() * 1000)
         return {
             "timestamp": ts_ms,
@@ -304,7 +265,10 @@ class BT_KwinAdapter(bt.Strategy):
         }
 
     def next(self):
-        self.state.set_equity(float(self.broker.getvalue()))
+        # поддерживаем локальную equity (KWIN) = broker value только для старта;
+        # после — KWIN управляет сам.
+        if self.state.get_equity() is None:
+            self.state.set_equity(float(self.broker.getvalue()))
 
         if self.data1_present:
             dt1 = self.data1.datetime.datetime(0)
@@ -316,35 +280,7 @@ class BT_KwinAdapter(bt.Strategy):
         if self._last_dt0 != dt0:
             self._last_dt0 = dt0
             self.kwin.on_bar_close_15m(self._bar_to_candle(self.data0))
-        # трейл внутри стратегии
-
-    # ---- Сбор закрытых сделок (для стрелок) ----
-    def notify_trade(self, trade: bt.Trade):
-        if not trade.isclosed:
-            return
-        # определяем сторону по первой записи в истории
-        side = "long"
-        try:
-            if trade.history and len(trade.history) > 0:
-                first = trade.history[0]
-                if getattr(first.event, "size", 0) < 0:
-                    side = "short"
-        except Exception:
-            side = "long" if (getattr(trade, "price", 0) <= getattr(trade, "pnl", 0)) else "short"
-
-        def _bt2dt(num):
-            try:
-                return bt.num2date(num, tz=timezone.utc)
-            except Exception:
-                return None
-
-        self._bt_trades.append({
-            "direction": side,
-            "entry_time": _bt2dt(trade.dtopen),
-            "exit_time":  _bt2dt(trade.dtclose),
-            "entry_price": float(getattr(trade, "price", 0.0)),
-            "exit_price":  float(getattr(trade, "price", 0.0) + (getattr(trade, "pnl", 0.0) / max(trade.size or 1.0, 1.0))),
-        })
+        # трейл внутри KWIN
 
 # =========================== Источник данных (Bybit только) ===========================
 with st.expander("Источник данных (Bybit API)", expanded=True):
@@ -380,10 +316,10 @@ with st.expander("Источник данных (Bybit API)", expanded=True):
         if df1 is not None and not df1.empty:
             s1, e1 = df1["datetime"].iloc[0], df1["datetime"].iloc[-1]
             st.info(f"{ltf_tf}m: {len(df1)} строк | {s1} → {e1}")
-        # быстрый sanity-check: хватает ли баров на заданный период?
+        # быстрый sanity-check
         exp_bars = int((pd.Timedelta(days=int(days)).total_seconds() // (_tf_ms(main_tf)/1000)))
         if len(df15) < 0.9 * exp_bars:
-            st.warning("Похоже, покрытие меньше ожидаемого. Проверь лимиты API/сетевую доступность.")
+            st.warning("Покрытие меньше ожидаемого — лимиты API или пропуски.")
 
 # =========================== Параметры и запуск ===========================
 st.markdown("---")
@@ -520,6 +456,7 @@ if run:
             price_for_logic=price_for_logic,
         )
 
+        # Аналайзеры брокера (теперь скорее для справки)
         cerebro.addanalyzer(bt.analyzers.TradeAnalyzer, _name='ta')
         cerebro.addanalyzer(bt.analyzers.DrawDown, _name='dd')
         cerebro.addanalyzer(bt.analyzers.SharpeRatio, _name='sharpe', timeframe=bt.TimeFrame.Days)
@@ -527,8 +464,12 @@ if run:
 
         result = cerebro.run(maxcpus=1)
         strat: BT_KwinAdapter = result[0]
-        final_val = cerebro.broker.getvalue()
-        st.success(f"Финальный капитал: {final_val:.2f}")
+
+        broker_val = cerebro.broker.getvalue()
+        kwin_eq = strat.state.get_equity() if hasattr(strat, "state") else None
+
+        st.success(f"Equity (KWIN): {kwin_eq:.2f}" if kwin_eq is not None else "Equity (KWIN): —")
+        st.info(f"Broker Value (BT): {broker_val:.2f}")
 
         ta = strat.analyzers.ta.get_analysis()
         dd = strat.analyzers.dd.get_analysis()
@@ -537,36 +478,27 @@ if run:
         cA,cB,cC,cD = st.columns(4)
         with cA:
             total = ta.total.closed if 'total' in ta and 'closed' in ta.total else 0
-            st.metric("Сделок (закрытых)", total or 0)
+            st.metric("Сделок (закрытых, BT)", total or 0)
         with cB:
             won = ta.won.total if 'won' in ta and 'total' in ta.won else 0
             wr = (won/total*100) if total else 0
-            st.metric("WinRate", f"{wr:.1f}%")
+            st.metric("WinRate (BT)", f"{wr:.1f}%")
         with cC:
-            st.metric("Max DD", f"{getattr(dd.max, 'drawdown', 0):.2f}%")
+            st.metric("Max DD (BT)", f"{getattr(dd.max, 'drawdown', 0):.2f}%")
         with cD:
             sr = sharpe.get("sharperatio", None)
-            st.metric("Sharpe", f"{sr:.2f}" if sr is not None else "—")
+            st.metric("Sharpe (BT)", f"{sr:.2f}" if sr is not None else "—")
 
-        # график Backtrader
+        # график Backtrader (без штатных buy/sell, мы их не создаём)
         fig = cerebro.plot(style='candlestick', iplot=False, volume=False)[0][0]
 
-        # стрелочки входов/выходов: сначала БД KWIN, если пусто — fallback из backtrader
-        trades_for_overlay: List[Dict] = []
-        try:
-            if hasattr(strat, "kwin"):
-                trades_for_overlay = strat.kwin.db.get_all_trades() or []
-        except Exception:
-            trades_for_overlay = []
-
-        if not trades_for_overlay and hasattr(strat, "_bt_trades"):
-            trades_for_overlay = strat._bt_trades
-
-        if show_markers and trades_for_overlay:
+        # стрелочки входов/выходов из твоей БД
+        if show_markers:
             try:
+                trades = strat.kwin.db.get_all_trades() if hasattr(strat, "kwin") else []
                 ax_price = fig.axes[0] if fig.axes else None
-                if ax_price is not None:
-                    _plot_trade_markers(ax_price, df15, trades_for_overlay)
+                if trades and ax_price is not None:
+                    _plot_trade_markers(ax_price, df15, trades)
             except Exception as e:
                 st.warning(f"Не удалось наложить метки сделок: {e}")
 
