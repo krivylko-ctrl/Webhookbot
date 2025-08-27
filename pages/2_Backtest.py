@@ -55,30 +55,106 @@ def _norm_df(df: pd.DataFrame) -> pd.DataFrame:
     df.reset_index(drop=True, inplace=True)
     return df
 
-def load_bybit(symbol: str, interval: str, days: int) -> Optional[pd.DataFrame]:
-    if LiveBybitAPI is None:
-        st.error("bybit_api не найден")
-        return None
-    api = LiveBybitAPI("", "", testnet=False)
-    end = pd.Timestamp.utcnow().tz_localize(None)
-    start = end - pd.Timedelta(days=int(days))
-    start_ms = int(start.timestamp() * 1000)
-    end_ms   = int(end.timestamp() * 1000)
-    rows = api.get_klines_window(symbol, interval, start_ms=start_ms, end_ms=end_ms, limit=1000)
-    if not rows:
-        st.error("Bybit: пусто")
-        return None
-    df = pd.DataFrame([{
-        "datetime": pd.to_datetime(r["timestamp"], unit="ms", utc=True),
-        "open": float(r["open"]), "high": float(r["high"]),
-        "low": float(r["low"]), "close": float(r["close"]),
-        "volume": float(r.get("volume", 0.0))
-    } for r in rows]).drop_duplicates(subset=["datetime"]).sort_values("datetime")
+# ---------- НОВОЕ: чанковая загрузка с Bybit ----------
+_MINUTES = {"1":1,"3":3,"5":5,"15":15,"30":30,"60":60}
+
+def _tf_ms(interval: str) -> int:
+    return int(_MINUTES.get(str(interval), 1)) * 60_000
+
+def _rows_to_df(rows: List[Dict]) -> pd.DataFrame:
+    def norm_ts(v):
+        if v is None:
+            return None
+        v = int(v)
+        if v < 1_000_000_000_000:  # sec -> ms
+            v *= 1000
+        return v
+    out = []
+    for r in rows:
+        ts = norm_ts(r.get("timestamp") or r.get("open_time"))
+        if not ts:
+            continue
+        out.append({
+            "datetime": pd.to_datetime(ts, unit="ms", utc=True),
+            "open": float(r["open"]),
+            "high": float(r["high"]),
+            "low": float(r["low"]),
+            "close": float(r["close"]),
+            "volume": float(r.get("volume") or r.get("turnover") or 0.0),
+        })
+    if not out:
+        return pd.DataFrame(columns=REQ_COLS)
+    df = pd.DataFrame(out).drop_duplicates(subset=["datetime"]).sort_values("datetime")
     return df
 
+def _fetch_bybit_range(symbol: str, interval: str, start_ms: int, end_ms: int, max_per_call: int = 1000) -> pd.DataFrame:
+    """Качаем все бары в [start_ms, end_ms] кусками, объединяем."""
+    if LiveBybitAPI is None:
+        st.error("bybit_api не найден")
+        return pd.DataFrame(columns=REQ_COLS)
+    api = LiveBybitAPI("", "", testnet=False)
+
+    tfms = _tf_ms(interval)
+    cursor = start_ms
+    all_rows: List[Dict] = []
+    last_seen_ms = None
+
+    while cursor < end_ms:
+        # ограничим окно ~max_per_call баров
+        approx_window = tfms * max_per_call
+        chunk_end = min(end_ms, cursor + approx_window - 1)
+
+        # предпочитаем get_klines_window, иначе fallback
+        if hasattr(api, "get_klines_window"):
+            rows = api.get_klines_window(symbol, interval, start_ms=cursor, end_ms=chunk_end, limit=max_per_call) or []
+        else:
+            rows = api.get_klines(symbol, interval, max_per_call) or []
+
+        if not rows:
+            # продвинемся на 1 бар, чтобы избежать зацикливания
+            cursor += tfms
+            continue
+
+        # фильтруем прогресс и дубли
+        before = len(all_rows)
+        for r in rows:
+            ts = r.get("timestamp") or r.get("open_time")
+            if ts is None:
+                continue
+            ts = int(ts)
+            if ts < 1_000_000_000_000:
+                ts *= 1000
+            # добавляем только то, что попадает в наше окно и дальше последнего
+            if start_ms <= ts <= end_ms:
+                if (last_seen_ms is None) or (ts > last_seen_ms):
+                    all_rows.append(r)
+                    last_seen_ms = ts
+        after = len(all_rows)
+
+        # двигаем курсор к времени после последней свечи
+        if last_seen_ms is None:
+            cursor += approx_window
+        else:
+            cursor = int(last_seen_ms) + tfms
+
+    df = _rows_to_df(all_rows)
+    return df
+
+def load_bybit(symbol: str, interval: str, days: int) -> Optional[pd.DataFrame]:
+    end = pd.Timestamp.utcnow().tz_localize("UTC")
+    start = end - pd.Timedelta(days=int(days))
+    df = _fetch_bybit_range(symbol, str(interval), int(start.timestamp()*1000), int(end.timestamp()*1000))
+    return df if not df.empty else None
+
 def load_bybit_dual(symbol: str, main_interval: str, ltf_interval: str, days: int) -> Tuple[Optional[pd.DataFrame], Optional[pd.DataFrame]]:
-    """Грузим оба ТФ с Bybit за один период."""
-    return load_bybit(symbol, main_interval, days), load_bybit(symbol, ltf_interval, days)
+    """Грузим оба ТФ с Bybit за один и тот же период (полное покрытие, без обрезки 1000 баров)."""
+    end = pd.Timestamp.utcnow().tz_localize("UTC")
+    start = end - pd.Timedelta(days=int(days))
+    s_ms, e_ms = int(start.timestamp()*1000), int(end.timestamp()*1000)
+    df_main = _fetch_bybit_range(symbol, str(main_interval), s_ms, e_ms)
+    df_ltf  = _fetch_bybit_range(symbol, str(ltf_interval), s_ms, e_ms)
+    return (df_main if not df_main.empty else None,
+            df_ltf  if not df_ltf.empty  else None)
 
 # =========================== Feed ===========================
 class PandasData(bt.feeds.PandasData):
@@ -242,7 +318,7 @@ class BT_KwinAdapter(bt.Strategy):
         if self._last_dt0 != dt0:
             self._last_dt0 = dt0
             self.kwin.on_bar_close_15m(self._bar_to_candle(self.data0))
-        # ❌ НЕТ вызова self.kwin.process_trailing() — трейл внутри стратегии
+        # трейл внутри стратегии
 
 # =========================== Источник данных (Bybit только) ===========================
 with st.expander("Источник данных (Bybit API)", expanded=True):
@@ -272,10 +348,16 @@ with st.expander("Источник данных (Bybit API)", expanded=True):
     df15 = st.session_state["data_15m"]
     df1  = st.session_state["data_1m"]
     if df15 is not None:
-        st.success(f"{main_tf}m: {len(df15)} строк | {df15['datetime'].iloc[0]} → {df15['datetime'].iloc[-1]}")
+        start_dt, end_dt = df15["datetime"].iloc[0], df15["datetime"].iloc[-1]
+        st.success(f"{main_tf}m: {len(df15)} строк | {start_dt} → {end_dt}")
         st.dataframe(df15.head(5), use_container_width=True)
-        if df1 is not None:
-            st.info(f"{ltf_tf}m: {len(df1)} строк | {df1['datetime'].iloc[0]} → {df1['datetime'].iloc[-1]}")
+        if df1 is not None and not df1.empty:
+            s1, e1 = df1["datetime"].iloc[0], df1["datetime"].iloc[-1]
+            st.info(f"{ltf_tf}m: {len(df1)} строк | {s1} → {e1}")
+        # быстрый sanity-check: хватает ли баров на заданный период?
+        exp_bars = int((pd.Timedelta(days=int(days)).total_seconds() // (_tf_ms(main_tf)/1000)))
+        if len(df15) < 0.9 * exp_bars:
+            st.warning("Похоже, что покрытие меньше ожидаемого. Проверь лимиты API/сетевую доступность.")
 
 # =========================== Параметры и запуск ===========================
 st.markdown("---")
