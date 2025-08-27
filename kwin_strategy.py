@@ -1136,20 +1136,17 @@ class KWINStrategy:
             kl1.sort(key=lambda x: x.get("timestamp", 0), reverse=True)
             self.candles_1m = kl1[:lim]
 
-            # -------- ИСТОРИЧЕСКИЙ ПРОИГРЫШ: сначала 1m внутри окна, потом 15m-логика --------
+            # -------- ИСТОРИЧЕСКИЙ ПРОИГРЫШ --------
             if self.candles_15m and not self._history_replayed:
                 bars_old_to_new = sorted(self.candles_15m, key=lambda x: x.get("timestamp", 0))
-                # обнулим, будем наращивать пошагово
                 self.candles_15m = []
                 self.last_processed_bar_ts = 0
 
                 for b in bars_old_to_new:
-                    # 1) вставляем 15m бар как текущий
                     self.candles_15m.insert(0, b)
                     if len(self.candles_15m) > 200:
                         self.candles_15m = self.candles_15m[:200]
 
-                    # 2) открываем новое 15m окно — сброс флагов как при закрытии 15m
                     bar_ts = int(b.get("timestamp") or b.get("open_time") or 0)
                     if bar_ts and bar_ts < 1_000_000_000_000:
                         bar_ts *= 1000
@@ -1159,11 +1156,9 @@ class KWINStrategy:
                     self.can_enter_short = True
                     self._bar_index_15m += 1
 
-                    # 3) проигрываем все 1m свечи внутри этого окна (локальные входы/трейл)
                     for m in self._ltf_slices_for_bar(bar_ts):
                         self.on_bar_close_1m(m)
 
-                    # 4) применяем 15m немедленные входы на закрытии окна
                     self.run_cycle()
 
                 self._history_replayed = True
@@ -1187,7 +1182,7 @@ class KWINStrategy:
         except Exception as e:
             self._log("error", f"update_candles: {e}")
 
-    # >>> ДОБАВЛЕНО: служебные визуал-хелперы Lux SFP (лог/совместимость с Pine), вызываются в run_cycle()
+    # --- Lux визуал-хелперы ---
     def _lux_find_new_sfp(self):
         try:
             L = int(self.lux_swings)
@@ -1239,31 +1234,24 @@ class KWINStrategy:
     def _lux_update_active(self):
         try:
             idx = int(self._bar_index_15m)
-
             def alive(ctx: Optional[Dict]) -> bool:
-                if not ctx:
-                    return False
+                if not ctx: return False
                 created = int(ctx.get("created_index", idx))
                 exp = int(ctx.get("expire_after", self.lux_expire_bars))
                 return (idx - created) <= exp
 
-            if not alive(self._active_bear):
-                self._active_bear = None
-            if not alive(self._active_bull):
-                self._active_bull = None
+            if not alive(self._active_bear): self._active_bear = None
+            if not alive(self._active_bull): self._active_bull = None
         except Exception as e:
             self._log("error", f"_lux_update_active: {e}")
 
     def run_cycle(self):
-        """15m логика входа (немедленно на закрытии окна) + подтяжка трейла."""
         try:
             if not self.candles_15m:
                 return
 
-            # Обновляем equity перед расчётами (реинвест)
             self._update_equity()
 
-            # Трейл для открытой позиции
             pos = self.state.get_current_position() if self.state else None
             if pos and pos.get("status") == "open":
                 self._update_smart_trailing(pos)
@@ -1275,11 +1263,10 @@ class KWINStrategy:
             if (not self._is_in_backtest_window_utc(ts)) or (not self._is_after_cycle_start(ts)):
                 return
 
-            # Защита: одна сделка на 15m окно
             if self._last_entered_15m_start is not None and self._last_entered_15m_start == self.last_processed_bar_ts:
                 return
 
-            # ===== 15m IMMEDIATE ENTRY (без «confirmed»), как в Pine =====
+            # ===== 15m IMMEDIATE ENTRY =====
             L = int(self.lux_swings)
             cur15 = self.candles_15m[0]
             prev1 = self.candles_15m[1] if len(self.candles_15m) > 1 else None
@@ -1290,7 +1277,6 @@ class KWINStrategy:
             ph15 = self._pivot_high_value(L, 1)
             pl15 = self._pivot_low_value (L, 1)
 
-            # локальные свинги на 1m для SL-first
             last1 = self.candles_1m[0] if self.candles_1m else cur15
             ph_loc = self._pivot_high_value_tf(self.candles_1m, L, 1) if self.candles_1m else None
             pl_loc = self._pivot_low_value_tf (self.candles_1m, L, 1) if self.candles_1m else None
@@ -1300,19 +1286,18 @@ class KWINStrategy:
             bear_ctx = None
             bull_ctx = None
 
-            # swing = 15m[L], как в Pine (high15[len]/low15[len])
             swH_15 = float(self.candles_15m[L]["high"]) if ph15 is not None and len(self.candles_15m) > L else None
             swL_15 = float(self.candles_15m[L]["low" ]) if pl15 is not None and len(self.candles_15m) > L else None
 
             if swH_15 is not None and hi15 > swH_15 and op15 < swH_15 and cl15 < swH_15:
-                sl = self._sl_local_first("short", swH_loc, last1)  # RAW
+                sl = self._sl_local_first("short", swH_loc, last1)
                 bear_ctx = {"sl": sl, "sid_15m": int(prev1.get("timestamp") or 0), "source": "15m"}
 
             if swL_15 is not None and lo15 < swL_15 and op15 > swL_15 and cl15 > swL_15:
-                sl = self._sl_local_first("long", swL_loc, last1)  # RAW
+                sl = self._sl_local_first("long", swL_loc, last1)
                 bull_ctx = {"sl": sl, "sid_15m": int(prev1.get("timestamp") or 0), "source": "15m"}
 
-            # ===== once-per-swing по timestamp локального свинга =====
+            # ===== once-per-swing =====
             if self.use_one_per_swing:
                 if bear_ctx:
                     ph_l = self._pivot_high_value_tf(self.candles_1m, int(self.lux_swings), 1) if self.candles_1m else None
@@ -1325,7 +1310,7 @@ class KWINStrategy:
                     if sid_ts and self.traded_bull_swing_id == sid_ts:
                         bull_ctx = None
 
-            # конфликт сигналов — one-per-bar + приоритет
+            # конфликт сигналов
             if self.use_one_per_bar and bear_ctx and bull_ctx:
                 if self.bar_priority == "prefer_bull":
                     bear_ctx = None
@@ -1335,7 +1320,6 @@ class KWINStrategy:
                     bear_ctx = None
                     bull_ctx = None
 
-            # Если уже был вход в текущем 1m-баре — блокируем 15m-вход
             if self.use_one_per_bar and self.candles_1m:
                 cur_1m_ts = int(self.candles_1m[0].get("timestamp") or 0)
                 if self._already_entered_this_bar(cur_1m_ts):
@@ -1343,7 +1327,6 @@ class KWINStrategy:
                     bull_ctx = None
 
             executed = False
-            # SHORT по 15m
             if bear_ctx and self.can_enter_short:
                 pos = self.state.get_current_position() if self.state else None
                 if pos and pos.get("status") == "open":
@@ -1352,17 +1335,15 @@ class KWINStrategy:
                             bear_ctx = None
                     else:
                         bear_ctx = None
-
             if bear_ctx:
                 entry = cl15
-                sl    = float(bear_ctx["sl"])  # RAW
+                sl    = float(bear_ctx["sl"])
                 qty   = self._calculate_position_size(entry, sl, "short")
                 if qty and qty >= self.min_order_qty and self._expected_net_ok(entry, sl, qty):
                     self._process_short_entry(entry_override=entry, sl_override=sl)
                     self.can_enter_short = False
                     executed = True
 
-            # LONG по 15m
             if bull_ctx and self.can_enter_long and not (executed and self.use_one_per_bar):
                 pos = self.state.get_current_position() if self.state else None
                 if pos and pos.get("status") == "open":
@@ -1371,25 +1352,20 @@ class KWINStrategy:
                             bull_ctx = None
                     else:
                         bull_ctx = None
-
             if bull_ctx and not (executed and self.use_one_per_bar):
                 entry = cl15
-                sl    = float(bull_ctx["sl"])  # RAW
+                sl    = float(bull_ctx["sl"])
                 qty   = self._calculate_position_size(entry, sl, "long")
                 if qty and qty >= self.min_order_qty and self._expected_net_ok(entry, sl, qty):
                     self._process_long_entry(entry_override=entry, sl_override=sl)
                     self.can_enter_long = False
 
-            # Логи активных SFP (визуал/совместимость)
             self._lux_find_new_sfp()
             self._lux_update_active()
-
         except Exception as e:
             self._log("error", f"run_cycle: {e}")
 
-    # ---------- Окно теста ----------
     def _is_in_backtest_window_utc(self, current_timestamp: int) -> bool:
-        """Плавающее окно дней назад + опционная стартовая дата (как в Pine-обёртке)."""
         days_back = int(getattr(self.config, "days_back", 30))
         utc_now = datetime.utcnow().replace(tzinfo=timezone.utc)
         utc_midnight = utc_now.replace(hour=0, minute=0, second=0, microsecond=0)
@@ -1403,7 +1379,6 @@ class KWINStrategy:
         return int(current_timestamp) >= int(self.start_time_ms)
 
     def _update_equity(self):
-        """Если задано equity_source='wallet' — обновляем equity из кошелька, иначе не трогаем локальную метрику."""
         try:
             if str(self.equity_source) != "wallet":
                 return
@@ -1424,7 +1399,6 @@ class KWINStrategy:
         except Exception as e:
             self._log("error", f"update_equity: {e}")
 
-    # ---------- Debug helper ----------
     def get_trailing_debug(self) -> Dict[str, Any]:
         try:
             pos = self.state.get_current_position() if self.state else None
