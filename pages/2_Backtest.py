@@ -127,21 +127,7 @@ def _fetch_bybit_range(symbol: str, interval: str, start_ms: int, end_ms: int, m
 
     return _rows_to_df(all_rows)
 
-def load_bybit(symbol: str, interval: str, days: int) -> Optional[pd.DataFrame]:
-    end = pd.Timestamp.utcnow().tz_localize("UTC")
-    start = end - pd.Timedelta(days=int(days))
-    df = _fetch_bybit_range(symbol, str(interval), int(start.timestamp()*1000), int(end.timestamp()*1000))
-    return df if not df.empty else None
 
-def load_bybit_dual(symbol: str, main_interval: str, ltf_interval: str, days: int) -> Tuple[Optional[pd.DataFrame], Optional[pd.DataFrame]]:
-    """Грузим оба ТФ с Bybit за один и тот же период (полное покрытие, без обрезки 1000 баров)."""
-    end = pd.Timestamp.utcnow().tz_localize("UTC")
-    start = end - pd.Timedelta(days=int(days))
-    s_ms, e_ms = int(start.timestamp()*1000), int(end.timestamp()*1000)
-    df_main = _fetch_bybit_range(symbol, str(main_interval), s_ms, e_ms)
-    df_ltf  = _fetch_bybit_range(symbol, str(ltf_interval), s_ms, e_ms)
-    return (df_main if not df_main.empty else None,
-            df_ltf  if not df_ltf.empty  else None)
 
 # =========================== Feed ===========================
 class PandasData(bt.feeds.PandasData):
@@ -280,7 +266,31 @@ class BT_KwinAdapter(bt.Strategy):
         if self._last_dt0 != dt0:
             self._last_dt0 = dt0
             self.kwin.on_bar_close_15m(self._bar_to_candle(self.data0))
-        # трейл внутри KWIN
+            
+            
+    def load_bybit(symbol: str, interval: str, days: int) -> Optional[pd.DataFrame]:
+        end = pd.Timestamp.utcnow()
+        if end.tzinfo is None:
+            end = end.tz_localize("UTC")
+        else:
+            end = end.tz_convert("UTC") 
+        start = end - pd.Timedelta(days=int(days))
+        df = _fetch_bybit_range(symbol, str(interval), int(start.timestamp()*1000), int(end.timestamp()*1000))
+        return df if not df.empty else None
+
+
+    def load_bybit_dual(symbol: str, main_interval: str, ltf_interval: str, days: int) -> Tuple[Optional[pd.DataFrame], Optional[pd.DataFrame]]:
+        end = pd.Timestamp.utcnow()
+        if end.tzinfo is None:
+            end = end.tz_localize("UTC")
+        else:
+            end = end.tz_convert("UTC")
+        start = end - pd.Timedelta(days=int(days))
+        s_ms, e_ms = int(start.timestamp()*1000), int(end.timestamp()*1000)
+        df_main = _fetch_bybit_range(symbol, str(main_interval), s_ms, e_ms)
+        df_ltf  = _fetch_bybit_range(symbol, str(ltf_interval), s_ms, e_ms)
+        return (df_main if not df_main.empty else None,
+                df_ltf  if not df_ltf.empty  else None)
 
 # =========================== Источник данных (Bybit только) ===========================
 with st.expander("Источник данных (Bybit API)", expanded=True):
