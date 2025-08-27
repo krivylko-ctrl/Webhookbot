@@ -10,6 +10,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
+from datetime import timezone
 
 # ---- боевые модули ----
 from kwin_strategy import KWINStrategy
@@ -46,7 +47,13 @@ def _norm_df(df: pd.DataFrame) -> pd.DataFrame:
         df.rename(columns=rename, inplace=True)
     if "datetime" not in df.columns:
         raise ValueError("В источнике нет колонки 'datetime'")
-    df["datetime"] = pd.to_datetime(df["datetime"], utc=True, errors="coerce")
+    # делаем tz-aware UTC, не «локализуем» уже-aware метки
+    dt = pd.to_datetime(df["datetime"], errors="coerce", utc=False)
+    if getattr(dt.dt, "tz", None) is None:
+        dt = dt.dt.tz_localize("UTC")
+    else:
+        dt = dt.dt.tz_convert("UTC")
+    df["datetime"] = dt
     df.dropna(subset=["datetime"], inplace=True)
     if "volume" not in df.columns:
         df["volume"] = 0.0
@@ -99,24 +106,19 @@ def _fetch_bybit_range(symbol: str, interval: str, start_ms: int, end_ms: int, m
     all_rows: List[Dict] = []
     last_seen_ms = None
 
-    while cursor < end_ms:
-        # ограничим окно ~max_per_call баров
+    while cursor <= end_ms:
         approx_window = tfms * max_per_call
         chunk_end = min(end_ms, cursor + approx_window - 1)
 
-        # предпочитаем get_klines_window, иначе fallback
         if hasattr(api, "get_klines_window"):
             rows = api.get_klines_window(symbol, interval, start_ms=cursor, end_ms=chunk_end, limit=max_per_call) or []
         else:
             rows = api.get_klines(symbol, interval, max_per_call) or []
 
         if not rows:
-            # продвинемся на 1 бар, чтобы избежать зацикливания
             cursor += tfms
             continue
 
-        # фильтруем прогресс и дубли
-        before = len(all_rows)
         for r in rows:
             ts = r.get("timestamp") or r.get("open_time")
             if ts is None:
@@ -124,33 +126,24 @@ def _fetch_bybit_range(symbol: str, interval: str, start_ms: int, end_ms: int, m
             ts = int(ts)
             if ts < 1_000_000_000_000:
                 ts *= 1000
-            # добавляем только то, что попадает в наше окно и дальше последнего
             if start_ms <= ts <= end_ms:
                 if (last_seen_ms is None) or (ts > last_seen_ms):
                     all_rows.append(r)
                     last_seen_ms = ts
-        after = len(all_rows)
 
-        # двигаем курсор к времени после последней свечи
-        if last_seen_ms is None:
-            cursor += approx_window
-        else:
-            cursor = int(last_seen_ms) + tfms
+        cursor = (int(last_seen_ms) + tfms) if last_seen_ms is not None else (cursor + approx_window)
 
-    df = _rows_to_df(all_rows)
-    return df
+    return _rows_to_df(all_rows)
 
 def load_bybit(symbol: str, interval: str, days: int) -> Optional[pd.DataFrame]:
-    # FIX tz: используем now(tz="UTC"), не tz_localize на tz-aware
-    end = pd.Timestamp.now(tz="UTC")
+    end = pd.Timestamp.utcnow().tz_localize("UTC")
     start = end - pd.Timedelta(days=int(days))
     df = _fetch_bybit_range(symbol, str(interval), int(start.timestamp()*1000), int(end.timestamp()*1000))
     return df if not df.empty else None
 
 def load_bybit_dual(symbol: str, main_interval: str, ltf_interval: str, days: int) -> Tuple[Optional[pd.DataFrame], Optional[pd.DataFrame]]:
     """Грузим оба ТФ с Bybit за один и тот же период (полное покрытие, без обрезки 1000 баров)."""
-    # FIX tz: используем now(tz="UTC"), не tz_localize на tz-aware
-    end = pd.Timestamp.now(tz="UTC")
+    end = pd.Timestamp.utcnow().tz_localize("UTC")
     start = end - pd.Timedelta(days=int(days))
     s_ms, e_ms = int(start.timestamp()*1000), int(end.timestamp()*1000)
     df_main = _fetch_bybit_range(symbol, str(main_interval), s_ms, e_ms)
@@ -238,7 +231,7 @@ class BTApiAdapter:
             return False
 
 class BT_KwinAdapter(bt.Strategy):
-    """Backtrader-обёртка, которая кормит твою KWINStrategy 15m и 1m данными."""
+    """Backtrader-обёртка, которая кормит твою KWINStrategy 15m и 1m данными и собирает сделки для оверлея."""
     params = dict(
         symbol="ETHUSDT",
         tick_size=0.01,
@@ -295,8 +288,11 @@ class BT_KwinAdapter(bt.Strategy):
         self._last_dt0 = None
         self._last_dt1 = None
 
+        # собираем сделки backtrader (fallback для стрелок)
+        self._bt_trades: List[Dict] = []
+
     def _bar_to_candle(self, data) -> Dict:
-        dt = data.datetime.datetime(0)  # naive UTC
+        dt = data.datetime.datetime(0)  # naive UTC (Backtrader отдаёт naive)
         ts_ms = int(pd.Timestamp(dt, tz="UTC").timestamp() * 1000)
         return {
             "timestamp": ts_ms,
@@ -321,6 +317,34 @@ class BT_KwinAdapter(bt.Strategy):
             self._last_dt0 = dt0
             self.kwin.on_bar_close_15m(self._bar_to_candle(self.data0))
         # трейл внутри стратегии
+
+    # ---- Сбор закрытых сделок (для стрелок) ----
+    def notify_trade(self, trade: bt.Trade):
+        if not trade.isclosed:
+            return
+        # определяем сторону по первой записи в истории
+        side = "long"
+        try:
+            if trade.history and len(trade.history) > 0:
+                first = trade.history[0]
+                if getattr(first.event, "size", 0) < 0:
+                    side = "short"
+        except Exception:
+            side = "long" if (getattr(trade, "price", 0) <= getattr(trade, "pnl", 0)) else "short"
+
+        def _bt2dt(num):
+            try:
+                return bt.num2date(num, tz=timezone.utc)
+            except Exception:
+                return None
+
+        self._bt_trades.append({
+            "direction": side,
+            "entry_time": _bt2dt(trade.dtopen),
+            "exit_time":  _bt2dt(trade.dtclose),
+            "entry_price": float(getattr(trade, "price", 0.0)),
+            "exit_price":  float(getattr(trade, "price", 0.0) + (getattr(trade, "pnl", 0.0) / max(trade.size or 1.0, 1.0))),
+        })
 
 # =========================== Источник данных (Bybit только) ===========================
 with st.expander("Источник данных (Bybit API)", expanded=True):
@@ -359,7 +383,7 @@ with st.expander("Источник данных (Bybit API)", expanded=True):
         # быстрый sanity-check: хватает ли баров на заданный период?
         exp_bars = int((pd.Timedelta(days=int(days)).total_seconds() // (_tf_ms(main_tf)/1000)))
         if len(df15) < 0.9 * exp_bars:
-            st.warning("Похоже, что покрытие меньше ожидаемого. Проверь лимиты API/сетевую доступность.")
+            st.warning("Похоже, покрытие меньше ожидаемого. Проверь лимиты API/сетевую доступность.")
 
 # =========================== Параметры и запуск ===========================
 st.markdown("---")
@@ -527,13 +551,22 @@ if run:
         # график Backtrader
         fig = cerebro.plot(style='candlestick', iplot=False, volume=False)[0][0]
 
-        # стрелочки входов/выходов
-        if show_markers:
+        # стрелочки входов/выходов: сначала БД KWIN, если пусто — fallback из backtrader
+        trades_for_overlay: List[Dict] = []
+        try:
+            if hasattr(strat, "kwin"):
+                trades_for_overlay = strat.kwin.db.get_all_trades() or []
+        except Exception:
+            trades_for_overlay = []
+
+        if not trades_for_overlay and hasattr(strat, "_bt_trades"):
+            trades_for_overlay = strat._bt_trades
+
+        if show_markers and trades_for_overlay:
             try:
-                trades = strat.kwin.db.get_all_trades() if hasattr(strat, "kwin") else []
                 ax_price = fig.axes[0] if fig.axes else None
-                if trades and ax_price is not None:
-                    _plot_trade_markers(ax_price, df15, trades)
+                if ax_price is not None:
+                    _plot_trade_markers(ax_price, df15, trades_for_overlay)
             except Exception as e:
                 st.warning(f"Не удалось наложить метки сделок: {e}")
 
