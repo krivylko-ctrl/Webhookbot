@@ -1,4 +1,4 @@
-# pages/3_Backtrader.py — Бэктест твоей KWINStrategy с dual-TF (15m + 1m) + маркеры вход/выход
+# pages/3_Backtrader.py — Бэктест KWINStrategy (15m + 1m, Bybit-only) + стрелочки вход/выход
 import os
 from typing import List, Dict, Optional, Tuple
 import io
@@ -9,7 +9,7 @@ import backtrader as bt
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-import matplotlib.dates as mdates  # для привязки стрелок к времени
+import matplotlib.dates as mdates
 
 # ---- боевые модули ----
 from kwin_strategy import KWINStrategy
@@ -17,19 +17,14 @@ from config import Config
 from state_manager import StateManager
 from database import Database
 
-# Bybit API для загрузки истории (публичные эндпоинты — без ключей)
+# реальный BybitAPI для загрузки истории
 try:
     from bybit_api import BybitAPI as LiveBybitAPI
 except Exception:
     LiveBybitAPI = None
 
 st.set_page_config(page_title="Backtrader — Бэктест KWIN (15m + 1m)", page_icon="📈", layout="wide")
-st.title("📈 Бэктест KWINStrategy (Lux SFP) — 15m + 1m интрабар")
-
-# --------------------------- SessionState ---------------------------
-for k in ("df15", "df1", "source_note"):
-    if k not in st.session_state:
-        st.session_state[k] = None
+st.title("📈 Бэктест KWINStrategy — 15m + 1m (Bybit API)")
 
 # =========================== утилиты загрузки ===========================
 REQ_COLS = ["datetime", "open", "high", "low", "close", "volume"]
@@ -44,7 +39,7 @@ def _norm_df(df: pd.DataFrame) -> pd.DataFrame:
     if rename:
         df.rename(columns=rename, inplace=True)
     if "datetime" not in df.columns:
-        raise ValueError("Нет колонки 'datetime'")
+        raise ValueError("В источнике нет колонки 'datetime'")
     df["datetime"] = pd.to_datetime(df["datetime"], utc=True, errors="coerce")
     df.dropna(subset=["datetime"], inplace=True)
     if "volume" not in df.columns:
@@ -65,6 +60,7 @@ def load_bybit(symbol: str, interval: str, days: int) -> Optional[pd.DataFrame]:
     end_ms   = int(end.timestamp() * 1000)
     rows = api.get_klines_window(symbol, interval, start_ms=start_ms, end_ms=end_ms, limit=1000)
     if not rows:
+        st.error("Bybit: пусто")
         return None
     df = pd.DataFrame([{
         "datetime": pd.to_datetime(r["timestamp"], unit="ms", utc=True),
@@ -75,9 +71,8 @@ def load_bybit(symbol: str, interval: str, days: int) -> Optional[pd.DataFrame]:
     return df
 
 def load_bybit_dual(symbol: str, main_interval: str, ltf_interval: str, days: int) -> Tuple[Optional[pd.DataFrame], Optional[pd.DataFrame]]:
-    df_main = load_bybit(symbol, main_interval, days)
-    df_ltf  = load_bybit(symbol, ltf_interval, days)
-    return df_main, df_ltf
+    """Грузим оба ТФ с Bybit за один период."""
+    return load_bybit(symbol, main_interval, days), load_bybit(symbol, ltf_interval, days)
 
 # =========================== Feed ===========================
 class PandasData(bt.feeds.PandasData):
@@ -93,7 +88,7 @@ class PandasData(bt.feeds.PandasData):
 
 # =========================== Backtrader↔KWIN мост ===========================
 class BTApiAdapter:
-    """Мини-API для KWINStrategy: place_order/update_position_stop_loss/get_price/get_ticker/get_instruments_info."""
+    """Мини-API для KWINStrategy поверх Backtrader."""
     def __init__(self, ctx: 'BT_KwinAdapter', symbol: str, tick_size: float, qty_step: float, min_order_qty: float):
         self.ctx = ctx
         self.symbol = symbol
@@ -122,6 +117,7 @@ class BTApiAdapter:
                     reduce_only: bool = False, trigger_by_source: str = "mark",
                     time_in_force: Optional[str] = None, position_idx: Optional[int] = None,
                     tpsl_mode: Optional[str] = None) -> Dict:
+
         size = float(max(qty, 0.0))
         if side.lower().startswith("b"):   # Buy = long
             main_order = self.ctx.buy(size=size)
@@ -158,7 +154,7 @@ class BTApiAdapter:
             return False
 
 class BT_KwinAdapter(bt.Strategy):
-    """Обёртка backtrader, которая создаёт KWINStrategy и кормит её data0=15m, data1=1m."""
+    """Backtrader-обёртка, которая кормит твою KWINStrategy 15m и 1m данными."""
     params = dict(
         symbol="ETHUSDT",
         tick_size=0.01,
@@ -234,51 +230,36 @@ class BT_KwinAdapter(bt.Strategy):
             dt1 = self.data1.datetime.datetime(0)
             if self._last_dt1 != dt1:
                 self._last_dt1 = dt1
-                candle_1m = self._bar_to_candle(self.data1)
-                self.kwin.on_bar_close_1m(candle_1m)
+                self.kwin.on_bar_close_1m(self._bar_to_candle(self.data1))
 
         dt0 = self.data0.datetime.datetime(0)
         if self._last_dt0 != dt0:
             self._last_dt0 = dt0
-            candle_15m = self._bar_to_candle(self.data0)
-            self.kwin.on_bar_close_15m(candle_15m)
+            self.kwin.on_bar_close_15m(self._bar_to_candle(self.data0))
+        # ❌ НЕТ вызова self.kwin.process_trailing() — трейл внутри стратегии
 
-        self.kwin.process_trailing()
-
-# =========================== Источник данных (Bybit only UI, с сохранением в сессию) ===========================
+# =========================== Источник данных (Bybit только) ===========================
 with st.expander("Источник данных (Bybit API)", expanded=True):
     symbol_in = st.text_input("Bybit symbol", "ETHUSDT")
     days = st.slider("Период (дней)", 7, 180, 60)
     main_tf = st.selectbox("Main TF", ["15","30","60"], index=0)
     ltf_tf = st.selectbox("LTF (интрабар)", ["1","3","5"], index=0)
 
-    col_dl, col_cl = st.columns([1,1])
-    with col_dl:
-        if st.button("📥 Скачать бары с Bybit"):
-            with st.spinner("Тянем историю с Bybit..."):
-                df15, df1 = load_bybit_dual(symbol_in, main_tf, ltf_tf, days)
-                st.session_state.df15 = df15
-                st.session_state.df1 = df1
-                st.session_state.source_note = f"{symbol_in} {main_tf}m / {ltf_tf}m, {days}d"
-    with col_cl:
-        if st.button("🧹 Очистить данные"):
-            st.session_state.df15 = None
-            st.session_state.df1 = None
-            st.session_state.source_note = None
+    df15: Optional[pd.DataFrame] = None
+    df1: Optional[pd.DataFrame] = None
 
-    if st.session_state.df15 is not None:
-        df15_preview = st.session_state.df15
-        st.success(f"{main_tf}m: {len(df15_preview)} строк | "
-                   f"{df15_preview['datetime'].iloc[0]} → {df15_preview['datetime'].iloc[-1]}")
-        st.dataframe(df15_preview.head(8), use_container_width=True)
-        if st.session_state.df1 is not None:
-            df1_preview = st.session_state.df1
-            st.info(f"{ltf_tf}m: {len(df1_preview)} строк | "
-                    f"{df1_preview['datetime'].iloc[0]} → {df1_preview['datetime'].iloc[-1]}")
+    if st.button("Скачать с Bybit"):
+        df15, df1 = load_bybit_dual(symbol_in, main_tf, ltf_tf, days)
+
+    if df15 is not None:
+        st.success(f"{main_tf}m: {len(df15)} строк | {df15['datetime'].iloc[0]} → {df15['datetime'].iloc[-1]}")
+        if df1 is not None:
+            st.info(f"{ltf_tf}m: {len(df1)} строк | {df1['datetime'].iloc[0]} → {df1['datetime'].iloc[-1]}")
+        st.dataframe(df15.head(5), use_container_width=True)
 
 # =========================== Параметры и запуск ===========================
 st.markdown("---")
-st.header("Запуск бэктеста (KWINStrategy) — dual-TF")
+st.header("Запуск бэктеста")
 
 c0, c1, c2, c3, c4 = st.columns(5)
 with c0:
@@ -290,7 +271,7 @@ with c2:
 with c3:
     slippage = st.number_input("Слиппедж (dec.)", 0.0, 0.01, 0.0, 0.0001)
 with c4:
-    cheat_on_close = st.checkbox("Исполнять по close текущего бара (Cheat-On-Close)", True)
+    cheat_on_close = st.checkbox("Cheat-On-Close (исполнять по close текущего бара)", True)
 
 st.subheader("Параметры стратегии")
 d1, d2, d3, d4 = st.columns(4)
@@ -315,11 +296,7 @@ with e4:
 
 # Оверлеи
 st.subheader("Оверлеи")
-col_ov1, col_ov2 = st.columns(2)
-with col_ov1:
-    show_markers = st.checkbox("Показывать стрелочки вход/выход", True)
-with col_ov2:
-    show_legend = st.checkbox("Показывать легенду", True)
+show_markers = st.checkbox("Показывать стрелочки вход/выход", True)
 
 run = st.button("🚀 Запустить")
 
@@ -327,7 +304,7 @@ class PandasData15(PandasData): pass
 class PandasData1(PandasData): pass
 
 # ---------- Рисовалка стрелок поверх графика ----------
-def _plot_trade_markers(ax, df15: pd.DataFrame, trades: List[Dict], show_legend: bool = True) -> None:
+def _plot_trade_markers(ax, df15: pd.DataFrame, trades: List[Dict]) -> None:
     if not trades or df15 is None or df15.empty:
         return
     mid_price_by_dt = {pd.to_datetime(d).to_pydatetime(): float(c)
@@ -338,10 +315,9 @@ def _plot_trade_markers(ax, df15: pd.DataFrame, trades: List[Dict], show_legend:
 
     for tr in trades:
         try:
-            side = (tr.get("direction") or "").lower()
-            # вход
             ets = tr.get("entry_time")
             epx = tr.get("entry_price")
+            side = (tr.get("direction") or "").lower()
             if ets:
                 edt = pd.to_datetime(ets, utc=True, errors="coerce").tz_convert(None).to_pydatetime()
                 x = mdates.date2num(edt)
@@ -350,11 +326,13 @@ def _plot_trade_markers(ax, df15: pd.DataFrame, trades: List[Dict], show_legend:
                     xs_in.append(x); ys_in.append(y); colors_in.append("#10B981"); markers_in.append("^")
                 elif side == "short":
                     xs_in.append(x); ys_in.append(y); colors_in.append("#EF4444"); markers_in.append("v")
-            # выход
-            xts = tr.get("exit_time"); xpx = tr.get("exit_price")
+
+            xts = tr.get("exit_time")
+            xpx = tr.get("exit_price")
             if xts and xpx is not None:
                 xdt = pd.to_datetime(xts, utc=True, errors="coerce").tz_convert(None).to_pydatetime()
-                xnum = mdates.date2num(xdt); yv = float(xpx)
+                xnum = mdates.date2num(xdt)
+                yv = float(xpx)
                 if side == "long":
                     xs_out.append(xnum); ys_out.append(yv); colors_out.append("#10B981"); markers_out.append("v")
                 elif side == "short":
@@ -367,19 +345,16 @@ def _plot_trade_markers(ax, df15: pd.DataFrame, trades: List[Dict], show_legend:
     for x, y, c, m in zip(xs_out, ys_out, colors_out, markers_out):
         ax.scatter(x, y, marker=m, s=90, facecolors="white", edgecolors=c, linewidths=1.2, zorder=5)
 
-    if show_legend:
-        import matplotlib.lines as mlines
-        lg_long_in  = mlines.Line2D([], [], color="#10B981", marker="^", linestyle="None", markersize=8, label="Long entry")
-        lg_long_out = mlines.Line2D([], [], color="#10B981", marker="v", markerfacecolor="white", linestyle="None", markersize=8, label="Long exit")
-        lg_sh_in    = mlines.Line2D([], [], color="#EF4444", marker="v", linestyle="None", markersize=8, label="Short entry")
-        lg_sh_out   = mlines.Line2D([], [], color="#EF4444", marker="^", markerfacecolor="white", linestyle="None", markersize=8, label="Short exit")
-        ax.legend(handles=[lg_long_in, lg_long_out, lg_sh_in, lg_sh_out], loc="upper left")
+    import matplotlib.lines as mlines
+    lg_long_in  = mlines.Line2D([], [], color="#10B981", marker="^", linestyle="None", markersize=8, label="Long entry")
+    lg_long_out = mlines.Line2D([], [], color="#10B981", marker="v", markerfacecolor="white", linestyle="None", markersize=8, label="Long exit")
+    lg_sh_in    = mlines.Line2D([], [], color="#EF4444", marker="v", linestyle="None", markersize=8, label="Short entry")
+    lg_sh_out   = mlines.Line2D([], [], color="#EF4444", marker="^", markerfacecolor="white", linestyle="None", markersize=8, label="Short exit")
+    ax.legend(handles=[lg_long_in, lg_long_out, lg_sh_in, lg_sh_out], loc="upper left")
 
 if run:
-    df15 = st.session_state.df15
-    df1  = st.session_state.df1
     if df15 is None or df15.empty:
-        st.error("Нет данных 15m. Сначала нажми «📥 Скачать бары с Bybit».")
+        st.error("Нет данных 15m.")
     else:
         cerebro = bt.Cerebro()
         cerebro.broker.set_coc(bool(cheat_on_close))
@@ -412,7 +387,6 @@ if run:
             price_for_logic=price_for_logic,
         )
 
-        # Аналайзеры
         cerebro.addanalyzer(bt.analyzers.TradeAnalyzer, _name='ta')
         cerebro.addanalyzer(bt.analyzers.DrawDown, _name='dd')
         cerebro.addanalyzer(bt.analyzers.SharpeRatio, _name='sharpe', timeframe=bt.TimeFrame.Days)
@@ -444,18 +418,19 @@ if run:
         # график Backtrader
         fig = cerebro.plot(style='candlestick', iplot=False, volume=False)[0][0]
 
-        # стрелочки входов/выходов из БД KWIN
-        try:
-            trades = strat.kwin.db.get_all_trades() if hasattr(strat, "kwin") else []
-            ax_price = fig.axes[0] if fig.axes else None
-            if show_markers and trades and ax_price is not None:
-                _plot_trade_markers(ax_price, df15, trades, show_legend=show_legend)
-        except Exception as e:
-            st.warning(f"Не удалось наложить метки сделок: {e}")
+        # стрелочки входов/выходов
+        if show_markers:
+            try:
+                trades = strat.kwin.db.get_all_trades() if hasattr(strat, "kwin") else []
+                ax_price = fig.axes[0] if fig.axes else None
+                if trades and ax_price is not None:
+                    _plot_trade_markers(ax_price, df15, trades)
+            except Exception as e:
+                st.warning(f"Не удалось наложить метки сделок: {e}")
 
         st.pyplot(fig, clear_figure=True, use_container_width=True)
 
-        # ===================== Экспорт сделок / логов из твоей БД =====================
+        # таблицы
         st.markdown("### 📋 Сделки (из KWIN Database)")
         try:
             trades = strat.kwin.db.get_all_trades() if hasattr(strat, "kwin") else []
