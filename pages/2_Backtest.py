@@ -141,14 +141,16 @@ def _fetch_bybit_range(symbol: str, interval: str, start_ms: int, end_ms: int, m
     return df
 
 def load_bybit(symbol: str, interval: str, days: int) -> Optional[pd.DataFrame]:
-    end = pd.Timestamp.utcnow().tz_localize("UTC")
+    # FIX tz: используем now(tz="UTC"), не tz_localize на tz-aware
+    end = pd.Timestamp.now(tz="UTC")
     start = end - pd.Timedelta(days=int(days))
     df = _fetch_bybit_range(symbol, str(interval), int(start.timestamp()*1000), int(end.timestamp()*1000))
     return df if not df.empty else None
 
 def load_bybit_dual(symbol: str, main_interval: str, ltf_interval: str, days: int) -> Tuple[Optional[pd.DataFrame], Optional[pd.DataFrame]]:
     """Грузим оба ТФ с Bybit за один и тот же период (полное покрытие, без обрезки 1000 баров)."""
-    end = pd.Timestamp.utcnow().tz_localize("UTC")
+    # FIX tz: используем now(tz="UTC"), не tz_localize на tz-aware
+    end = pd.Timestamp.now(tz="UTC")
     start = end - pd.Timedelta(days=int(days))
     s_ms, e_ms = int(start.timestamp()*1000), int(end.timestamp()*1000)
     df_main = _fetch_bybit_range(symbol, str(main_interval), s_ms, e_ms)
@@ -178,7 +180,7 @@ class BTApiAdapter:
         self._step = float(qty_step)
         self._minq = float(min_order_qty)
         self._sl_order = None
-        self._tp_order = None
+               self._tp_order = None
 
     def get_instruments_info(self, symbol: str) -> Dict:
         return {
