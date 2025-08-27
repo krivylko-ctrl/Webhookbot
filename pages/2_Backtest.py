@@ -26,6 +26,12 @@ except Exception:
 st.set_page_config(page_title="Backtrader — Бэктест KWIN (15m + 1m)", page_icon="📈", layout="wide")
 st.title("📈 Бэктест KWINStrategy — 15m + 1m (Bybit API)")
 
+# -------- persist датафреймы между перезапусками Streamlit --------
+if "data_15m" not in st.session_state:
+    st.session_state["data_15m"] = None
+if "data_1m" not in st.session_state:
+    st.session_state["data_1m"] = None
+
 # =========================== утилиты загрузки ===========================
 REQ_COLS = ["datetime", "open", "high", "low", "close", "volume"]
 
@@ -245,17 +251,31 @@ with st.expander("Источник данных (Bybit API)", expanded=True):
     main_tf = st.selectbox("Main TF", ["15","30","60"], index=0)
     ltf_tf = st.selectbox("LTF (интрабар)", ["1","3","5"], index=0)
 
-    df15: Optional[pd.DataFrame] = None
-    df1: Optional[pd.DataFrame] = None
+    col_dl, col_clr = st.columns([1, 1])
+    with col_dl:
+        if st.button("Скачать с Bybit"):
+            with st.spinner("Качаем историю с Bybit..."):
+                df15, df1 = load_bybit_dual(symbol_in, main_tf, ltf_tf, days)
+            st.session_state["data_15m"] = df15
+            st.session_state["data_1m"] = df1
+            if df15 is None:
+                st.error("Bybit вернул пусто по 15m.")
+            else:
+                st.success("История загружена.")
+    with col_clr:
+        if st.button("🧹 Очистить загруженные данные"):
+            st.session_state["data_15m"] = None
+            st.session_state["data_1m"] = None
+            st.success("Данные очищены.")
 
-    if st.button("Скачать с Bybit"):
-        df15, df1 = load_bybit_dual(symbol_in, main_tf, ltf_tf, days)
-
+    # Показываем, что сейчас лежит в сессии
+    df15 = st.session_state["data_15m"]
+    df1  = st.session_state["data_1m"]
     if df15 is not None:
         st.success(f"{main_tf}m: {len(df15)} строк | {df15['datetime'].iloc[0]} → {df15['datetime'].iloc[-1]}")
+        st.dataframe(df15.head(5), use_container_width=True)
         if df1 is not None:
             st.info(f"{ltf_tf}m: {len(df1)} строк | {df1['datetime'].iloc[0]} → {df1['datetime'].iloc[-1]}")
-        st.dataframe(df15.head(5), use_container_width=True)
 
 # =========================== Параметры и запуск ===========================
 st.markdown("---")
@@ -353,8 +373,13 @@ def _plot_trade_markers(ax, df15: pd.DataFrame, trades: List[Dict]) -> None:
     ax.legend(handles=[lg_long_in, lg_long_out, lg_sh_in, lg_sh_out], loc="upper left")
 
 if run:
+    # забираем данные из session_state (устойчиво между перезапусками)
+    df15 = st.session_state.get("data_15m")
+    df1  = st.session_state.get("data_1m")
+
     if df15 is None or df15.empty:
-        st.error("Нет данных 15m.")
+        st.error("Нет данных 15m. Сначала нажми «Скачать с Bybit».")
+        st.stop()
     else:
         cerebro = bt.Cerebro()
         cerebro.broker.set_coc(bool(cheat_on_close))
