@@ -118,16 +118,37 @@ def _fetch_bybit_range(symbol: str, interval: str, start_ms: int, end_ms: int, m
             ts = int(ts)
             if ts < 1_000_000_000_000:
                 ts *= 1000
-            if start_ms <= ts <= end_ms:
-                if (last_seen_ms is None) or (ts > last_seen_ms):
-                    all_rows.append(r)
-                    last_seen_ms = ts
+            if start_ms <= ts <= end_ms and ((last_seen_ms is None) or ts > last_seen_ms):
+                all_rows.append(r)
+                last_seen_ms = ts
 
         cursor = (int(last_seen_ms) + tfms) if last_seen_ms is not None else (cursor + approx_window)
 
     return _rows_to_df(all_rows)
 
+def _utc_now():
+    """UTC-aware timestamp (pandas.Timestamp)."""
+    now = pd.Timestamp.utcnow()
+    # pandas >=2 возвращает tz-aware; на всякий случай:
+    if now.tzinfo is None:
+        return now.tz_localize("UTC")
+    return now.tz_convert("UTC")
 
+def load_bybit(symbol: str, interval: str, days: int) -> Optional[pd.DataFrame]:
+    end = _utc_now()
+    start = end - pd.Timedelta(days=int(days))
+    df = _fetch_bybit_range(symbol, str(interval), int(start.timestamp()*1000), int(end.timestamp()*1000))
+    return df if not df.empty else None
+
+def load_bybit_dual(symbol: str, main_interval: str, ltf_interval: str, days: int) -> Tuple[Optional[pd.DataFrame], Optional[pd.DataFrame]]:
+    """Грузим оба ТФ с Bybit за один и тот же период (полное покрытие, без обрезки 1000 баров)."""
+    end = _utc_now()
+    start = end - pd.Timedelta(days=int(days))
+    s_ms, e_ms = int(start.timestamp()*1000), int(end.timestamp()*1000)
+    df_main = _fetch_bybit_range(symbol, str(main_interval), s_ms, e_ms)
+    df_ltf  = _fetch_bybit_range(symbol, str(ltf_interval), s_ms, e_ms)
+    return (df_main if not df_main.empty else None,
+            df_ltf  if not df_ltf.empty  else None)
 
 # =========================== Feed ===========================
 class PandasData(bt.feeds.PandasData):
@@ -143,14 +164,13 @@ class PandasData(bt.feeds.PandasData):
 
 # =========================== Backtrader↔KWIN мост ===========================
 class BTApiAdapter:
-    """Мини-API для KWINStrategy поверх Backtrader."""
+    """Мини-API для KWINStrategy поверх Backtrader (без реальных BT-ордеров)."""
     def __init__(self, ctx: 'BT_KwinAdapter', symbol: str, tick_size: float, qty_step: float, min_order_qty: float):
         self.ctx = ctx
         self.symbol = symbol
         self._tick = float(tick_size)
         self._step = float(qty_step)
         self._minq = float(min_order_qty)
-        # no-op: не создаём ордера Backtrader
         self._sl_order = None
         self._tp_order = None
 
@@ -167,17 +187,11 @@ class BTApiAdapter:
     def get_price(self, symbol: str, source: str = "last") -> float:
         return float(self.ctx.data1.close[0]) if self.ctx.data1_present else float(self.ctx.data0.close[0])
 
-    # --- ВАЖНО: больше НЕ торгуем внутри Backtrader. Только эмуляция ответа API. ---
-    def place_order(self, symbol: str, side: str, orderType: str, qty: float,
-                    price: Optional[float] = None, stop_loss: Optional[float] = None,
-                    take_profit: Optional[float] = None, order_link_id: Optional[str] = None,
-                    reduce_only: bool = False, trigger_by_source: str = "mark",
-                    time_in_force: Optional[str] = None, position_idx: Optional[int] = None,
-                    tpsl_mode: Optional[str] = None) -> Dict:
+    # Никаких реальных ордеров в BT — KWIN сама ведёт PnL у себя
+    def place_order(self, *args, **kwargs) -> Dict:
         return {"ok": True, "order": None}
 
-    def update_position_stop_loss(self, symbol: str, new_sl: float, trigger_by_source: str = "mark",
-                                  position_idx: Optional[int] = None) -> bool:
+    def update_position_stop_loss(self, *args, **kwargs) -> bool:
         return True
 
 class BT_KwinAdapter(bt.Strategy):
@@ -251,8 +265,7 @@ class BT_KwinAdapter(bt.Strategy):
         }
 
     def next(self):
-        # поддерживаем локальную equity (KWIN) = broker value только для старта;
-        # после — KWIN управляет сам.
+        # при первом проходе выравниваем локальную equity
         if self.state.get_equity() is None:
             self.state.set_equity(float(self.broker.getvalue()))
 
@@ -266,31 +279,6 @@ class BT_KwinAdapter(bt.Strategy):
         if self._last_dt0 != dt0:
             self._last_dt0 = dt0
             self.kwin.on_bar_close_15m(self._bar_to_candle(self.data0))
-            
-            
-    def load_bybit(symbol: str, interval: str, days: int) -> Optional[pd.DataFrame]:
-        end = pd.Timestamp.utcnow()
-        if end.tzinfo is None:
-            end = end.tz_localize("UTC")
-        else:
-            end = end.tz_convert("UTC") 
-        start = end - pd.Timedelta(days=int(days))
-        df = _fetch_bybit_range(symbol, str(interval), int(start.timestamp()*1000), int(end.timestamp()*1000))
-        return df if not df.empty else None
-
-
-    def load_bybit_dual(symbol: str, main_interval: str, ltf_interval: str, days: int) -> Tuple[Optional[pd.DataFrame], Optional[pd.DataFrame]]:
-        end = pd.Timestamp.utcnow()
-        if end.tzinfo is None:
-            end = end.tz_localize("UTC")
-        else:
-            end = end.tz_convert("UTC")
-        start = end - pd.Timedelta(days=int(days))
-        s_ms, e_ms = int(start.timestamp()*1000), int(end.timestamp()*1000)
-        df_main = _fetch_bybit_range(symbol, str(main_interval), s_ms, e_ms)
-        df_ltf  = _fetch_bybit_range(symbol, str(ltf_interval), s_ms, e_ms)
-        return (df_main if not df_main.empty else None,
-                df_ltf  if not df_ltf.empty  else None)
 
 # =========================== Источник данных (Bybit только) ===========================
 with st.expander("Источник данных (Bybit API)", expanded=True):
@@ -466,7 +454,7 @@ if run:
             price_for_logic=price_for_logic,
         )
 
-        # Аналайзеры брокера (теперь скорее для справки)
+        # Аналайзеры брокера (скорее справочные — сделки KWIN ведёт сама)
         cerebro.addanalyzer(bt.analyzers.TradeAnalyzer, _name='ta')
         cerebro.addanalyzer(bt.analyzers.DrawDown, _name='dd')
         cerebro.addanalyzer(bt.analyzers.SharpeRatio, _name='sharpe', timeframe=bt.TimeFrame.Days)
@@ -502,7 +490,7 @@ if run:
         # график Backtrader (без штатных buy/sell, мы их не создаём)
         fig = cerebro.plot(style='candlestick', iplot=False, volume=False)[0][0]
 
-        # стрелочки входов/выходов из твоей БД
+        # стрелочки входов/выходов из БД KWIN
         if show_markers:
             try:
                 trades = strat.kwin.db.get_all_trades() if hasattr(strat, "kwin") else []
