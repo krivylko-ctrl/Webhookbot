@@ -531,18 +531,35 @@ class KWINStrategy:
 
     # --------- детектор удара стопа на текущем баре ---------
     def _check_stop_hit(self):
+        """
+        Проверяем удар SL ТОЛЬКО на свечах, идущих ПОСЛЕ бара входа.
+        Если нет нового M1 после входа — выходим без действий (чтобы не закрывать в ту же секунду).
+        """
         pos = self.state.get_current_position() if self.state else None
         if not pos or str(pos.get("status")) != "open":
             return
+
         sl = float(pos.get("stop_loss") or 0.0)
         if sl <= 0:
             return
 
-        price = self._get_current_price()
-        price = float(price) if price is not None else sl
-        hi, lo = self._get_bar_extremes_for_trailing(price)
-        side = str(pos.get("direction"))
+        # когда открылись
+        entry_ts = int(pos.get("entry_time_ts") or 0)  # это мы уже пишем при входе
+        if entry_ts <= 0:
+            return
 
+        # берём ТОЛЬКО те M1, у которых ts > entry_ts
+        m1 = [c for c in (self.candles_1m or []) if int(c.get("timestamp") or 0) > entry_ts]
+
+        # если интрабара нет — ничего не делаем (ждём следующий бар)
+        if not m1:
+            return
+
+        # экстремумы ПОСЛЕ входа
+        hi = max(float(c["high"]) for c in m1 if c.get("high") is not None)
+        lo = min(float(c["low"])  for c in m1 if c.get("low")  is not None)
+
+        side = str(pos.get("direction"))
         if side == "long" and lo <= sl:
             self._apply_realized_pnl(sl, reason="stop")
         elif side == "short" and hi >= sl:
@@ -570,8 +587,7 @@ class KWINStrategy:
             self._log("debug", f"15m close @ts(start)={aligned_start}")
             self.run_cycle()
 
-            # после цикла проверить удар SL
-            self._check_stop_hit()
+        
         except Exception as e:
             self._log("error", f"on_bar_close_15m: {e}")
 
