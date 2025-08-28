@@ -144,6 +144,8 @@ class KWINStrategy:
         self._last_enter_ts_1m: Optional[int] = None
         # Доп. защита: одна сделка на 15m-окно
         self._last_entered_15m_start: Optional[int] = None
+        # >>> ДОБАВЛЕНО: ts последнего закрытого 1m (для корректного entry_time_ts)
+        self._last_1m_ts: Optional[int] = None
 
         # ================== TV PARITY MODE (жёсткая фиксация под Pine) ==================
         self.tv_parity_mode: bool = bool(getattr(self.config, "tv_parity_mode", True))
@@ -344,10 +346,15 @@ class KWINStrategy:
                 base += buf_ticks * tick
             return float(base)
 
+    # ---------- Локальные SFP на LTF (M1/M3/M5) ----------
     def _find_local_sfp_intrabar(self) -> Tuple[Optional[Dict], Optional[Dict]]:
-        """Локальные (M1/M5) SFP: wick за swing и close-back через swing. Возвращает контексты bear/bull."""
+        """
+        Локальные (M1/M5) SFP: фитиль за swing и close-back через swing.
+        Возвращает контексты bear/bull со свежим SL (сырым, БЕЗ квантования).
+        """
         if not self.candles_1m:
             return None, None
+
         L = int(self.lux_swings)
         cur = self.candles_1m[0]
         op, cl, hi, lo = map(float, (cur["open"], cur["close"], cur["high"], cur["low"]))
@@ -359,7 +366,9 @@ class KWINStrategy:
         ph = self._pivot_high_value_tf(self.candles_1m, L, 1)
         if ph is not None:
             swH, swing_ts, swing_idx = ph
+            # wick above + close back below
             if hi > swH and op < swH and cl < swH:
+                # quality filter (если включён)
                 if bool(getattr(self.config, "use_sfp_quality", False)):
                     min_ticks = int(getattr(self.config, "wick_min_ticks", 0) or 0)
                     wick_ticks = max(0.0, (hi - swH) / tick)
@@ -373,6 +382,7 @@ class KWINStrategy:
         pl = self._pivot_low_value_tf(self.candles_1m, L, 1)
         if pl is not None:
             swL, swing_ts, swing_idx = pl
+            # wick below + close back above
             if lo < swL and op > swL and cl > swL:
                 if bool(getattr(self.config, "use_sfp_quality", False)):
                     min_ticks = int(getattr(self.config, "wick_min_ticks", 0) or 0)
@@ -386,12 +396,14 @@ class KWINStrategy:
 
         return bear_ctx, bull_ctx
 
-    # --- окр. к ближайшему шагу — PATCH D: pine-like (round) вместо Decimal HALF_UP для qty ---
+    # --- окр. к ближайшему шагу — pine-like (math.round) ---
     def _round_to_step_nearest(self, v: float, step: float) -> float:
-        # Pine math.round эквивалентен округлению к ближайшему; 0.5→вверх на практике для положительных qty
+        """
+        Pine math.round эквивалентен округлению к ближайшему (для положительных qty 0.5 -> вверх).
+        """
         return round(v / step) * step
 
-    # --- 15m-SFP intrabar detector (anti-repaint like Pine) ---
+    # --- 15m-SFP intrabar detector (anti-repaint как в Pine) ---
     def _find_15m_sfp_intrabar(self) -> Tuple[Optional[Dict], Optional[Dict]]:
         """
         Возвращает bear_ctx/bull_ctx для 15m-SFP, подтверждённого внутри текущего 15m окна.
@@ -438,30 +450,46 @@ class KWINStrategy:
 
         if swH is not None and hi15_cur > swH and op < swH and cl < swH:
             sl = self._sl_local_first("short", swH_loc, last1)  # RAW
-            bear_ctx = {"sl": sl, "sid_15m": int(self.candles_15m[1].get("timestamp") or 0) if len(self.candles_15m) > 1 else 0, "source": "15m_intrabar"}
+            bear_ctx = {
+                "sl": sl,
+                "sid_15m": int(self.candles_15m[1].get("timestamp") or 0) if len(self.candles_15m) > 1 else 0,
+                "source": "15m_intrabar",
+            }
 
         if swL is not None and lo15_cur < swL and op > swL and cl > swL:
             sl = self._sl_local_first("long", swL_loc, last1)  # RAW
-            bull_ctx = {"sl": sl, "sid_15m": int(self.candles_15m[1].get("timestamp") or 0) if len(self.candles_15m) > 1 else 0, "source": "15m_intrabar"}
+            bull_ctx = {
+                "sl": sl,
+                "sid_15m": int(self.candles_15m[1].get("timestamp") or 0) if len(self.candles_15m) > 1 else 0,
+                "source": "15m_intrabar",
+            }
 
         return bear_ctx, bull_ctx
 
     # ---------- SL fallback как в Pine (если свинг отсутствует) ----------
     def _sl_with_fallback(self, side: str, swing_price: Optional[float], bar: Dict) -> float:
+        """
+        Если swing_price отсутствует, используем экстремум бара.
+        Возвращаем RAW SL без квантования (квантование при отправке в API).
+        """
         tick = float(self.tick_size or 0.01)
         use_buf   = bool(getattr(self.config, "use_sl_buffer", False))
         buf_ticks = int(getattr(self.config, "sl_buf_ticks", 0) or 0)
         if side == "long":
             base = swing_price if swing_price is not None else float(bar["low"])
             sl   = base - (buf_ticks * tick if use_buf and swing_price is not None else 0.0)
-            return float(sl)  # RAW
+            return float(sl)
         else:
             base = swing_price if swing_price is not None else float(bar["high"])
             sl   = base + (buf_ticks * tick if use_buf and swing_price is not None else 0.0)
-            return float(sl)  # RAW
+            return float(sl)
 
     # ---------- SL с приоритетом локального свинга ----------
     def _sl_local_first(self, side: str, local_swing: Optional[float], bar: Dict) -> float:
+        """
+        Если есть локальный свинг на LTF — используем его для SL, иначе экстремум бара.
+        Буфер накладываем ТОЛЬКО когда свинг найден (как в Pine).
+        """
         tick = float(self.tick_size or 0.01)
         use_buf   = bool(getattr(self.config, "use_sl_buffer", False))
         buf_ticks = int(getattr(self.config, "sl_buf_ticks", 0) or 0)
@@ -469,15 +497,19 @@ class KWINStrategy:
             base = float(local_swing) if local_swing is not None else float(bar["low"])
             if local_swing is not None and use_buf:
                 base -= buf_ticks * tick
-            return float(base)  # RAW
+            return float(base)
         else:
             base = float(local_swing) if local_swing is not None else float(bar["high"])
             if local_swing is not None and use_buf:
                 base += buf_ticks * tick
-            return float(base)  # RAW
+            return float(base)
 
     # ---------- Fee filter ----------
     def _expected_net_ok(self, entry: float, sl: float, qty: float) -> bool:
+        """
+        Проверка, что ожидаемая валовая прибыль в 1R минус комиссии >= min_net_profit.
+        В TV-паритете фильтр по умолчанию отключён.
+        """
         if not self.use_fee_filter:
             return True
         stop_size = abs(entry - sl)
@@ -495,8 +527,33 @@ class KWINStrategy:
             return False
         return self._last_enter_ts_1m == int(ts_1m)
 
+    # ---------- Вспомогательное: корректный ts входа для текущего 15m окна ----------
+    def _bar_close_ts_ms(self, bar_start_ms: Optional[int] = None) -> int:
+        """
+        Возвращает timestamp закрытия текущего 15m бара (start + 899_000 ms).
+        """
+        if bar_start_ms is None:
+            bar_start_ms = self._current_bar_ts_ms()
+        start = self._align_15m_ms(int(bar_start_ms))
+        return int(start + 899_000)
+
+    def _entry_ts_for_current_bar(self, intrabar_trigger: bool) -> int:
+        """
+        Если вход интрабарный и у нас есть свежий self._last_1m_ts внутри текущего окна —
+        используем его. Иначе — закрытие 15m (для TV-паритета).
+        """
+        bar_start = self._current_bar_ts_ms()
+        if intrabar_trigger and self._last_1m_ts is not None:
+            if bar_start <= int(self._last_1m_ts) <= (bar_start + 899_000):
+                return int(self._last_1m_ts)
+        return self._bar_close_ts_ms(bar_start)
+
     # --------- Локальная фиксация реализованной PnL и реинвест ---------
     def _apply_realized_pnl(self, exit_price: float, reason: str = "close"):
+        """
+        Закрывает текущую позицию, пересчитывает equity локально (как Pine),
+        записывает снапшот equity в БД (если доступно).
+        """
         pos = self.state.get_current_position() if self.state else None
         if not pos or str(pos.get("status")) != "open":
             return
@@ -529,7 +586,19 @@ class KWINStrategy:
 
         self._log("info", f"[CLOSE {side.upper()}] @ {exit_price:.6f} PnL={pnl:.2f} equity->{new_eq:.2f} reason={reason}")
 
-    # --------- детектор удара стопа на текущем баре ---------
+    # --------- TP/SL детекторы по M1 после входа ----------
+    def _m1_extremes_after_entry(self, entry_ts: int) -> Tuple[Optional[float], Optional[float]]:
+        """
+        Возвращает (hi, lo) только по тем M1, у которых ts > entry_ts.
+        Если интрабара нет — (None, None).
+        """
+        m1 = [c for c in (self.candles_1m or []) if int(c.get("timestamp") or 0) > int(entry_ts)]
+        if not m1:
+            return None, None
+        hi = max(float(c["high"]) for c in m1 if c.get("high") is not None)
+        lo = min(float(c["low"])  for c in m1 if c.get("low")  is not None)
+        return hi, lo
+
     def _check_stop_hit(self):
         """
         Проверяем удар SL ТОЛЬКО на свечах, идущих ПОСЛЕ бара входа.
@@ -543,21 +612,13 @@ class KWINStrategy:
         if sl <= 0:
             return
 
-        # когда открылись
-        entry_ts = int(pos.get("entry_time_ts") or 0)  # это мы уже пишем при входе
+        entry_ts = int(pos.get("entry_time_ts") or 0)
         if entry_ts <= 0:
             return
 
-        # берём ТОЛЬКО те M1, у которых ts > entry_ts
-        m1 = [c for c in (self.candles_1m or []) if int(c.get("timestamp") or 0) > entry_ts]
-
-        # если интрабара нет — ничего не делаем (ждём следующий бар)
-        if not m1:
+        hi, lo = self._m1_extremes_after_entry(entry_ts)
+        if hi is None:
             return
-
-        # экстремумы ПОСЛЕ входа
-        hi = max(float(c["high"]) for c in m1 if c.get("high") is not None)
-        lo = min(float(c["low"])  for c in m1 if c.get("low")  is not None)
 
         side = str(pos.get("direction"))
         if side == "long" and lo <= sl:
@@ -565,8 +626,41 @@ class KWINStrategy:
         elif side == "short" and hi >= sl:
             self._apply_realized_pnl(sl, reason="stop")
 
+    def _check_take_profit_hit(self):
+        """
+        Аналогично SL: TP срабатывает только на барах M1 с ts > entry_ts.
+        """
+        pos = self.state.get_current_position() if self.state else None
+        if not pos or str(pos.get("status")) != "open":
+            return
+
+        tp = float(pos.get("take_profit") or 0.0)
+        if tp <= 0:
+            return
+
+        entry_ts = int(pos.get("entry_time_ts") or 0)
+        if entry_ts <= 0:
+            return
+
+        hi, lo = self._m1_extremes_after_entry(entry_ts)
+        if hi is None:
+            return
+
+        side = str(pos.get("direction"))
+        if side == "long" and hi >= tp:
+            self._apply_realized_pnl(tp, reason="tp")
+        elif side == "short" and lo <= tp:
+            self._apply_realized_pnl(tp, reason="tp")
+
     # ============ ОБРАБОТЧИКИ БАРОВ ============
     def on_bar_close_15m(self, candle: Dict):
+        """
+        Закрытие 15m:
+          - буферизуем бар,
+          - сдвигаем окно,
+          - запускаем run_cycle() (детекция 15m сигналов),
+          - НИЧЕГО не закрываем в эту же секунду (SL/TP проверяются на последующих M1).
+        """
         try:
             self.candles_15m.insert(0, candle)
             if len(self.candles_15m) > 200:
@@ -587,7 +681,8 @@ class KWINStrategy:
             self._log("debug", f"15m close @ts(start)={aligned_start}")
             self.run_cycle()
 
-        
+            # ВАЖНО: не вызываем здесь _check_stop_hit/_check_take_profit_hit
+            # чтобы не «убивать» сделку в ту же секунду её появления.
         except Exception as e:
             self._log("error", f"on_bar_close_15m: {e}")
 
@@ -600,7 +695,10 @@ class KWINStrategy:
             self._log("error", f"on_bar_close_60m: {e}")
 
     def _flip_position(self, new_dir: str) -> bool:
-        """Разворот при use_dir_lock=False: закрыть текущую позицию и открыть новую сторону."""
+        """
+        Разворот при use_dir_lock=False: закрыть текущую позицию и открыть новую сторону.
+        Для TV-паритета разворот встречается редко (обычно одна позиция за 15m окно), но поддерживаем.
+        """
         pos = self.state.get_current_position() if self.state else None
         if not pos or pos.get("status") != "open":
             return True
@@ -619,12 +717,12 @@ class KWINStrategy:
                 if px is not None:
                     self._apply_realized_pnl(float(px), reason="flip(api)")
             else:
-                close_side = "short" if cur_dir == "long" else "long"
+                # локально
                 px = self._get_current_price()
                 if px is None:
                     px = float(pos.get("stop_loss") or pos.get("entry_price"))
                 self._apply_realized_pnl(float(px), reason="flip(local)")
-                self._place_market_order(close_side, size)
+                self._place_market_order("short" if cur_dir == "long" else "long", size)
 
             return True
         except Exception as e:
@@ -632,15 +730,23 @@ class KWINStrategy:
             return False
 
     def on_bar_close_1m(self, candle: Dict):
-        """Интрабар — локальные входы и Smart Trail.
-           В TV-режиме (`tv_parity_mode=True`) и `use_intrabar=False` — ВХОДЫ ЗАБЛОКИРОВАНЫ,
-           оставляем только обновление трейлинга (если он не отключён)."""
+        """
+        Закрытие M1:
+          — обновляем буфер,
+          — отмечаем последний ts (self._last_1m_ts),
+          — в TV-режиме входы отключены, работаем только с trailing/TP/SL,
+          — вне TV-режима — Dual-SFP интрабар-входы + trailing,
+          — TP/SL проверяем ТОЛЬКО по барам ПОСЛЕ входа.
+        """
         try:
             self.candles_1m.insert(0, candle)
             lim = int(getattr(self.config, "intrabar_pull_limit", 1000) or 1000)
             if len(self.candles_1m) > lim:
                 self.candles_1m = self.candles_1m[:lim]
             self._ensure_desc(self.candles_1m)
+
+            cur_ts = int(candle.get("timestamp") or 0)
+            self._last_1m_ts = cur_ts  # <<< фиксируем последнюю m1 для корректного entry_time_ts
 
             # one-per-swing reset по локальным пивотам (оставим — не мешает TV режиму)
             L = int(self.lux_swings)
@@ -655,18 +761,20 @@ class KWINStrategy:
                 if (cur_bull_sid_ts is None) or (self.traded_bull_swing_id != cur_bull_sid_ts):
                     self.traded_bull_swing_id = None
 
-            # Входы по интрабар-логике отключаем, если tv_parity_mode
+            # В TV-режиме или при use_intrabar=False входы по M1 блокируем.
             if self.tv_parity_mode or not bool(getattr(self.config, "use_intrabar", True)):
-                # Только трейлинг, если не отключён
+                # Только трейлинг (если включён) + проверка TP/SL после входа.
                 if self.enable_smart_trail:
                     pos = self.state.get_current_position() if self.state else None
                     if pos and pos.get("status") == "open":
                         self._update_smart_trailing(pos)
+
+                # Порядок: сначала TP, затем SL (как в Pine, чтобы TP имел приоритет при касании)
+                self._check_take_profit_hit()
                 self._check_stop_hit()
                 return
 
             # --- Dual-SFP интрабар (когда разрешено use_intrabar=True) ---
-            cur_ts = int(candle.get("timestamp") or 0)
             bear_loc, bull_loc = self._find_local_sfp_intrabar()
             bear_15m, bull_15m = self._find_15m_sfp_intrabar()
 
@@ -724,7 +832,9 @@ class KWINStrategy:
                     if (not self.use_one_per_swing) or (self.traded_bear_swing_id != sid_local_ts):
                         qty = self._calculate_position_size(cl, sl, "short")
                         if qty and qty >= self.min_order_qty and self._expected_net_ok(cl, sl, qty):
-                            self._process_short_entry(entry_override=cl, sl_override=sl)
+                            # корректный ts входа для интрабара
+                            entry_ts = self._entry_ts_for_current_bar(intrabar_trigger=True)
+                            self._process_short_entry(entry_override=cl, sl_override=sl, _entry_ts_override=entry_ts)
                             if self.use_one_per_swing and sid_local_ts:
                                 self.traded_bear_swing_id = sid_local_ts
                             self._last_entered_15m_start = self.last_processed_bar_ts
@@ -753,7 +863,8 @@ class KWINStrategy:
                     if (not self.use_one_per_swing) or (self.traded_bull_swing_id != sid_local_ts):
                         qty = self._calculate_position_size(cl, sl, "long")
                         if qty and qty >= self.min_order_qty and self._expected_net_ok(cl, sl, qty):
-                            self._process_long_entry(entry_override=cl, sl_override=sl)
+                            entry_ts = self._entry_ts_for_current_bar(intrabar_trigger=True)
+                            self._process_long_entry(entry_override=cl, sl_override=sl, _entry_ts_override=entry_ts)
                             if self.use_one_per_swing and sid_local_ts:
                                 self.traded_bull_swing_id = sid_local_ts
                             self._last_entered_15m_start = self.last_processed_bar_ts
@@ -764,6 +875,8 @@ class KWINStrategy:
             if pos and pos.get("status") == "open" and getattr(self.config, "use_intrabar", True) and self.enable_smart_trail:
                 self._update_smart_trailing(pos)
 
+            # Порядок: сначала TP, затем SL
+            self._check_take_profit_hit()
             self._check_stop_hit()
 
         except Exception as e:
@@ -771,7 +884,10 @@ class KWINStrategy:
 
     # ========== ВХОДЫ / ПРАЙСЫ ==========
     def _get_current_price(self) -> Optional[float]:
-        """Паритет Pine: по умолчанию используем close рабочего ТФ; при intrabar — close последней M1."""
+        """
+        Паритет Pine: по умолчанию используем close рабочего ТФ; при intrabar — close последней M1.
+        В TV-режиме принудительно 'close'.
+        """
         try:
             src = str(getattr(self.config, "price_for_logic", "close")).lower()
             if src == "close":
@@ -779,6 +895,7 @@ class KWINStrategy:
                     return float(self.candles_1m[0]["close"])
                 return float(self.candles_15m[0]["close"]) if self.candles_15m else None
 
+            # Явно задан "last"/"mark" — используем API
             if self.api and hasattr(self.api, "get_price"):
                 px = self.api.get_price(self.symbol, source=src)
                 if px:
@@ -796,11 +913,16 @@ class KWINStrategy:
         except Exception as e:
             self._log("error", f"get_current_price: {e}")
 
+        # Fallback: intrabar close if available, else 15m close
         if getattr(self.config, "use_intrabar", True) and self.candles_1m:
             return float(self.candles_1m[0]["close"])
         return float(self.candles_15m[0]["close"]) if self.candles_15m else None
 
     def _place_market_order(self, direction: str, quantity: float, stop_loss: Optional[float] = None):
+        """
+        Унифицированная отправка рыночного ордера; при отсутствии API просто логируем.
+        SL квантуется в «жёсткую» сторону только если quantize_initial_sl=True.
+        """
         if not self.api or not hasattr(self.api, "place_order"):
             self._log("warn", "API not available for placing order (local mode)")
             return {"ok": True, "filled": True}
@@ -876,7 +998,17 @@ class KWINStrategy:
             return None
 
     # ========== СОБСТВЕННО ВХОДЫ ==========
-    def _process_long_entry(self, entry_override: Optional[float] = None, sl_override: Optional[float] = None):
+    def _process_long_entry(
+        self,
+        entry_override: Optional[float] = None,
+        sl_override: Optional[float] = None,
+        _entry_ts_override: Optional[int] = None,
+    ):
+        """
+        Создаём локальную позицию (без реального BT-ордера), фиксируем корректный entry_time_ts:
+        — для TV-режима это close 15m бара,
+        — для интрабара — последний M1 внутри окна (self._last_1m_ts).
+        """
         try:
             if len(self.candles_15m) < 1 or sl_override is None:
                 return
@@ -905,7 +1037,11 @@ class KWINStrategy:
                 self._log("warn", "Order failed (long)")
                 return
 
-            bar_ts_ms = self._current_bar_ts_ms()
+            # корректный timestamp входа
+            entry_ts = int(_entry_ts_override) if _entry_ts_override is not None else self._entry_ts_for_current_bar(
+                intrabar_trigger=bool(getattr(self.config, "use_intrabar", True))
+            )
+
             pos = {
                 "symbol": self.symbol,
                 "direction": "long",
@@ -915,7 +1051,7 @@ class KWINStrategy:
                 "sl_calc": float(sl_raw),
                 "status": "open",
                 "armed": (not self.use_arm_after_rr),
-                "entry_time_ts": bar_ts_ms,
+                "entry_time_ts": int(entry_ts),
                 "take_profit": tp_calc,
                 "trail_points": float(entry) * (self.trailing_perc / 100.0),
                 "trail_offset": float(entry) * (self.trailing_offset_perc / 100.0),
@@ -935,7 +1071,15 @@ class KWINStrategy:
         except Exception as e:
             self._log("error", f"process_long_entry: {e}")
 
-    def _process_short_entry(self, entry_override: Optional[float] = None, sl_override: Optional[float] = None):
+    def _process_short_entry(
+        self,
+        entry_override: Optional[float] = None,
+        sl_override: Optional[float] = None,
+        _entry_ts_override: Optional[int] = None,
+    ):
+        """
+        Аналогично long, но для короткой позиции.
+        """
         try:
             if len(self.candles_15m) < 1 or sl_override is None:
                 return
@@ -964,7 +1108,10 @@ class KWINStrategy:
                 self._log("warn", "Order failed (short)")
                 return
 
-            bar_ts_ms = self._current_bar_ts_ms()
+            entry_ts = int(_entry_ts_override) if _entry_ts_override is not None else self._entry_ts_for_current_bar(
+                intrabar_trigger=bool(getattr(self.config, "use_intrabar", True))
+            )
+
             pos = {
                 "symbol": self.symbol,
                 "direction": "short",
@@ -974,7 +1121,7 @@ class KWINStrategy:
                 "sl_calc": float(sl_raw),
                 "status": "open",
                 "armed": (not self.use_arm_after_rr),
-                "entry_time_ts": bar_ts_ms,
+                "entry_time_ts": int(entry_ts),
                 "take_profit": tp_calc,
                 "trail_points": float(entry) * (self.trailing_perc / 100.0),
                 "trail_offset": float(entry) * (self.trailing_offset_perc / 100.0),
@@ -996,6 +1143,11 @@ class KWINStrategy:
 
     # ---------- Трейлинг ----------
     def _get_bar_extremes_for_trailing(self, current_price: float) -> Tuple[float, float]:
+        """
+        Источник экстремумов:
+          — если разрешён интрабар и есть M1 — берём M1;
+          — иначе — 15m бар.
+        """
         try:
             if getattr(self.config, "use_intrabar", True) and self.candles_1m:
                 last = self.candles_1m[0]
@@ -1013,6 +1165,7 @@ class KWINStrategy:
             direction = str(position.get("direction"))
             old_sl = float(position.get("stop_loss") or 0.0)
 
+            # Квантование в сторону «ужесточения»
             if direction == "long":
                 candidate = floor_to_tick(float(new_sl), self.tick_size)
                 if candidate <= old_sl:
@@ -1187,6 +1340,8 @@ class KWINStrategy:
                     k["timestamp"] = int(ts * 1000)
             kl1.sort(key=lambda x: x.get("timestamp", 0), reverse=True)
             self.candles_1m = kl1[:lim]
+            # фиксируем последний m1 ts (нужен для корректного entry_time_ts)
+            self._last_1m_ts = int(self.candles_1m[0]["timestamp"]) if self.candles_1m else None
 
             # -------- ИСТОРИЧЕСКИЙ ПРОИГРЫШ --------
             if self.candles_15m and not self._history_replayed:
@@ -1208,7 +1363,7 @@ class KWINStrategy:
                     self.can_enter_short = True
                     self._bar_index_15m += 1
 
-                    # Если нужен интрабар-трейлинг/входы в истории — включай use_intrabar
+                    # Если нужен интрабар в истории и НЕ включён жёсткий TV-паритет — прокручиваем M1
                     if getattr(self.config, "use_intrabar", True) and not bool(getattr(self.config, "tv_parity_mode", False)):
                         for m in self._ltf_slices_for_bar(bar_ts):
                             self.on_bar_close_1m(m)
@@ -1288,18 +1443,29 @@ class KWINStrategy:
     def _lux_update_active(self):
         try:
             idx = int(self._bar_index_15m)
+
             def alive(ctx: Optional[Dict]) -> bool:
-                if not ctx: return False
+                if not ctx:
+                    return False
                 created = int(ctx.get("created_index", idx))
                 exp = int(ctx.get("expire_after", self.lux_expire_bars))
                 return (idx - created) <= exp
 
-            if not alive(self._active_bear): self._active_bear = None
-            if not alive(self._active_bull): self._active_bull = None
+            if not alive(self._active_bear):
+                self._active_bear = None
+            if not alive(self._active_bull):
+                self._active_bull = None
         except Exception as e:
             self._log("error", f"_lux_update_active: {e}")
 
     def run_cycle(self):
+        """
+        Главный тик цикла на закрытии 15m.
+        — обновляем equity (если источник wallet),
+        — подтягиваем трейлинг, если позиция открыта,
+        — детектим Lux-SFP на 15m и входим,
+        — для TV-паритета ставим entry_time_ts = закрытию 15m.
+        """
         try:
             if not self.candles_15m:
                 return
@@ -1343,24 +1509,37 @@ class KWINStrategy:
             swH_15 = float(self.candles_15m[L]["high"]) if ph15 is not None and len(self.candles_15m) > L else None
             swL_15 = float(self.candles_15m[L]["low" ]) if pl15 is not None and len(self.candles_15m) > L else None
 
+            # SL: при tv_sl_from_15m True — берем от 15m свинга (как в Pine), иначе — local-first
             if swH_15 is not None and hi15 > swH_15 and op15 < swH_15 and cl15 < swH_15:
-                sl = self._sl_local_first("short", swH_loc, last1)
+                if self.tv_sl_from_15m:
+                    sl = self._sl_from_swing("short", swH_15)
+                else:
+                    sl = self._sl_local_first("short", swH_loc, last1)
                 bear_ctx = {"sl": sl, "sid_15m": int(prev1.get("timestamp") or 0), "source": "15m"}
 
             if swL_15 is not None and lo15 < swL_15 and op15 > swL_15 and cl15 > swL_15:
-                sl = self._sl_local_first("long", swL_loc, last1)
+                if self.tv_sl_from_15m:
+                    sl = self._sl_from_swing("long", swL_15)
+                else:
+                    sl = self._sl_local_first("long", swL_loc, last1)
                 bull_ctx = {"sl": sl, "sid_15m": int(prev1.get("timestamp") or 0), "source": "15m"}
 
             # ===== once-per-swing =====
             if self.use_one_per_swing:
                 if bear_ctx:
-                    ph_l = self._pivot_high_value_tf(self.candles_1m, int(self.lux_swings), 1) if self.candles_1m else None
-                    sid_ts = int(ph_l[1]) if ph_l else 0
+                    if self.use_15m_swing_id:
+                        sid_ts = int(prev1.get("timestamp") or 0)
+                    else:
+                        ph_l = self._pivot_high_value_tf(self.candles_1m, int(self.lux_swings), 1) if self.candles_1m else None
+                        sid_ts = int(ph_l[1]) if ph_l else 0
                     if sid_ts and self.traded_bear_swing_id == sid_ts:
                         bear_ctx = None
                 if bull_ctx:
-                    pl_l = self._pivot_low_value_tf(self.candles_1m, int(self.lux_swings), 1) if self.candles_1m else None
-                    sid_ts = int(pl_l[1]) if pl_l else 0
+                    if self.use_15m_swing_id:
+                        sid_ts = int(prev1.get("timestamp") or 0)
+                    else:
+                        pl_l = self._pivot_low_value_tf(self.candles_1m, int(self.lux_swings), 1) if self.candles_1m else None
+                        sid_ts = int(pl_l[1]) if pl_l else 0
                     if sid_ts and self.traded_bull_swing_id == sid_ts:
                         bull_ctx = None
 
@@ -1388,7 +1567,12 @@ class KWINStrategy:
                 sl    = float(bear_ctx["sl"])
                 qty   = self._calculate_position_size(entry, sl, "short")
                 if qty and qty >= self.min_order_qty and self._expected_net_ok(entry, sl, qty):
-                    self._process_short_entry(entry_override=entry, sl_override=sl)
+                    entry_ts = self._entry_ts_for_current_bar(intrabar_trigger=False)  # закрытие 15м
+                    self._process_short_entry(entry_override=entry, sl_override=sl, _entry_ts_override=entry_ts)
+                    if self.use_one_per_swing:
+                        sid_note = int(prev1.get("timestamp") or 0) if self.use_15m_swing_id else 0
+                        if sid_note:
+                            self.traded_bear_swing_id = sid_note
                     self.can_enter_short = False
                     executed = True
 
@@ -1405,9 +1589,15 @@ class KWINStrategy:
                 sl    = float(bull_ctx["sl"])
                 qty   = self._calculate_position_size(entry, sl, "long")
                 if qty and qty >= self.min_order_qty and self._expected_net_ok(entry, sl, qty):
-                    self._process_long_entry(entry_override=entry, sl_override=sl)
+                    entry_ts = self._entry_ts_for_current_bar(intrabar_trigger=False)  # закрытие 15м
+                    self._process_long_entry(entry_override=entry, sl_override=sl, _entry_ts_override=entry_ts)
+                    if self.use_one_per_swing:
+                        sid_note = int(prev1.get("timestamp") or 0) if self.use_15m_swing_id else 0
+                        if sid_note:
+                            self.traded_bull_swing_id = sid_note
                     self.can_enter_long = False
 
+            # В конце цикла обновим «активные» SFP-зоны (для визуала/отладки)
             self._lux_find_new_sfp()
             self._lux_update_active()
         except Exception as e:
@@ -1427,6 +1617,10 @@ class KWINStrategy:
         return int(current_timestamp) >= int(self.start_time_ms)
 
     def _update_equity(self):
+        """
+        Подтягиваем equity из кошелька только если equity_source='wallet'.
+        В противном случае — локальный Pine-подобный учёт (по умолчанию).
+        """
         try:
             if str(self.equity_source) != "wallet":
                 return
@@ -1441,13 +1635,19 @@ class KWINStrategy:
                                 equity = float(coin.get("equity", 0))
                                 if self.state:
                                     self.state.set_equity(equity)
-                                if self.db:
-                                    self.db.save_equity_snapshot(equity)
+                                if self.db and hasattr(self.db, "save_equity_snapshot"):
+                                    try:
+                                        self.db.save_equity_snapshot(equity)
+                                    except Exception:
+                                        pass
                                 return
         except Exception as e:
             self._log("error", f"update_equity: {e}")
 
     def get_trailing_debug(self) -> Dict[str, Any]:
+        """
+        Удобный дамп текущего состояния трейлинга для отладки UI.
+        """
         try:
             pos = self.state.get_current_position() if self.state else None
             if not pos:
@@ -1456,11 +1656,14 @@ class KWINStrategy:
                 "symbol": self.symbol,
                 "entry": pos.get("entry_price"),
                 "sl": pos.get("stop_loss"),
+                "tp": pos.get("take_profit"),
                 "armed": pos.get("armed"),
                 "anchor": pos.get("trail_anchor"),
                 "extreme": pos.get("trail_extreme"),
                 "tick_size": self.tick_size,
                 "qty_step": self.qty_step,
+                "last_1m_ts": getattr(self, "_last_1m_ts", None),
+                "bar_start_15m": self.last_processed_bar_ts,
             }
         except Exception:
             return {}
