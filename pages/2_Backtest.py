@@ -354,8 +354,11 @@ with e2:
 with e3:
     min_order_qty = st.number_input("min_order_qty", 0.0001, 10.0, 0.01, 0.0001, format="%.4f")
 with e4:
-    price_for_logic = st.selectbox("Источник цены для логики", ["last", "mark"], index=0)
-
+    price_for_logic = st.selectbox(
+        "Источник цены для логики",
+        ["close", "last", "mark"],  # добавили close
+        index=0                     # по умолчанию close — как в Pine
+    )
 # Оверлеи
 st.subheader("Оверлеи")
 show_markers = st.checkbox("Показывать стрелочки вход/выход", True)
