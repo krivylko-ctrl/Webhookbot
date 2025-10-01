@@ -1,171 +1,63 @@
-# utils_round.py
-from __future__ import annotations
+import math
+import time
+from typing import Dict, Any
 
-from decimal import Decimal, ROUND_DOWN, ROUND_UP, ROUND_HALF_UP, localcontext, getcontext
-from typing import Optional, Literal, Union
+# Bybit формат шага цены/кол-ва берём из /v5/market/instruments-info
+# result.list[*].lotSizeFilter.stepSize, priceFilter.tickSize
 
-__all__ = [
-    "round_price", "round_qty",
-    "floor_to_tick", "ceil_to_tick", "round_to_tick",
-    "is_on_tick", "snap_to_tick_if_close", "ensure_min_qty",
-    "price_round", "qty_round",
-]
+class InstrumentCache:
+    def __init__(self, bybit_client, ttl_sec: int = 300):
+        self.cli = bybit_client
+        self.ttl = ttl_sec
+        self.cache: Dict[str, Dict[str, Any]] = {}  # key: f"{category}:{symbol}" -> {"ts":..., "spec":...}
 
-# Высокая точность для внутренних расчётов, чтобы исключить артефакты (0.30000000000004 и т.п.)
-getcontext().prec = 40
+    def get(self, symbol: str, category: str) -> Dict[str, Any]:
+        key = f"{category}:{symbol}"
+        now = time.time()
+        item = self.cache.get(key)
+        if item and now - item["ts"] < self.ttl:
+            return item["spec"]
 
-# Микро-эпсилон для «прилипания» к ближайшему тику
-_EPS = Decimal("1e-18")
-
-NumberLike = Union[float, int, str, Decimal]
-
-
-def _D(x: NumberLike) -> Decimal:
-    """Безопасная конвертация в Decimal через str(x) — гасит двоичную погрешность."""
-    return x if isinstance(x, Decimal) else Decimal(str(x))
-
-
-def _q_step(step: NumberLike) -> Decimal:
-    """Нормализация шага (tick/qty_step) в Decimal."""
-    d = _D(step)
-    if d <= 0:
-        raise ValueError("Step must be > 0")
-    return d
-
-
-# -----------------------------
-# БАЗОВЫЕ ФУНКЦИИ
-# -----------------------------
-def round_price(price: NumberLike, tick: NumberLike, mode: Literal["down", "up"] = "down") -> float:
-    """
-    Округление цены к шагу tick.
-      mode="down" -> floor (вниз, для SL long)
-      mode="up"   -> ceil  (вверх, для SL short)
-    """
-    if float(tick) <= 0:
-        return float(price)
-
-    with localcontext() as ctx:
-        ctx.prec = 40
-        q = _q_step(tick)
-        p = _D(price)
-
-        r = p / q
-        frac = r - r.to_integral_value(rounding=ROUND_DOWN)
-
-        # «Прилипание» к ближайшему тику, если уже почти на нём
-        if frac.copy_abs() <= _EPS or (1 - frac).copy_abs() <= _EPS:
-            r = r.to_integral_value(rounding=ROUND_HALF_UP)
+        data = self.cli.get("/v5/market/instruments-info", {"category": category, "symbol": symbol})
+        lst = (data.get("result", {}) or {}).get("list", []) or []
+        if not lst:
+            # запасной дефолт — обычно ETHUSDT: tick=0.05, lot=0.001 — но лучше не полагаться
+            spec = {"tickSize": "0.01", "stepSize": "0.001"}
         else:
-            r = r.to_integral_value(rounding=ROUND_UP if mode.lower() == "up" else ROUND_DOWN)
+            info = lst[0]
+            tick = (info.get("priceFilter") or {}).get("tickSize") or "0.01"
+            step = (info.get("lotSizeFilter") or {}).get("stepSize") or "0.001"
+            spec = {"tickSize": str(tick), "stepSize": str(step)}
 
-        return float(r * q)
+        self.cache[key] = {"ts": now, "spec": spec}
+        return spec
 
+def _round_to_step(value: float, step: float) -> float:
+    if step <= 0:
+        return value
+    return math.floor((value + 1e-12) / step) * step
 
-def round_qty(qty: NumberLike, step: NumberLike, mode: Literal["down", "up"] = "down") -> float:
-    """
-    Округление количества к шагу step.
-      mode="down" -> floor (обычно для рыночных/лимитных ордеров)
-      mode="up"   -> ceil  (если нужно гарантированно не недобрать, например при min_order_qty)
-    """
-    if float(step) <= 0:
-        return float(qty)
+def _quantize_str(x: float, step_str: str) -> str:
+    # корректно форматируем строку в нужной точности
+    if "." in step_str:
+        dec = len(step_str.split(".")[1].rstrip("0"))
+    else:
+        dec = 0
+    fmt = f"{{:.{dec}f}}"
+    return fmt.format(x)
 
-    with localcontext() as ctx:
-        ctx.prec = 40
-        q = _q_step(step)
-        v = _D(qty)
+def normalize_price_qty(price: str, qty: str, tp: str, sl: str, spec: Dict[str, str]):
+    tick = float(spec["tickSize"])
+    step = float(spec["stepSize"])
 
-        r = v / q
-        frac = r - r.to_integral_value(rounding=ROUND_DOWN)
-        if frac.copy_abs() <= _EPS or (1 - frac).copy_abs() <= _EPS:
-            r = r.to_integral_value(rounding=ROUND_HALF_UP)
-        else:
-            r = r.to_integral_value(rounding=ROUND_UP if mode.lower() == "up" else ROUND_DOWN)
+    p  = _round_to_step(float(price), tick)
+    tpp = _round_to_step(float(tp),    tick)
+    sll = _round_to_step(float(sl),    tick)
+    q  = _round_to_step(float(qty),  step)
 
-        return float(r * q)
-
-
-# -----------------------------------------
-# ДОП. ХЕЛПЕРЫ 1:1 с PineScript
-# -----------------------------------------
-def floor_to_tick(price: NumberLike, tick: NumberLike) -> float:
-    """Жёстко вниз к ближайшему тиковому шагу (для SL long)."""
-    return round_price(price, tick, mode="down")
-
-
-def ceil_to_tick(price: NumberLike, tick: NumberLike) -> float:
-    """Жёстко вверх к ближайшему тиковому шагу (для SL short)."""
-    return round_price(price, tick, mode="up")
-
-
-def round_to_tick(price: NumberLike, tick: NumberLike) -> float:
-    """
-    Округление к ближайшему тиковому шагу (как Pine `round()`).
-    Используется для entry/TP, где не важна предвзятость вверх/вниз.
-    """
-    if float(tick) <= 0:
-        return float(price)
-
-    with localcontext() as ctx:
-        ctx.prec = 40
-        q = _q_step(tick)
-        p = _D(price)
-        r = (p / q).to_integral_value(rounding=ROUND_HALF_UP)
-        return float(r * q)
-
-
-# -----------------------------
-# УДОБНЫЕ ДОПОЛНЕНИЯ (без ломания API)
-# -----------------------------
-def is_on_tick(price: NumberLike, tick: NumberLike) -> bool:
-    """Проверка, лежит ли цена точно на сетке тик-сайза (с учётом ε)."""
-    if float(tick) <= 0:
-        return True
-    with localcontext() as ctx:
-        ctx.prec = 40
-        q = _q_step(tick)
-        p = _D(price)
-        # остаток от деления по модулю шага
-        rem = (p % q).copy_abs()
-        return rem <= q * _EPS or (q - rem) <= q * _EPS
-
-
-def snap_to_tick_if_close(price: NumberLike, tick: NumberLike) -> float:
-    """
-    «Прилипание» к ближайшему тику, если расстояние меньше ε.
-    Полезно перед отправкой на биржу, чтобы избежать reject из-за 1e-15.
-    """
-    if float(tick) <= 0:
-        return float(price)
-    with localcontext() as ctx:
-        ctx.prec = 40
-        q = _q_step(tick)
-        p = _D(price)
-        rem = p % q
-        # если остаток очень мал — липнем вниз; если почти полный шаг — липнем вверх
-        if rem.copy_abs() <= q * _EPS:
-            return float((p - rem))
-        if (q - rem).copy_abs() <= q * _EPS:
-            return float((p + (q - rem)))
-    return float(price)
-
-
-def ensure_min_qty(qty: NumberLike, min_qty: NumberLike, step: NumberLike) -> float:
-    """
-    Гарантируем минимальный объём: если после округления вниз он < min_qty,
-    дожимаем вверх к ближайшему валидному шагу ≥ min_qty.
-    """
-    if float(step) <= 0:
-        return max(float(qty), float(min_qty))
-    qd = round_qty(qty, step, mode="down")
-    if qd + 0.0 < float(min_qty):  # явная конверсия в float
-        return round_qty(min_qty, step, mode="up")
-    return qd
-
-
-# -----------------------------
-# АЛИАСЫ ДЛЯ СОВМЕСТИМОСТИ
-# -----------------------------
-price_round = round_to_tick   # ближе всего к PineScript `round()`
-qty_round = round_qty
+    return (
+        _quantize_str(p,   spec["tickSize"]),
+        _quantize_str(q,   spec["stepSize"]),
+        _quantize_str(tpp, spec["tickSize"]),
+        _quantize_str(sll, spec["tickSize"]),
+    )
