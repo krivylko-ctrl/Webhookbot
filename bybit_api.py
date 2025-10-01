@@ -24,7 +24,8 @@ class BybitREST:
 
     def _sign(self, ts: int, method: str, path: str, query: str, body: str) -> (str, str):
         recv_window = "5000"
-        payload = f"{ts}{self.api_key}{recv_window}{method.upper()}{path}{query}{body}"
+    # v5: sign = ts + apiKey + recvWindow + body  (без method/path/query)
+        payload = f"{ts}{self.api_key}{recv_window}{body}"
         sign = hmac.new(self.api_secret, payload.encode(), hashlib.sha256).hexdigest()
         return sign, recv_window
 
